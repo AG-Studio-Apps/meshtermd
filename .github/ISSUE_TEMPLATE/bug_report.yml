@@ -1,0 +1,46 @@
+name: Daemon bug report
+description: Report a bug in meshtermd (the Go daemon). For iOS app bugs, see the contact links.
+title: "[bug] "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file. Please confirm the bug is in **meshtermd** and not in the iOS app — most user-visible issues sit in the app, not the daemon. The daemon's only outputs are PTY bytes, log lines, and the bootstrap line; if your problem is anywhere else, it's likely an app issue.
+
+        The wire protocol is **pre-1.0** and breaking changes happen often. Issues that boil down to "you broke compatibility with version X" are expected behaviour during v0.x; please report them only when X was the most recent release.
+  - type: input
+    id: version
+    attributes:
+      label: meshtermd version
+      description: Output of `meshtermd version`.
+      placeholder: "v0.1.0 (abc1234, built 2026-…)"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Host OS / arch
+      description: e.g. `Linux 6.8 x86_64`, `macOS 14.4 arm64`, `FreeBSD 14 amd64`
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Be precise. Include the exact `meshtermd` invocation and any environment variables.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+      description: What did you expect to happen? What happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Stderr from the daemon, journalctl output, etc. Redact anything sensitive — bootstrap tokens and session IDs are short-lived but still secrets.
+      render: shell

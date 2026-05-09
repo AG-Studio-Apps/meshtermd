@@ -25,11 +25,15 @@ The transport-layer security is TLS 1.3 (provided by Go's standard library insid
 
 ## Reporting issues
 
-Issues are tracked at [meshTerm's repo](https://github.com/AG-Studio-Apps/meshTerm/issues) for now. Please file there with the `meshtermd:` prefix in the title.
+Bugs and questions about the daemon itself: file an issue here on this repo. Templates are provided.
+
+Bugs about the **meshTerm iOS app** (UI, host management, anything that isn't the daemon): use the in-app help/feedback channel — the meshTerm app source is private, so issues here aren't the right venue for app-side problems.
+
+We do not actively solicit feature requests or contributions during the v0.x phase; the wire protocol is in flux and external proposals are likely to be rejected on grounds of "not yet". That said, bug reports against released versions are welcome and will get triaged.
 
 ## Reporting security issues
 
-See [SECURITY.md](docs/SECURITY.md). Do not file security reports as public issues.
+See [SECURITY.md](docs/SECURITY.md). **Do not file security reports as public issues.**
 
 ## License
 

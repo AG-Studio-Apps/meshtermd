@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: meshTerm iOS app feedback
+    url: https://meshterm.app/support
+    about: Issues about the iOS app itself (UI, host config, terminal rendering) belong in the in-app help channel. The iOS app source is private; this repo only covers the daemon.
+  - name: Security vulnerability
+    url: https://github.com/AG-Studio-Apps/meshtermd/blob/main/docs/SECURITY.md
+    about: Do not file security reports as public issues. Email security@meshterm.app instead.

@@ -132,7 +132,7 @@ Single ALPN value: `meshterm/0` (will become `meshterm/1` at protocol v1.0). The
 
 ### 5.3 TLS 1.3
 
-QUIC mandates TLS 1.3. The daemon presents a self-signed Ed25519 certificate from `~/.local/share/meshtermd/cert.pem`. The client MUST validate the certificate's fingerprint matches `<cert_fp>` from the bootstrap line. No CA trust chain is involved. No SNI validation is required (the daemon ignores the SNI hostname).
+QUIC mandates TLS 1.3. The daemon presents a self-signed ECDSA P-256 certificate (sigalg `ecdsa_secp256r1_sha256`, TLS code 0x0403) from `~/.local/share/meshtermd/cert.pem`. The client MUST validate the certificate's fingerprint matches `<cert_fp>` from the bootstrap line. No CA trust chain is involved. No SNI validation is required (the daemon ignores the SNI hostname). Earlier drafts of this protocol specified Ed25519; we changed to P-256 because iOS Network.framework's QUIC ClientHello does not advertise `ed25519` (0x0807) in its `signature_algorithms` extension and silently rejects Ed25519 server certs with `CRYPTO_ERROR 0x128` before the client's verify block ever runs. See SECURITY.md § Cert lifecycle.
 
 ### 5.4 Connection migration
 

@@ -21,8 +21,8 @@ The protocol's security perimeter is the **iOS client → daemon** channel. Insi
 - **The user's SSH host key chain.** Bootstrap happens over an existing SSH session. If the user's known_hosts trusts the host, we inherit that trust. If SSH is being MITM'd at bootstrap time, every secret SSH carries is already compromised — this protocol cannot improve on that.
 - **Apple's `Security.framework` (TLS 1.3 implementation).** Used by `Network.framework` for all QUIC TLS operations on the iOS client.
 - **Go's `crypto/tls` (TLS 1.3 implementation).** Used by `quic-go` on the daemon.
-- **Apple's `CryptoKit` (SHA-256, Ed25519).** Used by the iOS client for fingerprint computation.
-- **Go's `crypto` standard library (Ed25519, SHA-256, `crypto/rand`).** Used by the daemon for cert generation, fingerprint computation, and token generation.
+- **Apple's `CryptoKit` (SHA-256, P-256).** Used by the iOS client for fingerprint computation.
+- **Go's `crypto` standard library (ECDSA P-256, SHA-256, `crypto/rand`).** Used by the daemon for cert generation, fingerprint computation, and token generation.
 - **The user's local filesystem.** Cert + key persist at `~/.local/share/meshtermd/{cert,key}.pem` with mode 0600.
 
 ## What we do NOT trust
@@ -37,7 +37,7 @@ The protocol's security perimeter is the **iOS client → daemon** channel. Insi
 |---|---|---|
 | QUIC transport encryption | TLS 1.3 with AES-256-GCM or ChaCha20-Poly1305 | iOS: Apple `Security.framework`. Server: Go `crypto/tls` via `quic-go`. |
 | Key exchange | TLS 1.3 ECDHE (X25519, P-256, P-384) | same as above |
-| Server cert | self-signed Ed25519 | Server: Go `crypto/ed25519` + `crypto/x509` |
+| Server cert | self-signed ECDSA P-256 (rationale below) | Server: Go `crypto/ecdsa` + `crypto/x509` |
 | Cert fingerprint | SHA-256 of DER-encoded cert | iOS: `CryptoKit`. Server: Go `crypto/sha256`. |
 | Attach token | 16 bytes from CSPRNG | Go `crypto/rand` |
 | Session ID | 16 bytes from CSPRNG | Go `crypto/rand` |
@@ -127,7 +127,7 @@ There is no application-layer cryptography in `meshtermd` or the iOS client's Ro
 ## Cert lifecycle
 
 - Generated on first daemon startup, stored at `~/.local/share/meshtermd/{cert,key}.pem` with mode 0600.
-- Ed25519, no CN/SAN required (cert is identified by fingerprint, not name).
+- ECDSA P-256 with SHA-256 (cert sigalg `ecdsa_secp256r1_sha256`, TLS code 0x0403). No CN/SAN required — the cert is identified by fingerprint, not name. Ed25519 was the original choice and is cryptographically equivalent, but iOS Network.framework's QUIC ClientHello does not list `ed25519` (0x0807) in its `signature_algorithms` extension, so an Ed25519 server cert is rejected with `CRYPTO_ERROR 0x128` before the client's verify block runs. P-256 sidesteps this without weakening the security posture.
 - Validity: 365 days. The daemon refreshes within the last 30 days of validity (regenerates cert+key, retains old fingerprint as "previously valid" for one rotation period).
 - The fingerprint is the SHA-256 of the DER-encoded certificate.
 - During rotation, both fingerprints (old and new) are accepted by the daemon for one full rotation period; the bootstrap line always emits the *new* fingerprint.

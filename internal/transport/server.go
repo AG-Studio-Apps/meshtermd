@@ -99,6 +99,16 @@ func New(cfg Config) (*Server, error) {
 		// identified by fingerprint not name. Refuse any handshake
 		// that tries to negotiate down from TLS 1.3.
 		ClientAuth: tls.NoClientCert,
+		// Pin classical ECDHE only. Go 1.24+ enables X25519MLKEM768
+		// (post-quantum hybrid) by default for TLS 1.3 key exchange.
+		// iOS Network.framework's QUIC stack negotiates the group but
+		// fails on the resulting ~1.1 KB ServerHello key_share — the
+		// handshake stalls in Initial space and times out client-side.
+		// Locking to X25519 + P-256 sidesteps the interop bug; both
+		// give the same ~128-bit classical security and TLS 1.3 forward
+		// secrecy. Re-evaluate when iOS / Go interop on MLKEM768 is
+		// confirmed working.
+		CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256},
 	}
 
 	idle := cfg.MaxIdleTimeout
@@ -118,12 +128,27 @@ func New(cfg Config) (*Server, error) {
 	// well-behaved clients. HandshakeIdleTimeout caps the cost of a
 	// peer who completes ALPN but stalls before Attach.
 	listener, err := quic.Listen(udpConn, tlsConfig, &quic.Config{
-		EnableDatagrams:        true,
-		MaxIdleTimeout:         idle,
-		KeepAlivePeriod:        keepalive,
-		MaxIncomingStreams:     8,
-		MaxIncomingUniStreams:  8,
-		HandshakeIdleTimeout:   10 * time.Second,
+		EnableDatagrams:       true,
+		MaxIdleTimeout:        idle,
+		KeepAlivePeriod:       keepalive,
+		MaxIncomingStreams:    8,
+		MaxIncomingUniStreams: 8,
+		HandshakeIdleTimeout:  10 * time.Second,
+		// Pin to the QUIC spec minimum (1200 bytes UDP payload). Reasons:
+		//   1. Tailscale's tailscale0 interface has L3 MTU 1280. UDP+IPv4
+		//      headers = 28 bytes, so max QUIC packet = 1252. quic-go's
+		//      default InitialPacketSize is 1280, producing 1308-byte IP
+		//      packets that exceed the tunnel MTU and silently drop on
+		//      iPhone-side egress — server's ServerHello never arrives,
+		//      iOS keeps PINGing in Initial space until 15s timeout.
+		//   2. Mobile/cellular paths often carry a similar ~1280 effective
+		//      MTU (PPPoE, IPv6 transition, etc.). 1200 is the QUIC v1
+		//      spec floor and works on every path the protocol supports.
+		// Trade-off: a few extra packets per connection vs. the default
+		// 1280. Worth it for portability — Roam's whole value prop is
+		// "works over flaky / tunnelled networks". PMTUD is still on so
+		// quic-go can grow the packet size if the path supports it.
+		InitialPacketSize: 1200,
 	})
 	if err != nil {
 		_ = udpConn.Close()

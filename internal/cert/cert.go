@@ -1,18 +1,29 @@
 // Package cert manages the daemon's self-signed TLS certificate.
 //
-// We generate a fresh Ed25519 keypair + cert on first daemon startup
+// We generate a fresh ECDSA P-256 keypair + cert on first daemon startup
 // and persist them to ~/.local/share/meshtermd/. The certificate is
 // identified by the SHA-256 fingerprint of its DER encoding — that
 // fingerprint travels through the SSH bootstrap to the iOS client,
 // which pins it via Network.framework's verify block. There is no
 // public-CA trust involved.
 //
+// P-256 (rather than Ed25519) because iOS Network.framework's QUIC
+// ClientHello does not advertise `ed25519` in its TLS 1.3
+// `signature_algorithms` extension, so an Ed25519 server cert
+// triggers `CRYPTO_ERROR 0x128 (peer doesn't support any of the
+// certificate's signature algorithms)` before the client's verify
+// block is ever invoked. ECDSA P-256 with SHA-256 is universally
+// supported in modern TLS 1.3 stacks (`ecdsa_secp256r1_sha256`,
+// 0x0403). Security properties are equivalent — both ~128-bit
+// classical strength, both forward-secret in TLS 1.3.
+//
 // All cryptographic operations use Go's standard library; this
 // package introduces no new primitives.
 package cert
 
 import (
-	"crypto/ed25519"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -176,9 +187,9 @@ func loadFromDisk(certPath, keyPath string) (tls.Certificate, Fingerprint, error
 }
 
 func generateAndPersist(certPath, keyPath string, validity time.Duration) (tls.Certificate, Fingerprint, error) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return tls.Certificate{}, Fingerprint{}, fmt.Errorf("generate ed25519 key: %w", err)
+		return tls.Certificate{}, Fingerprint{}, fmt.Errorf("generate ecdsa p-256 key: %w", err)
 	}
 
 	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
@@ -192,14 +203,15 @@ func generateAndPersist(certPath, keyPath string, validity time.Duration) (tls.C
 		Subject: pkix.Name{
 			CommonName: "meshtermd",
 		},
-		NotBefore:             now.Add(-time.Minute), // small clock-skew tolerance
+		NotBefore:             now.Add(-time.Minute),
 		NotAfter:              now.Add(validity),
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		SignatureAlgorithm:    x509.ECDSAWithSHA256,
 		BasicConstraintsValid: true,
 		IsCA:                  false,
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, pub, priv)
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
 	if err != nil {
 		return tls.Certificate{}, Fingerprint{}, fmt.Errorf("create cert: %w", err)
 	}

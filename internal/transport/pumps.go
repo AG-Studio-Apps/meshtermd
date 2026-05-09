@@ -48,7 +48,13 @@ func outputPump(ctx context.Context, sess *session.Session, w *quic.SendStream, 
 // inputPump forwards the client's stdin stream into the session's
 // PTY. The QUIC stream's reliability + ordering means we don't need
 // any framing — bytes received are bytes typed.
+//
+// quic-go's ReceiveStream.Read does NOT abort on context cancel;
+// without an explicit CancelRead a stuck Read would pin this
+// goroutine until QUIC's idle timeout. We watch ctx in a sidecar
+// and call CancelRead when it fires (audit F11).
 func inputPump(ctx context.Context, sess *session.Session, r *quic.ReceiveStream) error {
+	cancelOnDone(ctx, func() { r.CancelRead(0) })
 	chunk := make([]byte, 4096)
 	for {
 		if err := ctx.Err(); err != nil {
@@ -69,6 +75,15 @@ func inputPump(ctx context.Context, sess *session.Session, r *quic.ReceiveStream
 	}
 }
 
+// cancelOnDone fires `cancel` when ctx is cancelled. Used by pumps
+// to escape blocking quic-go Reads on context cancel.
+func cancelOnDone(ctx context.Context, cancel func()) {
+	go func() {
+		<-ctx.Done()
+		cancel()
+	}()
+}
+
 // controlPump reads control-stream frames from the client (Ack,
 // Resize, Ping, Goodbye) and dispatches them. Returns nil on a
 // graceful Goodbye, ctx.Err on cancel, or any frame/decode error
@@ -80,6 +95,7 @@ func inputPump(ctx context.Context, sess *session.Session, r *quic.ReceiveStream
 // to keep the buffer larger when network is healthy and clients
 // keep up.
 func controlPump(ctx context.Context, sess *session.Session, s *quic.Stream) error {
+	cancelOnDone(ctx, func() { s.CancelRead(0) })
 	for {
 		if err := ctx.Err(); err != nil {
 			return err

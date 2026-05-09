@@ -31,6 +31,15 @@ func (id SessionID) String() string {
 	return hex.EncodeToString(id[:])
 }
 
+// Bytes returns a fresh copy of the session ID's raw bytes for
+// inclusion in CBOR-encoded protocol messages where the wire form
+// is `bytes` not `string`.
+func (id SessionID) Bytes() []byte {
+	out := make([]byte, len(id))
+	copy(out, id[:])
+	return out
+}
+
 // ParseSessionID parses a 32-char hex SessionID. Returns an error on
 // any deviation from that format.
 func ParseSessionID(s string) (SessionID, error) {

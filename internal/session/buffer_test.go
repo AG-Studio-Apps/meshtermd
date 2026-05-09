@@ -2,9 +2,11 @@ package session
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestNewRingBufferRejectsNonPositiveCapacity(t *testing.T) {
@@ -252,5 +254,124 @@ func TestWrapAtBoundary(t *testing.T) {
 	}
 	if !trunc {
 		t.Error("expected truncation indicator")
+	}
+}
+
+func TestWaitForDataReturnsWhenWriteHappens(t *testing.T) {
+	t.Parallel()
+	r, _ := NewRingBuffer(64)
+
+	type result struct {
+		head uint64
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		head, err := r.WaitForData(context.Background(), 0)
+		done <- result{head, err}
+	}()
+
+	// Briefly wait for the goroutine to enter Wait.
+	time.Sleep(20 * time.Millisecond)
+	r.Write([]byte("hello"))
+
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Errorf("WaitForData err = %v, want nil", res.err)
+		}
+		if res.head != 5 {
+			t.Errorf("WaitForData head = %d, want 5", res.head)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitForData did not return after Write")
+	}
+}
+
+func TestWaitForDataReturnsImmediatelyIfDataAlreadyPast(t *testing.T) {
+	t.Parallel()
+	r, _ := NewRingBuffer(64)
+	r.Write([]byte("abc"))
+
+	head, err := r.WaitForData(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != 3 {
+		t.Errorf("head = %d, want 3", head)
+	}
+}
+
+func TestWaitForDataRespectsContextCancel(t *testing.T) {
+	t.Parallel()
+	r, _ := NewRingBuffer(64)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	type result struct {
+		head uint64
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		head, err := r.WaitForData(ctx, 0)
+		done <- result{head, err}
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+
+	select {
+	case res := <-done:
+		if !errors.Is(res.err, context.Canceled) {
+			t.Errorf("err = %v, want context.Canceled", res.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitForData did not return after cancel")
+	}
+}
+
+func TestWaitForDataLoopsAfterIrrelevantNotify(t *testing.T) {
+	t.Parallel()
+	// Edge: WaitForData with seenSeq=10 while head=5; an unrelated
+	// reader's WaitForData(seenSeq=2) should NOT spuriously return.
+	r, _ := NewRingBuffer(64)
+	r.Write([]byte("abc")) // head = 3
+
+	type result struct {
+		head uint64
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		// Wait for head > 10 — must block past the next small write.
+		head, err := r.WaitForData(context.Background(), 10)
+		done <- result{head, err}
+	}()
+
+	// A small write that doesn't push head past 10. We expect
+	// WaitForData to NOT return here.
+	time.Sleep(20 * time.Millisecond)
+	r.Write([]byte("d")) // head = 4
+	time.Sleep(20 * time.Millisecond)
+
+	select {
+	case res := <-done:
+		t.Fatalf("WaitForData returned prematurely: head=%d err=%v", res.head, res.err)
+	default:
+		// good — still blocked
+	}
+
+	// Now push past 10.
+	r.Write(bytes.Repeat([]byte{'x'}, 10)) // head = 14
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Errorf("err = %v, want nil", res.err)
+		}
+		if res.head < 11 {
+			t.Errorf("head = %d, want ≥ 11", res.head)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitForData did not return after head advanced past target")
 	}
 }

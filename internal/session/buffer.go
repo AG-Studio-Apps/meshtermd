@@ -12,6 +12,7 @@
 package session
 
 import (
+	"context"
 	"errors"
 	"sync"
 )
@@ -49,6 +50,13 @@ type RingBuffer struct {
 	// full is true once the buffer has filled at least once. Until
 	// then writePos doubles as both the write head and "bytes used".
 	full bool
+
+	// notify is closed every time Write advances headSeq; a fresh
+	// chan is allocated immediately afterwards. WaitForData reads
+	// the chan under the lock, then waits on it without holding the
+	// lock — coupling with sync.Cond was clunkier (Cond doesn't
+	// integrate with select/ctx).
+	notify chan struct{}
 }
 
 // NewRingBuffer allocates a buffer of the given capacity in bytes.
@@ -57,7 +65,10 @@ func NewRingBuffer(capacity int) (*RingBuffer, error) {
 	if capacity <= 0 {
 		return nil, ErrInvalidCapacity
 	}
-	return &RingBuffer{buf: make([]byte, capacity)}, nil
+	return &RingBuffer{
+		buf:    make([]byte, capacity),
+		notify: make(chan struct{}),
+	}, nil
 }
 
 // Capacity returns the buffer's fixed size in bytes.
@@ -127,7 +138,53 @@ func (r *RingBuffer) Write(p []byte) (int, error) {
 	}
 
 	r.headSeq += uint64(total)
+
+	// Wake any waiting readers.
+	if total > 0 {
+		old := r.notify
+		r.notify = make(chan struct{})
+		close(old)
+	}
 	return total, nil
+}
+
+// WaitForData blocks until HeadSeq advances past `seenSeq` or ctx is
+// cancelled. Returns the current HeadSeq on advance (always >
+// seenSeq); on ctx cancel returns the current HeadSeq + ctx.Err().
+//
+// Used by the Stdout-stream pump: after sending all available bytes
+// since seenSeq, it waits here for the next chunk to arrive instead
+// of polling.
+func (r *RingBuffer) WaitForData(ctx context.Context, seenSeq uint64) (uint64, error) {
+	r.mu.Lock()
+	if r.headSeq > seenSeq {
+		head := r.headSeq
+		r.mu.Unlock()
+		return head, nil
+	}
+	ch := r.notify
+	r.mu.Unlock()
+
+	select {
+	case <-ch:
+		// Another writer advanced head — re-read it; we don't
+		// guarantee we're "the" awakened reader, just that head
+		// has advanced past seenSeq for at least one writer.
+		r.mu.Lock()
+		head := r.headSeq
+		r.mu.Unlock()
+		if head <= seenSeq {
+			// Edge case: a Write with len(p) == 0 closed the chan
+			// without advancing seq. Re-arm.
+			return r.WaitForData(ctx, seenSeq)
+		}
+		return head, nil
+	case <-ctx.Done():
+		r.mu.Lock()
+		head := r.headSeq
+		r.mu.Unlock()
+		return head, ctx.Err()
+	}
 }
 
 // ReadSince returns the bytes from `fromSeq` onward, up to maxBytes.

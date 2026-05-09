@@ -1,0 +1,193 @@
+// Package session owns the per-session state for meshtermd: the output
+// ring buffer, the Session value, and the concurrent registry.
+//
+// The ring buffer is the load-bearing piece for replay-on-reattach.
+// When a client disconnects (network drop, app background, foreground
+// roam), the daemon keeps writing PTY output into the buffer. On
+// reattach, the client passes its last-acked sequence number and the
+// buffer replays from there. If the disconnect was long enough that
+// the buffer overflowed, replay starts from the buffer's tail and the
+// AttachAck reports `trunc = true` so the client can render a
+// "[…some output lost…]" indicator.
+package session
+
+import (
+	"errors"
+	"sync"
+)
+
+// DefaultBufferCapacity is the per-session output ring buffer size when
+// none is specified. 4 MiB comfortably holds ~30 seconds of even a
+// fast-scrolling build log; longer disconnects truncate gracefully.
+const DefaultBufferCapacity = 4 * 1024 * 1024
+
+// ErrInvalidCapacity is returned by NewRingBuffer when capacity ≤ 0.
+var ErrInvalidCapacity = errors.New("ring buffer capacity must be positive")
+
+// RingBuffer is a fixed-capacity FIFO of bytes addressed by monotonic
+// sequence numbers. Sequence numbers count bytes, not frames — if seq
+// 100 covers the byte 'A', seq 101 covers the next byte. This matches
+// the protocol's wire framing.
+//
+// All exported methods are safe for concurrent use. The expected
+// access pattern is one writer (the PTY-reading goroutine) and one
+// reader (the Stdout-stream-writing goroutine), but the lock is a
+// plain Mutex so any pattern works.
+type RingBuffer struct {
+	mu sync.Mutex
+
+	// buf is the storage. Its length is the capacity; it never grows.
+	buf []byte
+
+	// writePos is the next index in buf to write at, in [0, len(buf)).
+	writePos int
+
+	// headSeq is the seq of the next byte that will be written.
+	// Equivalently: the count of all bytes ever written.
+	headSeq uint64
+
+	// full is true once the buffer has filled at least once. Until
+	// then writePos doubles as both the write head and "bytes used".
+	full bool
+}
+
+// NewRingBuffer allocates a buffer of the given capacity in bytes.
+// Returns ErrInvalidCapacity if capacity ≤ 0.
+func NewRingBuffer(capacity int) (*RingBuffer, error) {
+	if capacity <= 0 {
+		return nil, ErrInvalidCapacity
+	}
+	return &RingBuffer{buf: make([]byte, capacity)}, nil
+}
+
+// Capacity returns the buffer's fixed size in bytes.
+func (r *RingBuffer) Capacity() int {
+	return len(r.buf)
+}
+
+// HeadSeq returns the sequence number of the next byte that will be
+// written. Equivalently, the total bytes ever written to the buffer.
+func (r *RingBuffer) HeadSeq() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.headSeq
+}
+
+// TailSeq returns the sequence number of the oldest byte currently
+// retained. Until the buffer wraps, TailSeq is 0 (or HeadSeq if
+// nothing has been written). After wrap, TailSeq = HeadSeq − capacity.
+func (r *RingBuffer) TailSeq() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.tailSeqLocked()
+}
+
+func (r *RingBuffer) tailSeqLocked() uint64 {
+	if !r.full {
+		return 0
+	}
+	return r.headSeq - uint64(len(r.buf))
+}
+
+// Write appends p to the buffer. If len(p) > capacity, only the last
+// `capacity` bytes of p are retained — the earlier portion is dropped
+// without ever being readable. headSeq advances by len(p) regardless,
+// so a future ReadSince knows how much was lost.
+//
+// Write never returns an error or short write; the io.Writer signature
+// is preserved purely for compatibility with io.MultiWriter and
+// io.Copy use cases.
+func (r *RingBuffer) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	total := len(p)
+	cap := len(r.buf)
+
+	// If p is bigger than capacity, only the tail of p is useful;
+	// drop everything before that.
+	if total > cap {
+		p = p[total-cap:]
+	}
+
+	for len(p) > 0 {
+		// How many bytes can we write before wrapping the underlying
+		// array?
+		room := cap - r.writePos
+		if room > len(p) {
+			room = len(p)
+		}
+		copy(r.buf[r.writePos:r.writePos+room], p[:room])
+		r.writePos += room
+		if r.writePos == cap {
+			r.writePos = 0
+			r.full = true
+		}
+		p = p[room:]
+	}
+
+	r.headSeq += uint64(total)
+	return total, nil
+}
+
+// ReadSince returns the bytes from `fromSeq` onward, up to maxBytes.
+// The returned slice is a fresh copy and may be retained by the caller
+// after subsequent Writes.
+//
+//   - data is the byte slice; may be empty if fromSeq == HeadSeq.
+//   - newSeq is fromSeq + len(data); the seq the next ReadSince should
+//     pass to continue.
+//   - truncated is true when fromSeq was older than TailSeq, meaning
+//     some bytes between fromSeq and the returned data's start are
+//     lost forever. The data slice in that case starts at TailSeq.
+//
+// maxBytes ≤ 0 means "as much as is available".
+func (r *RingBuffer) ReadSince(fromSeq uint64, maxBytes int) (data []byte, newSeq uint64, truncated bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	tail := r.tailSeqLocked()
+	head := r.headSeq
+
+	// Caller has already seen everything we have.
+	if fromSeq >= head {
+		return nil, fromSeq, false
+	}
+
+	startSeq := fromSeq
+	if startSeq < tail {
+		startSeq = tail
+		truncated = true
+	}
+
+	avail := head - startSeq
+	if maxBytes > 0 && uint64(maxBytes) < avail {
+		avail = uint64(maxBytes)
+	}
+	if avail == 0 {
+		return nil, startSeq, truncated
+	}
+
+	cap := len(r.buf)
+	// Compute the index in buf where startSeq lives. The byte at
+	// startSeq is at offset (startSeq - tail) into the live data; the
+	// live data starts at writePos when full, or at 0 when not.
+	var dataStart int
+	if r.full {
+		dataStart = r.writePos
+	} else {
+		dataStart = 0
+	}
+	startIdx := (dataStart + int(startSeq-tail)) % cap
+
+	out := make([]byte, avail)
+	if startIdx+int(avail) <= cap {
+		copy(out, r.buf[startIdx:startIdx+int(avail)])
+	} else {
+		first := cap - startIdx
+		copy(out[:first], r.buf[startIdx:])
+		copy(out[first:], r.buf[:int(avail)-first])
+	}
+
+	return out, startSeq + avail, truncated
+}

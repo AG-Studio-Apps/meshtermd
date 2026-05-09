@@ -2,6 +2,8 @@ package session
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"sync"
 	"time"
@@ -9,7 +11,8 @@ import (
 
 // Registry is the daemon's catalogue of live Sessions. It is the
 // authority for "does this session_id exist", enforces a max-session
-// cap, and reaps idle sessions on a GC sweep.
+// cap, reaps idle sessions on a GC sweep, and tracks pending attach
+// tokens.
 //
 // Registry does not start any goroutines on its own — call Run from
 // the daemon's main goroutine to drive the periodic GC sweep, and
@@ -21,6 +24,15 @@ type Registry struct {
 
 	mu       sync.Mutex
 	sessions map[SessionID]*Session
+	tokens   map[AttachToken]pendingAttach
+}
+
+// pendingAttach is the registry-side state for a single in-flight
+// attach. The SSH-side `meshtermd connect` invocation reserves one;
+// the QUIC-side handler consumes it.
+type pendingAttach struct {
+	sessionID SessionID
+	expiresAt time.Time
 }
 
 // DefaultIdleTimeout is the time a detached session can remain idle
@@ -36,6 +48,49 @@ const DefaultGCInterval = time.Minute
 // modest — a typical user has a handful of terminals open at once;
 // hundreds suggests something pathological.
 const DefaultMaxSessions = 100
+
+// AttachTokenLen is the byte length of an attach token. 16 bytes
+// from a CSPRNG is overkill for guessability and matches the
+// protocol spec's MTRM_QUIC <attach_token> 32-hex-char field.
+const AttachTokenLen = 16
+
+// AttachTokenTTL is the lifetime of a freshly-issued attach token.
+// Per docs/SECURITY.md, 30 seconds is enough for the iOS client to
+// receive the bootstrap line over SSH and open a QUIC connection
+// without leaving a wide replay window.
+const AttachTokenTTL = 30 * time.Second
+
+// AttachToken is the single-use bearer token that authorises a QUIC
+// attach. Issued by IssueAttachToken when an SSH-side `meshtermd
+// connect` invocation reserves an attach; consumed by
+// ConsumeAttachToken on the QUIC side.
+type AttachToken [AttachTokenLen]byte
+
+// String returns the lowercase hex encoding (32 chars), matching
+// the bootstrap line's <attach_token> field format.
+func (t AttachToken) String() string {
+	return hex.EncodeToString(t[:])
+}
+
+// ParseAttachToken parses a 32-char hex AttachToken.
+func ParseAttachToken(s string) (AttachToken, error) {
+	var t AttachToken
+	if len(s) != AttachTokenLen*2 {
+		return t, errors.New("attach token must be 32 hex chars")
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return t, err
+	}
+	copy(t[:], b)
+	return t, nil
+}
+
+// ErrAttachTokenInvalid is returned by ConsumeAttachToken when the
+// token is unknown, expired, or already consumed. We intentionally
+// use a single error so callers can't distinguish those three cases —
+// a timing-safe-equal vibe applied at the policy level.
+var ErrAttachTokenInvalid = errors.New("attach token invalid or expired")
 
 // ErrCapacityReached is returned by Create when adding the session
 // would exceed maxSessions.
@@ -68,6 +123,7 @@ func NewRegistry(maxSessions int, idleTimeout, gcInterval time.Duration) *Regist
 		idleTimeout: idleTimeout,
 		gcInterval:  gcInterval,
 		sessions:    make(map[SessionID]*Session),
+		tokens:      make(map[AttachToken]pendingAttach),
 	}
 }
 
@@ -142,9 +198,82 @@ func (r *Registry) IDs() []SessionID {
 	return out
 }
 
+// IssueAttachToken generates a single-use attach token bound to the
+// given session, valid for AttachTokenTTL. Returns the token; callers
+// embed it in the bootstrap line. The session must already be in the
+// registry — issuing a token for an unknown session is a caller bug.
+func (r *Registry) IssueAttachToken(sessionID SessionID) (AttachToken, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if _, ok := r.sessions[sessionID]; !ok {
+		return AttachToken{}, ErrUnknownSession
+	}
+
+	var t AttachToken
+	if _, err := rand.Read(t[:]); err != nil {
+		return AttachToken{}, err
+	}
+	r.tokens[t] = pendingAttach{
+		sessionID: sessionID,
+		expiresAt: time.Now().Add(AttachTokenTTL),
+	}
+	return t, nil
+}
+
+// ConsumeAttachToken validates the token and returns the session it
+// authorises. The token is deleted on success regardless of whether
+// the caller's subsequent attach work succeeds — single-use is
+// single-use. Returns ErrAttachTokenInvalid on any failure (unknown,
+// expired, or session gone).
+func (r *Registry) ConsumeAttachToken(t AttachToken) (*Session, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	pending, ok := r.tokens[t]
+	if !ok {
+		return nil, ErrAttachTokenInvalid
+	}
+	delete(r.tokens, t)
+
+	if time.Now().After(pending.expiresAt) {
+		return nil, ErrAttachTokenInvalid
+	}
+	s, ok := r.sessions[pending.sessionID]
+	if !ok {
+		return nil, ErrAttachTokenInvalid
+	}
+	return s, nil
+}
+
+// SweepAttachTokens removes expired pending tokens. Called by the GC
+// loop alongside session sweep so the tokens map doesn't grow
+// unboundedly if clients abandon their bootstraps without attaching.
+func (r *Registry) SweepAttachTokens() int {
+	now := time.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var n int
+	for k, p := range r.tokens {
+		if now.After(p.expiresAt) {
+			delete(r.tokens, k)
+			n++
+		}
+	}
+	return n
+}
+
+// PendingTokenCount is exposed for diagnostics + tests.
+func (r *Registry) PendingTokenCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.tokens)
+}
+
 // Sweep performs one GC pass. Sessions whose IdleFor exceeds the
-// registry's idleTimeout are removed and closed. Returns the number
-// reaped.
+// registry's idleTimeout are removed and closed; expired attach
+// tokens are also removed. Returns the number of sessions reaped
+// (token-only sweeps don't count).
 //
 // Sweep is also called automatically by Run on a ticker; tests can
 // invoke it directly to drive deterministic GC behaviour without
@@ -162,6 +291,11 @@ func (r *Registry) Sweep() int {
 		if now.Sub(s.lastActivityForGC()) >= r.idleTimeout {
 			doomed = append(doomed, s)
 			delete(r.sessions, id)
+		}
+	}
+	for k, p := range r.tokens {
+		if now.After(p.expiresAt) {
+			delete(r.tokens, k)
 		}
 	}
 	r.mu.Unlock()

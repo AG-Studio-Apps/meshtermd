@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write  # required to create the GitHub Release
+
+jobs:
+  build:
+    name: Build & sign release artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # we want tag history for `git describe`
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build all targets
+        run: make dist
+
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum meshtermd-* > SHA256SUMS
+          cat SHA256SUMS
+
+      # Optional minisign signing. Only fires if the MINISIGN_KEY
+      # repository secret is set. Generate the key locally with
+      # `minisign -G -s minisign.key -p minisign.pub`, paste the
+      # contents of minisign.key into the secret. The matching
+      # public key lives in docs/release-public-key.txt and gets
+      # embedded in the iOS app.
+      - name: Install minisign
+        if: ${{ env.MINISIGN_KEY != '' }}
+        env:
+          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+        run: sudo apt-get update && sudo apt-get install -y minisign
+
+      - name: Sign SHA256SUMS
+        if: ${{ env.MINISIGN_KEY != '' }}
+        env:
+          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        working-directory: dist
+        run: |
+          echo "$MINISIGN_KEY" > /tmp/minisign.key
+          chmod 600 /tmp/minisign.key
+          # -t writes a trusted comment with the tag for audit trail.
+          # The signing process is non-interactive via piping
+          # the password.
+          echo "$MINISIGN_PASSWORD" | minisign -S \
+            -s /tmp/minisign.key \
+            -t "meshtermd ${GITHUB_REF_NAME}" \
+            -m SHA256SUMS
+          rm /tmp/minisign.key
+          ls -la
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          {
+            echo "## meshtermd ${tag}"
+            echo
+            echo "Server-side helper for the meshTerm iOS app. See "
+            echo "https://github.com/AG-Studio-Apps/meshtermd for the wire spec and security notes."
+            echo
+            echo "### Binaries"
+            echo
+            echo "Verify with the published \`SHA256SUMS\` and (if available) its \`.minisig\`."
+            echo "The minisign public key is in \`docs/release-public-key.txt\` of this repo."
+            echo
+            echo "### Compatibility"
+            echo
+            echo "See README.md compatibility table for the meshTerm iOS app version paired with this release."
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: |
+            dist/meshtermd-*
+            dist/SHA256SUMS
+            dist/SHA256SUMS.minisig
+          fail_on_unmatched_files: false  # minisig is optional

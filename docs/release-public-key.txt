@@ -1,0 +1,19 @@
+# minisign release-signing public key
+#
+# When the maintainer signs a release's SHA256SUMS with minisign,
+# this is the matching public key. The iOS app embeds this value
+# at build time and uses it to verify the daemon binary it's about
+# to upload via SFTP.
+#
+# Generation procedure (one-time, on a trusted machine):
+#
+#   minisign -G -s minisign.key -p minisign.pub
+#
+# Then commit the contents of minisign.pub here. Store minisign.key
+# offline + as a GitHub secret named MINISIGN_KEY (with
+# MINISIGN_PASSWORD if set). Never commit the private key.
+#
+# Status: not yet provisioned. Releases prior to provisioning are
+# unsigned (verifiable only against SHA256SUMS hash). The iOS
+# integration will refuse to auto-install daemons until a key is
+# set.

@@ -120,19 +120,23 @@ func New(cfg Config) (*Server, error) {
 		keepalive = 10 * time.Second
 	}
 
-	// Per-connection stream caps. Our protocol uses at most three
-	// streams per attach (control bidi, stdin uni, stdout uni); a
-	// peer that opens more is either confused or hostile. The
-	// generous-by-half cap of 8 each blunts a "open many streams to
-	// pin per-conn state" attack without any false positives in
-	// well-behaved clients. HandshakeIdleTimeout caps the cost of a
-	// peer who completes ALPN but stalls before Attach.
+	// Per-connection stream caps. The single-stream tagged-framing
+	// protocol uses exactly one client-initiated bidirectional
+	// stream per attach (control + stdin + stdout multiplexed via
+	// 1-byte type tags). A second bidi or any uni stream is a peer
+	// bug or hostile pin attempt; cap accordingly.
+	//
+	// Audit F-B (v0.0.2 review): previous v0.0.1 caps of 8/8 were
+	// stale leftovers from the three-stream protocol — buffered
+	// extra streams pinned per-conn state until idle timeout.
+	// HandshakeIdleTimeout caps the cost of a peer who completes
+	// ALPN but stalls before Attach.
 	listener, err := quic.Listen(udpConn, tlsConfig, &quic.Config{
 		EnableDatagrams:       true,
 		MaxIdleTimeout:        idle,
 		KeepAlivePeriod:       keepalive,
-		MaxIncomingStreams:    8,
-		MaxIncomingUniStreams: 8,
+		MaxIncomingStreams:    1,
+		MaxIncomingUniStreams: 0,
 		HandshakeIdleTimeout:  10 * time.Second,
 		// Pin to the QUIC spec minimum (1200 bytes UDP payload). Reasons:
 		//   1. Tailscale's tailscale0 interface has L3 MTU 1280. UDP+IPv4

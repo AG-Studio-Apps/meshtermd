@@ -29,7 +29,10 @@ import (
 // applied for any zero / unset fields.
 type Config struct {
 	// QUICAddr is the bind address for the QUIC listener. Default
-	// "0.0.0.0:0" — bind to all interfaces on a kernel-chosen port.
+	// "127.0.0.1:0" — loopback only, kernel-chosen port. Operators
+	// who want the daemon reachable on a Tailnet IP / LAN address
+	// should override explicitly (the systemd unit shipped with the
+	// release does this for testing).
 	QUICAddr string
 
 	// IPCSocketPath is the unix socket `meshtermd connect` dials.
@@ -71,7 +74,12 @@ func New(cfg Config) (*Daemon, error) {
 		return nil, errors.New("daemon: Config.IPCSocketPath is required")
 	}
 	if cfg.QUICAddr == "" {
-		cfg.QUICAddr = "0.0.0.0:0"
+		// Audit F-A (v0.0.2 review): library default is loopback so
+		// embedders who forget to set QUICAddr don't accidentally
+		// expose the daemon on every interface. The CLI flag's
+		// own default (`serve.go --addr`) was already 127.0.0.1:0;
+		// this aligns the library with that.
+		cfg.QUICAddr = "127.0.0.1:0"
 	}
 	logger := cfg.Logger
 	if logger == nil {

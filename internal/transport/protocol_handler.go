@@ -16,34 +16,21 @@ import (
 	"github.com/AG-Studio-Apps/meshtermd/internal/session"
 )
 
-// ctxReader wraps an io.Reader so a context cancel returns from
-// Read with the ctx error. Used by the rejection drain — without
-// this, io.Copy would block until the client EOFs even when our
-// timeout has fired.
-type ctxReader struct {
-	ctx context.Context
-	r   io.Reader
-}
-
-func (c *ctxReader) Read(p []byte) (int, error) {
-	if err := c.ctx.Err(); err != nil {
-		return 0, err
-	}
-	type result struct {
-		n   int
-		err error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		n, err := c.r.Read(p)
-		ch <- result{n, err}
-	}()
-	select {
-	case res := <-ch:
-		return res.n, res.err
-	case <-c.ctx.Done():
-		return 0, c.ctx.Err()
-	}
+// drainBriefly runs an unbuffered drain on the control stream for
+// up to `d` so the AttachAck failure frame we just wrote actually
+// hits the wire before the deferred CloseWithError tears the
+// connection down. quic-go's Stream.Close marks the write side
+// done but doesn't block until bytes drain — without the drain
+// the client sees a bare CONNECTION_CLOSE instead of our typed
+// AttachAck error message.
+//
+// Audit F-G (v0.0.2 review): replaces an earlier ctxReader pattern
+// that spawned a child goroutine per Read and leaked it until QUIC
+// teardown. SetReadDeadline does the same job natively without the
+// goroutine cost.
+func drainBriefly(s *quic.Stream, d time.Duration) {
+	_ = s.SetReadDeadline(time.Now().Add(d))
+	_, _ = io.Copy(io.Discard, s)
 }
 
 // ProtocolHandler is the real Handler that drives the Roam protocol
@@ -107,18 +94,11 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 	sess, err := h.resolveAttach(att, ctrl)
 	if err != nil {
 		// resolveAttach already wrote the AttachAck failure response.
-		// Close the control stream's write side, then wait for the
-		// client to read it and close from their side. quic-go's
-		// Stream.Close marks the write side done but doesn't block
-		// until the bytes hit the wire; if we tear down the
-		// connection too quickly the AttachAck frame is dropped and
-		// the client sees a bare CONNECTION_CLOSE instead of our
-		// typed error message. Reading until the peer closes (or a
-		// short cap fires) gives the AttachAck time to drain.
+		// Close the control stream's write side, then drain briefly
+		// so the AttachAck makes it on the wire before the deferred
+		// CloseWithError tears the connection down.
 		_ = ctrl.Close()
-		drainCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-		_, _ = io.Copy(io.Discard, &ctxReader{ctx: drainCtx, r: ctrl})
-		cancel()
+		drainBriefly(ctrl, 500*time.Millisecond)
 		log.InfoContext(ctx, "attach rejected", "err", err)
 		return
 	}
@@ -193,7 +173,7 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 	go func() {
 		defer wg.Done()
 		defer pumpsCancel()
-		if err := outputPump(pumpsCtx, sess, writeFrame, start); err != nil && !errors.Is(err, context.Canceled) {
+		if err := outputPump(pumpsCtx, sess, ctrl, writeFrame, start); err != nil && !errors.Is(err, context.Canceled) {
 			log.DebugContext(pumpsCtx, "output pump exit", "err", err)
 		}
 	}()

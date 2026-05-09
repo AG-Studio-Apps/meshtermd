@@ -128,10 +128,9 @@ There is no application-layer cryptography in `meshtermd` or the iOS client's Ro
 
 - Generated on first daemon startup, stored at `~/.local/share/meshtermd/{cert,key}.pem` with mode 0600.
 - ECDSA P-256 with SHA-256 (cert sigalg `ecdsa_secp256r1_sha256`, TLS code 0x0403). No CN/SAN required — the cert is identified by fingerprint, not name. Ed25519 was the original choice and is cryptographically equivalent, but iOS Network.framework's QUIC ClientHello does not list `ed25519` (0x0807) in its `signature_algorithms` extension, so an Ed25519 server cert is rejected with `CRYPTO_ERROR 0x128` before the client's verify block runs. P-256 sidesteps this without weakening the security posture.
-- Validity: 365 days. The daemon refreshes within the last 30 days of validity (regenerates cert+key, retains old fingerprint as "previously valid" for one rotation period).
+- Validity: 365 days. On daemon startup, if the on-disk cert is within 30 days of expiry (or already expired), `LoadOrGenerate` regenerates a fresh cert+key in place. The new fingerprint travels through the SSH bootstrap on the next attach, so iOS clients re-pin transparently.
 - The fingerprint is the SHA-256 of the DER-encoded certificate.
-- During rotation, both fingerprints (old and new) are accepted by the daemon for one full rotation period; the bootstrap line always emits the *new* fingerprint.
-- Cert rotation is automatic and silent. The iOS client picks up the new fingerprint on its next bootstrap.
+- Rotation is start-up driven, not continuous: a daemon with multi-year uptime keeps serving the same cert. Operators who want guaranteed-fresh certs should restart the daemon at least once a year (systemd Restart= will do this on any update). Continuous rotation + a dual-fingerprint window are tracked as a future hardening item.
 
 ## Attach token semantics
 

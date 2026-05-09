@@ -26,7 +26,15 @@ type frameWriter func(t uint8, body []byte) error
 // fromSeq is the position to start emitting from — the AttachAck's
 // Start field; this is either the client's last_ack_seq, or the
 // buffer's tail when ack < tail (truncated replay).
-func outputPump(ctx context.Context, sess *session.Session, write frameWriter, fromSeq uint64) error {
+//
+// Audit F-D (v0.0.2 review): cancelOnDone is symmetric with the
+// readPump's F11 fix. RingBuffer.WaitForData honours ctx, but
+// once data is in hand the goroutine can pin in `quic-go` Stream
+// write when the peer's flow-control window is full; CancelWrite
+// on ctx-cancel unblocks that path so the goroutine exits within
+// milliseconds of teardown rather than at MaxIdleTimeout.
+func outputPump(ctx context.Context, sess *session.Session, s *quic.Stream, write frameWriter, fromSeq uint64) error {
+	cancelOnDone(ctx, func() { s.CancelWrite(0) })
 	buf := sess.Buffer()
 	if buf == nil {
 		return nil
@@ -120,9 +128,15 @@ func handleControlFrame(sess *session.Session, body []byte, write frameWriter) e
 		if err := protocol.StrictDecMode.Unmarshal(body, &m); err != nil {
 			return nil // skip malformed; don't tear the connection down
 		}
-		if m.Rows > 0 && m.Cols > 0 {
-			_ = sess.Resize(m.Rows, m.Cols)
+		// Audit F-I (v0.0.2 review): defense-in-depth daemon-side
+		// floor + ceiling on PTY dimensions. The kernel ioctl rejects
+		// most pathological values, but a peer-supplied 1×1 or 65535
+		// has no legitimate use and clamping here matches the iOS
+		// client's own pre-send sanity check.
+		if m.Rows < 3 || m.Cols < 10 || m.Rows > 1000 || m.Cols > 1000 {
+			return nil
 		}
+		_ = sess.Resize(m.Rows, m.Cols)
 		return nil
 	case protocol.TypePing:
 		var m protocol.Ping

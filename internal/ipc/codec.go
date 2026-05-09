@@ -1,7 +1,6 @@
 package ipc
 
 import (
-	"errors"
 	"fmt"
 	"io"
 
@@ -10,11 +9,11 @@ import (
 	"github.com/AG-Studio-Apps/meshtermd/internal/protocol"
 )
 
-// MaxFrameBytes caps a single IPC frame. Since the IPC peer is
-// trusted (same uid, local socket) we set a generous limit; the
-// protocol package's much-tighter cap stays for the network-facing
-// streams.
-const MaxFrameBytes = 256 * 1024
+// IPC frames are framed with `protocol.WriteFrame` / `ReadFrame`,
+// which inherits `protocol.MaxControlFrameBytes` (64 KiB). We
+// previously declared a separate `MaxFrameBytes = 256 KiB` here
+// but it was never wired in; audit F-E (v0.0.2 review) flagged the
+// dead constant as a future-reviewer trap and we removed it.
 
 // EncodeRequest CBOR-encodes a typed request struct (with its `t`
 // discriminator stamped) and writes it as a length-prefixed frame.
@@ -123,6 +122,3 @@ func cborMarshal(v any) ([]byte, error) {
 	return em.Marshal(v)
 }
 
-// errClosedPipe is exported only for tests that want to assert
-// teardown behaviour against the same sentinel callers see.
-var errClosedPipe = errors.New("ipc: pipe closed")

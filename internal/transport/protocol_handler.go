@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
@@ -83,8 +84,12 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 	att, err := readAttach(ctrl)
 	if err != nil {
 		log.WarnContext(ctx, "read Attach", "err", err)
+		// closeMsg goes on the wire in CONNECTION_CLOSE; never
+		// echo peer-supplied bytes back to the peer (audit F8 —
+		// peer can shape err.Error() via the "got %q" formatter).
+		// Use a small fixed table keyed on err class instead.
 		closeErr = errCodeFor(err)
-		closeMsg = err.Error()
+		closeMsg = closeMsgFor(closeErr)
 		return
 	}
 
@@ -253,9 +258,14 @@ func (h *ProtocolHandler) resolveAttach(att protocol.Attach, ctrl *quic.Stream) 
 		})
 		return nil, err
 	}
-	var wantSid session.SessionID
-	copy(wantSid[:], att.SessionID)
-	if wantSid != sess.ID() {
+	// Constant-time SID compare. The win here is small in absolute
+	// terms (the registry's map lookup already exposes more timing
+	// than the byte compare ever would, and 128 bits of entropy
+	// makes guessing not a practical attack surface), but the
+	// SECURITY.md self-audit checklist explicitly requires this
+	// pattern and it costs us nothing.
+	sid := sess.ID()
+	if subtle.ConstantTimeCompare(att.SessionID, sid[:]) != 1 {
 		_ = sendAttachAck(ctrl, protocol.AttachAck{
 			V:   1,
 			Err: protocol.AttachErrUnknownSession,
@@ -267,24 +277,28 @@ func (h *ProtocolHandler) resolveAttach(att protocol.Attach, ctrl *quic.Stream) 
 }
 
 // readAttach reads the first frame from the control stream and
-// validates it's an Attach. Returns ErrProtocolViolation-shaped
-// errors on wrong-frame conditions so the caller can pick the right
-// QUIC application error code.
+// validates it's an Attach. Returns sentinel errors so the caller
+// can pick the right QUIC application error code via errors.Is.
+//
+// Notably we do NOT include the peer-supplied "got %q" type tag in
+// the wrapped error — that string round-trips into the
+// CONNECTION_CLOSE reason via closeMsgFor, and we don't echo peer
+// bytes there (audit F8).
 func readAttach(ctrl *quic.Stream) (protocol.Attach, error) {
 	body, err := protocol.ReadFrame(ctrl)
 	if err != nil {
-		return protocol.Attach{}, fmt.Errorf("read attach frame: %w", err)
+		return protocol.Attach{}, fmt.Errorf("%w: %v", errAttachBadFrame, err)
 	}
 	t, err := protocol.PeekType(body)
 	if err != nil {
-		return protocol.Attach{}, fmt.Errorf("peek attach type: %w", err)
+		return protocol.Attach{}, fmt.Errorf("%w: %v", errAttachBadFrame, err)
 	}
 	if t != protocol.TypeAttach {
-		return protocol.Attach{}, fmt.Errorf("expected Attach, got %q", t)
+		return protocol.Attach{}, errAttachWrongFirstFrame
 	}
 	var att protocol.Attach
 	if err := protocol.StrictDecMode.Unmarshal(body, &att); err != nil {
-		return protocol.Attach{}, fmt.Errorf("decode attach: %w", err)
+		return protocol.Attach{}, fmt.Errorf("%w: %v", errAttachBadFrame, err)
 	}
 	return att, nil
 }
@@ -299,40 +313,46 @@ func sendAttachAck(s *quic.Stream, ack protocol.AttachAck) error {
 	return protocol.WriteFrame(s, body)
 }
 
+// Sentinel errors readAttach returns. Classifying via errors.Is
+// rather than substring-matching English strings keeps the
+// classification stable when error messages are reformulated
+// (audit F9).
+var (
+	errAttachWrongFirstFrame = errors.New("expected Attach as first control frame")
+	errAttachBadFrame        = errors.New("could not decode Attach frame")
+)
+
 // errCodeFor maps an attach-handshake error to a QUIC application
 // error code. Used only for the connection-close path; AttachAck
 // failures use protocol.AttachErr* strings on the wire.
 func errCodeFor(err error) uint64 {
-	msg := err.Error()
 	switch {
-	case containsAny(msg, "expected Attach"):
+	case errors.Is(err, errAttachWrongFirstFrame):
 		return protocol.ErrStreamWrongOrder
-	case containsAny(msg, "decode attach", "peek attach"):
+	case errors.Is(err, errAttachBadFrame):
 		return protocol.ErrBadFrame
 	default:
 		return protocol.ErrProtocolViolation
 	}
 }
 
-func containsAny(s string, substrs ...string) bool {
-	for _, sub := range substrs {
-		if len(s) >= len(sub) && (s == sub || indexOf(s, sub) >= 0) {
-			return true
-		}
+// closeMsgFor returns a fixed-string close reason for the given
+// error code. Never includes peer-supplied bytes — the close reason
+// rides in a CONNECTION_CLOSE frame and a malicious peer could
+// otherwise shape its own input back into our outbound diagnostics.
+func closeMsgFor(code uint64) string {
+	switch code {
+	case protocol.ErrStreamWrongOrder:
+		return "expected Attach as first control frame"
+	case protocol.ErrBadFrame:
+		return "control frame decode failed"
+	case protocol.ErrProtocolViolation:
+		return "protocol violation"
+	case protocol.ErrOversizedFrame:
+		return "control frame exceeded size limit"
+	default:
+		return "internal error"
 	}
-	return false
-}
-
-func indexOf(s, sub string) int {
-	// stdlib strings.Index would do — kept inline so the package
-	// import set stays minimal and the helper is local to this
-	// error-classification path.
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }
 
 // computeReplayWindow figures out where on the buffer the replay

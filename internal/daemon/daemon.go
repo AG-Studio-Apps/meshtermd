@@ -257,11 +257,30 @@ func (d *Daemon) spawnSession(req ipc.AllocateRequest) (*session.Session, error)
 	}
 
 	spawnCfg := pty.SpawnConfig{
-		Shell:    req.Shell,
-		Args:     req.Exec,
-		Rows:     rows,
-		Cols:     cols,
-		ExtraEnv: []string{"MESHTERM_SESSION_ID=" + sid.String()},
+		Shell: req.Shell,
+		Args:  req.Exec,
+		Rows:  rows,
+		Cols:  cols,
+		ExtraEnv: []string{
+			"MESHTERM_SESSION_ID=" + sid.String(),
+			// MESHTERM_ROAM=1 is a guard variable user shells can
+			// check to avoid auto-attaching to tmux/screen on Roam
+			// sessions. Without it, a typical .bashrc / .zshrc that
+			// runs `tmux attach -t main || tmux new -s main` on
+			// interactive login lands the Roam shell inside the same
+			// tmux session as a regular SSH client — multi-attach
+			// mirrors keystrokes and breaks the user's terminal UX.
+			// Recommended .bashrc guard:
+			//
+			//   if [[ -z "$TMUX" && -z "$MESHTERM_ROAM" && $- == *i* ]]; then
+			//     tmux attach -t main || tmux new -s main
+			//   fi
+			//
+			// The Roam shell is already persistent via meshtermd's
+			// own session registry, so skipping tmux is a no-op
+			// from the user's persistence perspective.
+			"MESHTERM_ROAM=1",
+		},
 	}
 	ptyHandle, err := pty.Spawn(spawnCfg)
 	if err != nil {

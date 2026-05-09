@@ -37,6 +37,10 @@ func startDaemon(t *testing.T) (*Daemon, *ipc.Client, func()) {
 	}
 
 	tmp := t.TempDir()
+	// audit F5: NewServer rejects socket parent dirs with mode > 0700.
+	if err := os.Chmod(tmp, 0o700); err != nil {
+		t.Fatalf("chmod tempdir: %v", err)
+	}
 	socket := filepath.Join(tmp, "meshtermd.sock")
 
 	d, err := New(Config{

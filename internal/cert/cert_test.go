@@ -56,7 +56,9 @@ func TestLoadOrGenerateCreatesFreshPair(t *testing.T) {
 func TestLoadOrGenerateIsIdempotent(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	m := &Manager{Dir: dir, Validity: time.Hour}
+	// Validity must be well outside RenewalWindow so the second
+	// LoadOrGenerate doesn't auto-rotate (audit F10).
+	m := &Manager{Dir: dir, Validity: 2 * RenewalWindow}
 
 	_, fp1, err := m.LoadOrGenerate()
 	if err != nil {
@@ -68,6 +70,26 @@ func TestLoadOrGenerateIsIdempotent(t *testing.T) {
 	}
 	if fp1 != fp2 {
 		t.Errorf("fingerprint changed between calls — second call regenerated when it should have loaded\n  first  = %s\n  second = %s", fp1, fp2)
+	}
+}
+
+func TestLoadOrGenerateRotatesWithinRenewalWindow(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	// Validity inside the renewal window: every load triggers a
+	// regenerate, so fp1 != fp2.
+	m := &Manager{Dir: dir, Validity: time.Hour}
+
+	_, fp1, err := m.LoadOrGenerate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, fp2, err := m.LoadOrGenerate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp1 == fp2 {
+		t.Errorf("expected rotation: cert validity %v is inside RenewalWindow %v", m.Validity, RenewalWindow)
 	}
 }
 

@@ -29,10 +29,20 @@ import (
 	"time"
 )
 
-// Default validity for a freshly minted cert. Rotation is the
-// daemon's job (out of scope for v0, which just keeps using the cert
-// until it expires); v1 will regenerate within the last 30 days.
+// Default validity for a freshly minted cert. Rotation is automatic:
+// LoadOrGenerate regenerates if the on-disk cert is within
+// RenewalWindow of expiry (or already expired).
 const DefaultValidity = 365 * 24 * time.Hour
+
+// RenewalWindow is how close to NotAfter we trigger a regenerate
+// during LoadOrGenerate. iOS clients pin the SHA-256 fingerprint, so
+// rotation is silent from the client's perspective: the next
+// bootstrap line carries the new fingerprint and the client
+// re-pins. There's no continuity guarantee for clients holding a
+// stale bootstrap line, but bootstrap tokens have a 30-second TTL
+// anyway so the window where a stale fingerprint matters is
+// narrow.
+const RenewalWindow = 30 * 24 * time.Hour
 
 // Fingerprint is the SHA-256 of the certificate's DER encoding —
 // the value that travels through the SSH bootstrap line and is
@@ -106,6 +116,17 @@ func (m *Manager) LoadOrGenerate() (tls.Certificate, Fingerprint, error) {
 	cert, fp, err := loadFromDisk(certPath, keyPath)
 	switch {
 	case err == nil:
+		// Audit F10: regenerate if we're within the renewal window
+		// or the cert has already expired. Loaded cert's leaf is
+		// the first entry of cert.Certificate (DER bytes); parse
+		// once to inspect NotAfter.
+		if needsRotation(cert) {
+			validity := m.Validity
+			if validity <= 0 {
+				validity = DefaultValidity
+			}
+			return generateAndPersist(certPath, keyPath, validity)
+		}
 		return cert, fp, nil
 	case errors.Is(err, fs.ErrNotExist):
 		// fall through to regenerate
@@ -118,6 +139,20 @@ func (m *Manager) LoadOrGenerate() (tls.Certificate, Fingerprint, error) {
 		validity = DefaultValidity
 	}
 	return generateAndPersist(certPath, keyPath, validity)
+}
+
+// needsRotation reports whether the leaf cert is expired or within
+// RenewalWindow of expiry. Errors during parse mean "rotate" — a
+// cert we can't parse is one we shouldn't continue serving.
+func needsRotation(cert tls.Certificate) bool {
+	if len(cert.Certificate) == 0 {
+		return true
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return true
+	}
+	return time.Now().Add(RenewalWindow).After(leaf.NotAfter)
 }
 
 func loadFromDisk(certPath, keyPath string) (tls.Certificate, Fingerprint, error) {

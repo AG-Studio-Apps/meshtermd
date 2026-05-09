@@ -23,7 +23,7 @@ VERSION ?= $(shell git describe --tags --dirty --always 2>/dev/null || echo v0.0
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
-LDFLAGS := -s -w \
+LDFLAGS := -s -w -buildid= \
 	-X $(PKG)/internal/build.Version=$(VERSION) \
 	-X $(PKG)/internal/build.Commit=$(COMMIT) \
 	-X $(PKG)/internal/build.Date=$(DATE)

@@ -3,6 +3,7 @@ package ipc
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -34,7 +35,7 @@ func (h *echoHandler) HandlePing(ctx context.Context, req PingRequest) PingRespo
 
 func startServer(t *testing.T, h Handler) (*Server, string) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := tempDirWith0700(t)
 	socket := filepath.Join(dir, "meshtermd.sock")
 	srv, err := NewServer(socket, h)
 	if err != nil {
@@ -47,16 +48,29 @@ func startServer(t *testing.T, h Handler) (*Server, string) {
 	return srv, socket
 }
 
+// tempDirWith0700 returns a t.TempDir() chmod'd to 0700. Required
+// for tests after audit F5 (NewServer rejects socket parent dirs
+// with mode > 0700). The default t.TempDir() leaves system umask
+// behaviour, which is typically 0755 — too loose for production.
+func tempDirWith0700(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("chmod tempdir: %v", err)
+	}
+	return dir
+}
+
 func TestNewServerRejectsNilHandler(t *testing.T) {
 	t.Parallel()
-	if _, err := NewServer(filepath.Join(t.TempDir(), "x.sock"), nil); err == nil {
+	if _, err := NewServer(filepath.Join(tempDirWith0700(t), "x.sock"), nil); err == nil {
 		t.Error("NewServer accepted nil handler")
 	}
 }
 
 func TestNewServerCreatesSocketWith0600(t *testing.T) {
 	t.Parallel()
-	dir := t.TempDir()
+	dir := tempDirWith0700(t)
 	socket := filepath.Join(dir, "meshtermd.sock")
 	srv, err := NewServer(socket, &echoHandler{})
 	if err != nil {
@@ -143,7 +157,7 @@ func TestClientReportsDaemonNotRunning(t *testing.T) {
 
 func TestServeReplacesStaleSocket(t *testing.T) {
 	t.Parallel()
-	dir := t.TempDir()
+	dir := tempDirWith0700(t)
 	socket := filepath.Join(dir, "meshtermd.sock")
 	// Plant a stale file at the socket path (NOT a real socket).
 	// NewServer should remove it and bind cleanly.

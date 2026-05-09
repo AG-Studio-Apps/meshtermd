@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 )
 
 // Handler is the daemon-side dispatch for IPC requests. Each
@@ -36,17 +37,33 @@ type Server struct {
 // The path is created with mode 0600 — only the daemon's uid can
 // reach it. If the path already exists (stale socket from a
 // previous crash), it's removed first.
+//
+// Audit F5: also verifies the socket's parent directory is owned by
+// the calling uid and has mode ≤ 0700 before binding. A
+// world-writable parent (e.g., a misconfigured XDG_RUNTIME_DIR)
+// would let another local user race-create the socket and
+// intercept `meshtermd connect` IPC.
 func NewServer(socketPath string, handler Handler) (*Server, error) {
 	if handler == nil {
 		return nil, errors.New("ipc: NewServer requires a Handler")
 	}
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+	parent := filepath.Dir(socketPath)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return nil, fmt.Errorf("create socket dir: %w", err)
+	}
+	if err := verifyParentDir(parent); err != nil {
+		return nil, fmt.Errorf("socket parent dir: %w", err)
 	}
 	// Remove stale socket. A live `meshtermd serve` would be
 	// holding the listener open; bind would fail. If it succeeds,
-	// the previous one is gone.
-	_ = os.Remove(socketPath)
+	// the previous one is gone. Use Lstat first so we don't follow
+	// a symlink an attacker may have planted at the socket path.
+	if info, lerr := os.Lstat(socketPath); lerr == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("ipc: refuse to bind: %s is a symlink", socketPath)
+		}
+		_ = os.Remove(socketPath)
+	}
 
 	addr, err := net.ResolveUnixAddr("unix", socketPath)
 	if err != nil {
@@ -62,6 +79,35 @@ func NewServer(socketPath string, handler Handler) (*Server, error) {
 		return nil, fmt.Errorf("chmod socket: %w", err)
 	}
 	return &Server{listener: ln, handler: handler, socket: socketPath}, nil
+}
+
+// verifyParentDir asserts that the directory `path` is owned by the
+// current uid and has permissions no looser than 0700 (i.e. neither
+// group- nor world-readable/writable/executable). This rules out the
+// "$XDG_RUNTIME_DIR is misconfigured world-writable" attack where a
+// local attacker pre-creates the socket file or a symlink and races
+// the daemon's bind.
+func verifyParentDir(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", path)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		// Non-POSIX FS; we can't verify ownership. Fail closed.
+		return fmt.Errorf("cannot inspect ownership of %s", path)
+	}
+	if int(stat.Uid) != os.Getuid() {
+		return fmt.Errorf("%s is owned by uid %d; expected %d", path, stat.Uid, os.Getuid())
+	}
+	// Mode check: any group or other bits set fails.
+	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+		return fmt.Errorf("%s has loose permissions %o; expected ≤ 0700", path, mode)
+	}
+	return nil
 }
 
 // Path returns the unix socket path the server is bound to.

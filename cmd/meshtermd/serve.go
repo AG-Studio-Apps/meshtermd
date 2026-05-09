@@ -24,7 +24,10 @@ import (
 // startup error.
 func runServe(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	addr := fs.String("addr", "0.0.0.0:0", "QUIC bind address (host:port; port 0 = ephemeral)")
+	addr := fs.String("addr", "127.0.0.1:0",
+		"QUIC bind address (host:port; port 0 = ephemeral). "+
+			"Default 127.0.0.1: the iOS client reaches us via the same hostname they SSH'd to. "+
+			"Override to 0.0.0.0 only if you genuinely need remote QUIC on a non-loopback path.")
 	socket := fs.String("socket", "", "unix socket path for the connect helper (default: $XDG_RUNTIME_DIR/meshtermd.sock)")
 	maxSessions := fs.Int("max-sessions", 0, "concurrent session cap (0 = default 100)")
 	idleTimeout := fs.Duration("idle-timeout", 0, "idle timeout before reaping a detached session (0 = default 1h)")

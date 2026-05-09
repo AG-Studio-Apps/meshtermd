@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 
-	"github.com/fxamacker/cbor/v2"
 	"github.com/quic-go/quic-go"
 
 	"github.com/AG-Studio-Apps/meshtermd/internal/protocol"
@@ -103,7 +102,7 @@ func controlPump(ctx context.Context, sess *session.Session, s *quic.Stream) err
 			continue
 		case protocol.TypeResize:
 			var m protocol.Resize
-			if err := cbor.Unmarshal(body, &m); err != nil {
+			if err := protocol.StrictDecMode.Unmarshal(body, &m); err != nil {
 				continue // skip malformed; don't tear the connection down
 			}
 			if m.Rows > 0 && m.Cols > 0 {
@@ -111,7 +110,7 @@ func controlPump(ctx context.Context, sess *session.Session, s *quic.Stream) err
 			}
 		case protocol.TypePing:
 			var m protocol.Ping
-			if err := cbor.Unmarshal(body, &m); err != nil {
+			if err := protocol.StrictDecMode.Unmarshal(body, &m); err != nil {
 				continue
 			}
 			pong, err := protocol.MarshalPong(protocol.Pong{Nonce: m.Nonce})

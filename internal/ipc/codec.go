@@ -61,7 +61,7 @@ func DecodeAllocateRequest(body []byte) (AllocateRequest, error) {
 		return AllocateRequest{}, fmt.Errorf("expected Allocate frame, got %q", t)
 	}
 	var req AllocateRequest
-	if err := cbor.Unmarshal(body, &req); err != nil {
+	if err := protocol.StrictDecMode.Unmarshal(body, &req); err != nil {
 		return AllocateRequest{}, err
 	}
 	return req, nil
@@ -77,7 +77,7 @@ func DecodeAllocateResponse(body []byte) (AllocateResponse, error) {
 		return AllocateResponse{}, fmt.Errorf("expected Allocate response, got %q", t)
 	}
 	var resp AllocateResponse
-	if err := cbor.Unmarshal(body, &resp); err != nil {
+	if err := protocol.StrictDecMode.Unmarshal(body, &resp); err != nil {
 		return AllocateResponse{}, err
 	}
 	return resp, nil
@@ -93,7 +93,7 @@ func DecodePingRequest(body []byte) (PingRequest, error) {
 		return PingRequest{}, fmt.Errorf("expected Ping frame, got %q", t)
 	}
 	var req PingRequest
-	if err := cbor.Unmarshal(body, &req); err != nil {
+	if err := protocol.StrictDecMode.Unmarshal(body, &req); err != nil {
 		return PingRequest{}, err
 	}
 	return req, nil
@@ -109,7 +109,7 @@ func DecodePingResponse(body []byte) (PingResponse, error) {
 		return PingResponse{}, fmt.Errorf("expected Ping response, got %q", t)
 	}
 	var resp PingResponse
-	if err := cbor.Unmarshal(body, &resp); err != nil {
+	if err := protocol.StrictDecMode.Unmarshal(body, &resp); err != nil {
 		return PingResponse{}, err
 	}
 	return resp, nil

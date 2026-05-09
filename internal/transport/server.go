@@ -110,10 +110,20 @@ func New(cfg Config) (*Server, error) {
 		keepalive = 10 * time.Second
 	}
 
+	// Per-connection stream caps. Our protocol uses at most three
+	// streams per attach (control bidi, stdin uni, stdout uni); a
+	// peer that opens more is either confused or hostile. The
+	// generous-by-half cap of 8 each blunts a "open many streams to
+	// pin per-conn state" attack without any false positives in
+	// well-behaved clients. HandshakeIdleTimeout caps the cost of a
+	// peer who completes ALPN but stalls before Attach.
 	listener, err := quic.Listen(udpConn, tlsConfig, &quic.Config{
-		EnableDatagrams: true,
-		MaxIdleTimeout:  idle,
-		KeepAlivePeriod: keepalive,
+		EnableDatagrams:        true,
+		MaxIdleTimeout:         idle,
+		KeepAlivePeriod:        keepalive,
+		MaxIncomingStreams:     8,
+		MaxIncomingUniStreams:  8,
+		HandshakeIdleTimeout:   10 * time.Second,
 	})
 	if err != nil {
 		_ = udpConn.Close()

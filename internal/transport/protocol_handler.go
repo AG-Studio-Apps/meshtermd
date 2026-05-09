@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fxamacker/cbor/v2"
 	"github.com/quic-go/quic-go"
 
 	"github.com/AG-Studio-Apps/meshtermd/internal/protocol"
@@ -284,7 +283,7 @@ func readAttach(ctrl *quic.Stream) (protocol.Attach, error) {
 		return protocol.Attach{}, fmt.Errorf("expected Attach, got %q", t)
 	}
 	var att protocol.Attach
-	if err := cbor.Unmarshal(body, &att); err != nil {
+	if err := protocol.StrictDecMode.Unmarshal(body, &att); err != nil {
 		return protocol.Attach{}, fmt.Errorf("decode attach: %w", err)
 	}
 	return att, nil

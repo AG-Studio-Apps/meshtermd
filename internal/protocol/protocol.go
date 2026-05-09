@@ -27,6 +27,33 @@ import (
 	"github.com/fxamacker/cbor/v2"
 )
 
+// StrictDecMode is the CBOR decode mode every wire-facing path in
+// this codebase routes through. It enforces conservative limits on
+// array elements, map pairs, and nesting depth so a malicious peer
+// can't ship a 64 KiB control frame whose CBOR body claims a
+// gigantic map count and force allocation pressure.
+//
+// Limits picked against the actual messages we exchange:
+//   - MaxMapPairs 64       — Attach has 7 pairs; AttachAck max ~9
+//   - MaxArrayElements 256 — no current message uses arrays, but
+//                            being permissive here costs nothing
+//   - MaxNestedLevels 8    — every control message is a flat map;
+//                            8 is generous future-proofing
+var StrictDecMode cbor.DecMode = func() cbor.DecMode {
+	dm, err := cbor.DecOptions{
+		MaxArrayElements: 256,
+		MaxMapPairs:      64,
+		MaxNestedLevels:  8,
+	}.DecMode()
+	if err != nil {
+		// Static config; should never panic. If it does, fail
+		// fast at startup rather than serving traffic with a
+		// silently-degraded decoder.
+		panic(fmt.Sprintf("protocol: build StrictDecMode: %v", err))
+	}
+	return dm
+}()
+
 // ALPN is the application-layer protocol negotiation token sent on
 // the QUIC handshake. v0 uses "meshterm/0" (development); promotion to
 // v1 increments the suffix per docs/roam-protocol.md § 5.2.
@@ -166,7 +193,7 @@ func PeekType(body []byte) (string, error) {
 	var d struct {
 		T string `cbor:"t"`
 	}
-	if err := cbor.Unmarshal(body, &d); err != nil {
+	if err := StrictDecMode.Unmarshal(body, &d); err != nil {
 		return "", err
 	}
 	if d.T == "" {

@@ -1,6 +1,8 @@
-# Binaries
-meshtermd
-meshtermd-*
+# Binaries — root-anchored so we don't accidentally ignore directories
+# like cmd/meshtermd. The bare "meshtermd" pattern would match anywhere
+# in the tree; "/meshtermd" matches only the build artifact at the root.
+/meshtermd
+/meshtermd-*
 /dist/
 /build/
 /out/

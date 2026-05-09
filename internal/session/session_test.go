@@ -216,18 +216,23 @@ func TestAcquireDisplacesPriorAttach(t *testing.T) {
 	s, _ := NewSession(id, pty, 24, 80, 1024)
 	parent := context.Background()
 
-	first, err := s.Acquire(parent)
+	first, gen1, err := s.Acquire(parent)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// First attach should not be cancelled yet.
+	if gen1 == 0 {
+		t.Error("first generation should be > 0")
+	}
 	if first.Err() != nil {
 		t.Error("first attach context cancelled prematurely")
 	}
 
-	second, err := s.Acquire(parent)
+	second, gen2, err := s.Acquire(parent)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if gen2 == gen1 {
+		t.Error("second generation should differ from first")
 	}
 	// First should now be cancelled by the displacement.
 	if first.Err() == nil {
@@ -245,13 +250,37 @@ func TestReleaseDoesNotClearWhenDisplaced(t *testing.T) {
 	s, _ := NewSession(id, pty, 24, 80, 1024)
 	parent := context.Background()
 
-	first, _ := s.Acquire(parent)
-	second, _ := s.Acquire(parent)
-	// Old attach calls Release after seeing its ctx cancelled.
-	s.Release(first)
+	_, gen1, _ := s.Acquire(parent)
+	second, _, _ := s.Acquire(parent)
+	// Old attach calls Release after seeing its ctx cancelled. With
+	// the generation counter, this no-ops cleanly.
+	s.Release(gen1)
 	// Second attach should still be active.
 	if second.Err() != nil {
 		t.Error("second attach was lost after the first called Release")
+	}
+}
+
+func TestReleaseStaleGenerationIsNoOp(t *testing.T) {
+	t.Parallel()
+	// Even if the parent ctx was independently cancelled (e.g.,
+	// daemon-wide shutdown), Release(staleGen) must not touch the
+	// new active slot. The previous ctx-error-as-identity heuristic
+	// got this wrong.
+	id, _ := NewSessionID()
+	pty := newFakePTY()
+	s, _ := NewSession(id, pty, 24, 80, 1024)
+	parent, cancel := context.WithCancel(context.Background())
+	_, gen1, _ := s.Acquire(parent)
+	_, gen2, _ := s.Acquire(parent)
+	cancel() // cancel the shared parent — both ctxs now have Err()
+	// First's Release with the OLD gen must not clear gen2's slot.
+	s.Release(gen1)
+	// Inspect: activeCancel must still be set (a third Acquire
+	// should still trigger displacement).
+	_, gen3, _ := s.Acquire(context.Background())
+	if gen3 == gen2 {
+		t.Error("third Acquire didn't increment generation; second's cancel was prematurely cleared")
 	}
 }
 
@@ -283,7 +312,7 @@ func TestCloseCancelsActiveAttach(t *testing.T) {
 	id, _ := NewSessionID()
 	pty := newFakePTY()
 	s, _ := NewSession(id, pty, 24, 80, 1024)
-	ctx, _ := s.Acquire(context.Background())
+	ctx, _, _ := s.Acquire(context.Background())
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}

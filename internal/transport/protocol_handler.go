@@ -113,8 +113,10 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 	}
 
 	// Acquire the session — displaces any prior attach, whose
-	// pumps will observe attachCtx.Done() and unwind.
-	attachCtx, err := sess.Acquire(ctx)
+	// pumps will observe attachCtx.Done() and unwind. The gen
+	// handle is what we pass to Release so a displaced re-entry
+	// doesn't clobber the new owner (audit F4).
+	attachCtx, attachGen, err := sess.Acquire(ctx)
 	if err != nil {
 		_ = sendAttachAck(ctrl, protocol.AttachAck{
 			V:   1,
@@ -123,7 +125,7 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 		})
 		return
 	}
-	defer sess.Release(attachCtx)
+	defer sess.Release(attachGen)
 
 	if att.Rows > 0 && att.Cols > 0 {
 		_ = sess.Resize(att.Rows, att.Cols)

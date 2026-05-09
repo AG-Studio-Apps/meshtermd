@@ -94,6 +94,15 @@ type Session struct {
 	// active attach.
 	activeCancel context.CancelFunc
 
+	// activeGen is incremented on every Acquire. Callers that
+	// successfully acquire receive their generation; Release(gen)
+	// only clears the slot when gen matches activeGen, so a
+	// displaced caller calling Release after the new owner has
+	// taken over does NOT stomp the new owner's state. This is
+	// audit F4's recommended replacement for the previous
+	// ctx-error-as-identity heuristic.
+	activeGen uint64
+
 	closed bool
 }
 
@@ -185,42 +194,40 @@ func (s *Session) WindowSize() (rows, cols uint16) {
 // derived context the new attacher should use; cancelling that
 // context (e.g., via Release or via the registry GC'ing the session)
 // terminates the new attach.
-func (s *Session) Acquire(parent context.Context) (context.Context, error) {
+func (s *Session) Acquire(parent context.Context) (context.Context, uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return nil, ErrSessionClosed
+		return nil, 0, ErrSessionClosed
 	}
 	if s.activeCancel != nil {
 		// Displace the existing attach.
 		s.activeCancel()
 	}
+	s.activeGen++
 	ctx, cancel := context.WithCancel(parent)
 	s.activeCancel = cancel
 	s.lastActiveAt = time.Now()
-	return ctx, nil
+	return ctx, s.activeGen, nil
 }
 
-// Release is called by an attached client when its goroutine exits
-// cleanly. It clears the active-attach slot so a fresh attach won't
-// trigger a "replaced" displacement on a slot that's already empty.
+// Release is called by an attached client when its goroutine exits.
+// The caller passes the `gen` they received from Acquire; Release
+// clears the active-attach slot only if gen matches the current
+// active generation.
 //
-// It is safe to call Release after another attach has displaced this
-// one: only the active cancel is cleared (the displacement already
-// re-set the slot to the new attacher, so the cancel we'd see here
-// would be a different one).
-func (s *Session) Release(ctx context.Context) {
+// A mismatch means we've been displaced and the new owner's slot
+// must NOT be cleared. The previous implementation used ctx.Err()
+// as identity, which gave the wrong answer when the parent ctx was
+// independently cancelled (e.g., daemon-wide shutdown) — see audit
+// finding F4.
+//
+// Idempotent: calling Release twice with the same gen, or with a
+// stale gen, is a no-op.
+func (s *Session) Release(gen uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Idempotent: if this isn't the current attach, do nothing.
-	// We can't easily compare ctx to a stored one since contexts
-	// don't carry identity; instead we rely on the cancel function's
-	// pointer identity, which we don't expose. The simplest correct
-	// approach is to clear the slot only if this caller's ctx has
-	// been cancelled (i.e., it's the displaced attach finishing up).
-	if ctx.Err() != nil {
-		// Caller was displaced; their cancel has already fired and a
-		// new owner has taken the slot. Nothing to clear.
+	if gen != s.activeGen {
 		return
 	}
 	if s.activeCancel != nil {

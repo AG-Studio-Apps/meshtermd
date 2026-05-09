@@ -247,13 +247,16 @@ func TestDaemonEndToEndAttach(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := protocol.WriteFrame(ctrl, body); err != nil {
+	if err := protocol.WriteTaggedFrame(ctrl, protocol.FrameTypeControl, body); err != nil {
 		t.Fatal(err)
 	}
 
-	respBody, err := protocol.ReadFrame(ctrl)
+	frameType, respBody, err := protocol.ReadTaggedFrame(ctrl)
 	if err != nil {
 		t.Fatalf("read AttachAck: %v", err)
+	}
+	if frameType != protocol.FrameTypeControl {
+		t.Fatalf("AttachAck frame type = %d, want FrameTypeControl", frameType)
 	}
 	var ack protocol.AttachAck
 	if err := cbor.Unmarshal(respBody, &ack); err != nil {

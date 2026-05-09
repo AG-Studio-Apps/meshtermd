@@ -131,10 +131,12 @@ func newHandlerHarness(t *testing.T) *harness {
 	}
 }
 
-// dialAndAttach drives the client side of the Attach handshake.
-// Returns the QUIC connection (with control + stdin streams open),
-// the AttachAck, and the AcceptStream-derived stdout stream.
-func dialAndAttach(t *testing.T, h *harness, sid session.SessionID, token session.AttachToken) (*quic.Conn, *quic.Stream, protocol.AttachAck, *quic.Stream) {
+// dialAndAttach drives the client side of the Attach handshake on
+// the single-stream tagged-frame protocol. Returns the QUIC
+// connection, the (single) bidi stream, and the AttachAck. All
+// subsequent traffic — stdin frames from the test, stdout frames
+// from the daemon, control responses — flows over the same stream.
+func dialAndAttach(t *testing.T, h *harness, sid session.SessionID, token session.AttachToken) (*quic.Conn, *quic.Stream, protocol.AttachAck) {
 	t.Helper()
 	var fp [32]byte
 	copy(fp[:], h.fp)
@@ -148,9 +150,9 @@ func dialAndAttach(t *testing.T, h *harness, sid session.SessionID, token sessio
 		t.Fatalf("dial: %v", err)
 	}
 
-	ctrl, err := conn.OpenStreamSync(dialCtx)
+	stream, err := conn.OpenStreamSync(dialCtx)
 	if err != nil {
-		t.Fatalf("open control stream: %v", err)
+		t.Fatalf("open stream: %v", err)
 	}
 
 	body, err := protocol.MarshalAttach(protocol.Attach{
@@ -163,39 +165,45 @@ func dialAndAttach(t *testing.T, h *harness, sid session.SessionID, token sessio
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := protocol.WriteFrame(ctrl, body); err != nil {
+	if err := protocol.WriteTaggedFrame(stream, protocol.FrameTypeControl, body); err != nil {
 		t.Fatalf("write Attach: %v", err)
 	}
 
-	// Read AttachAck.
-	resp, err := protocol.ReadFrame(ctrl)
+	// Read AttachAck — must be a control-typed tagged frame.
+	frameType, ackBody, err := protocol.ReadTaggedFrame(stream)
 	if err != nil {
 		t.Fatalf("read AttachAck: %v", err)
 	}
+	if frameType != protocol.FrameTypeControl {
+		t.Fatalf("AttachAck frame type = %d, want FrameTypeControl", frameType)
+	}
 	var ack protocol.AttachAck
-	if err := cbor.Unmarshal(resp, &ack); err != nil {
+	if err := cbor.Unmarshal(ackBody, &ack); err != nil {
 		t.Fatalf("decode AttachAck: %v", err)
 	}
+	return conn, stream, ack
+}
 
-	// On rejection there's nothing more to set up — return early
-	// with nil streams.
-	if !ack.OK {
-		return conn, ctrl, ack, nil
+// readNextStdoutFrame blocks until the daemon sends the next
+// FrameTypeStdout frame on `stream` and returns its decoded
+// (seq, payload). Skips any non-stdout frames (e.g. Pong) so tests
+// can consume stdout without being confused by control replies.
+func readNextStdoutFrame(t *testing.T, stream *quic.Stream) (uint64, []byte) {
+	t.Helper()
+	for {
+		frameType, body, err := protocol.ReadTaggedFrame(stream)
+		if err != nil {
+			t.Fatalf("read tagged frame: %v", err)
+		}
+		if frameType != protocol.FrameTypeStdout {
+			continue
+		}
+		seq, payload, err := protocol.DecodeStdoutBody(body)
+		if err != nil {
+			t.Fatalf("decode stdout body: %v", err)
+		}
+		return seq, payload
 	}
-
-	// Accept the server-initiated bidi data stream. The daemon opens
-	// it + writes a zero-length open beacon frame immediately after
-	// AttachAck, so this should return promptly.
-	data, err := conn.AcceptStream(dialCtx)
-	if err != nil {
-		t.Fatalf("accept data bidi stream: %v", err)
-	}
-	// Drain the open-beacon (zero-length output frame) so callers
-	// see only real output.
-	if _, _, err := protocol.DecodeOutputFrame(data); err != nil {
-		t.Fatalf("decode data stream open beacon: %v", err)
-	}
-	return conn, ctrl, ack, data
 }
 
 func TestProtocolHandlerHappyPath(t *testing.T) {
@@ -208,30 +216,22 @@ func TestProtocolHandlerHappyPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	conn, ctrl, ack, stdout := dialAndAttach(t, h, h.sess.ID(), tok)
+	conn, stream, ack := dialAndAttach(t, h, h.sess.ID(), tok)
 	defer conn.CloseWithError(0, "")
-	defer ctrl.Close()
+	defer stream.Close()
 
 	if !ack.OK {
 		t.Fatalf("AttachAck.OK = false, err=%q msg=%q", ack.Err, ack.Msg)
 	}
 
-	// PTY pushes some output; ensure it arrives via the stdout
-	// stream as one or more output frames.
+	// PTY pushes some output; ensure it arrives as one or more
+	// FrameTypeStdout frames on the same stream.
 	want := []byte("hello-from-pty")
 	h.pty.push(want)
 
-	// Read frames until we've collected `want`.
 	got := make([]byte, 0, len(want))
-	deadline := time.Now().Add(2 * time.Second)
 	for len(got) < len(want) {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out collecting stdout; got %q so far, want %q", got, want)
-		}
-		_, payload, err := protocol.DecodeOutputFrame(stdout)
-		if err != nil {
-			t.Fatalf("decode output frame: %v", err)
-		}
+		_, payload := readNextStdoutFrame(t, stream)
 		got = append(got, payload...)
 	}
 	if !bytes.Equal(got, want) {
@@ -245,17 +245,15 @@ func TestProtocolHandlerStdinReachesPTY(t *testing.T) {
 	defer h.cleanup()
 
 	tok, _ := h.reg.IssueAttachToken(h.sess.ID())
-	conn, ctrl, ack, data := dialAndAttach(t, h, h.sess.ID(), tok)
+	conn, stream, ack := dialAndAttach(t, h, h.sess.ID(), tok)
 	defer conn.CloseWithError(0, "")
-	defer ctrl.Close()
+	defer stream.Close()
 	if !ack.OK {
 		t.Fatalf("AttachAck.OK = false: %s %s", ack.Err, ack.Msg)
 	}
 
-	// Write stdin on the data stream's client-write side. We don't
-	// close it — that would also tear down the read side, killing
-	// the output pump on the server.
-	if _, err := data.Write([]byte("hi\n")); err != nil {
+	// Send stdin as a tagged frame on the same single stream.
+	if err := protocol.WriteTaggedFrame(stream, protocol.FrameTypeStdin, []byte("hi\n")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -276,9 +274,9 @@ func TestProtocolHandlerRejectsBadToken(t *testing.T) {
 	defer h.cleanup()
 
 	var bad session.AttachToken // zero-valued, not in registry
-	conn, ctrl, ack, _ := dialAndAttach(t, h, h.sess.ID(), bad)
+	conn, stream, ack := dialAndAttach(t, h, h.sess.ID(), bad)
 	defer conn.CloseWithError(0, "")
-	defer ctrl.Close()
+	defer stream.Close()
 
 	if ack.OK {
 		t.Error("AttachAck.OK = true on bogus token")
@@ -296,9 +294,9 @@ func TestProtocolHandlerRejectsMismatchedSessionID(t *testing.T) {
 	tok, _ := h.reg.IssueAttachToken(h.sess.ID())
 	// Use a different session_id than the one the token authorises.
 	other, _ := session.NewSessionID()
-	conn, ctrl, ack, _ := dialAndAttach(t, h, other, tok)
+	conn, stream, ack := dialAndAttach(t, h, other, tok)
 	defer conn.CloseWithError(0, "")
-	defer ctrl.Close()
+	defer stream.Close()
 
 	if ack.OK {
 		t.Error("AttachAck.OK = true on session_id mismatch")
@@ -315,12 +313,12 @@ func TestProtocolHandlerReplaysBufferedOutputOnReattach(t *testing.T) {
 
 	// First attach + drop it, but leave bytes in the buffer.
 	tok, _ := h.reg.IssueAttachToken(h.sess.ID())
-	conn1, ctrl1, ack1, _ := dialAndAttach(t, h, h.sess.ID(), tok)
+	conn1, stream1, ack1 := dialAndAttach(t, h, h.sess.ID(), tok)
 	if !ack1.OK {
 		t.Fatalf("first attach failed: %s %s", ack1.Err, ack1.Msg)
 	}
 	conn1.CloseWithError(0, "")
-	ctrl1.Close()
+	stream1.Close()
 
 	// PTY emits while disconnected — these bytes accumulate in the
 	// session's ring buffer.
@@ -332,9 +330,9 @@ func TestProtocolHandlerReplaysBufferedOutputOnReattach(t *testing.T) {
 	// Reattach with last_ack_seq=0 — server should replay everything
 	// since the head was advanced past 0.
 	tok2, _ := h.reg.IssueAttachToken(h.sess.ID())
-	conn2, ctrl2, ack2, stdout2 := dialAndAttach(t, h, h.sess.ID(), tok2)
+	conn2, stream2, ack2 := dialAndAttach(t, h, h.sess.ID(), tok2)
 	defer conn2.CloseWithError(0, "")
-	defer ctrl2.Close()
+	defer stream2.Close()
 
 	if !ack2.OK {
 		t.Fatalf("reattach failed: %s %s", ack2.Err, ack2.Msg)
@@ -343,17 +341,10 @@ func TestProtocolHandlerReplaysBufferedOutputOnReattach(t *testing.T) {
 		t.Errorf("AttachAck.BufSeq = %d, want ≥ %d", ack2.BufSeq, len(missed))
 	}
 
-	// Read frames until we've seen the missed bytes.
+	// Read stdout frames until we've seen the missed bytes.
 	got := make([]byte, 0, len(missed))
-	deadline := time.Now().Add(2 * time.Second)
 	for len(got) < len(missed) {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out replaying; got %q want %q", got, missed)
-		}
-		_, payload, err := protocol.DecodeOutputFrame(stdout2)
-		if err != nil {
-			t.Fatalf("decode output frame: %v", err)
-		}
+		_, payload := readNextStdoutFrame(t, stream2)
 		got = append(got, payload...)
 	}
 	if !bytes.Contains(got, missed) {

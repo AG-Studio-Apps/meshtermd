@@ -11,8 +11,14 @@ import (
 	"github.com/AG-Studio-Apps/meshtermd/internal/session"
 )
 
-// outputPump streams the session's ring buffer to the data stream's
-// server-write side, framing each chunk with [seq][len][payload].
+// frameWriter sends one tagged frame on the protocol's single bidi
+// stream. The protocol_handler creates this with a mutex so the
+// output pump and the read pump's control-response sends don't race
+// on quic-go's Stream.Write.
+type frameWriter func(t uint8, body []byte) error
+
+// outputPump streams the session's ring buffer onto the wire as
+// FrameTypeStdout tagged frames (body = `[u64 BE seq][raw bytes]`).
 // It blocks on RingBuffer.WaitForData when the buffer has nothing
 // past the last-sent seq, and returns when ctx cancels (typical
 // teardown path).
@@ -20,13 +26,7 @@ import (
 // fromSeq is the position to start emitting from — the AttachAck's
 // Start field; this is either the client's last_ack_seq, or the
 // buffer's tail when ack < tail (truncated replay).
-//
-// The stream is bidi (the client's data stream); we only use the
-// send direction here. inputPump runs concurrently on the same
-// stream's receive direction. quic-go is fine with concurrent
-// read+write on the same Stream as long as the directions are
-// independent.
-func outputPump(ctx context.Context, sess *session.Session, w *quic.Stream, fromSeq uint64) error {
+func outputPump(ctx context.Context, sess *session.Session, write frameWriter, fromSeq uint64) error {
 	buf := sess.Buffer()
 	if buf == nil {
 		return nil
@@ -38,7 +38,8 @@ func outputPump(ctx context.Context, sess *session.Session, w *quic.Stream, from
 		}
 		data, newSeq, _ := buf.ReadSince(seq, protocol.MaxOutputFramePayload)
 		if len(data) > 0 {
-			if err := protocol.EncodeOutputFrame(w, seq, data); err != nil {
+			body := protocol.EncodeStdoutBody(seq, data)
+			if err := write(protocol.FrameTypeStdout, body); err != nil {
 				return err
 			}
 			seq = newSeq
@@ -51,34 +52,93 @@ func outputPump(ctx context.Context, sess *session.Session, w *quic.Stream, from
 	}
 }
 
-// inputPump forwards the data stream's client-write side into the
-// session's PTY. The QUIC stream's reliability + ordering means we
-// don't need any framing — bytes received are bytes typed.
+// readPump reads tagged frames from the single bidi stream and
+// dispatches by type:
+//
+//   - FrameTypeStdin: raw payload streams into the session's PTY.
+//   - FrameTypeControl: CBOR-decoded; Ack/Resize/Ping/Goodbye are
+//     handled via handleControlFrame (with control-side writes
+//     going through the same `write` writer).
 //
 // quic-go's Read does NOT abort on context cancel; without an
 // explicit CancelRead a stuck Read would pin this goroutine until
-// QUIC's idle timeout. We watch ctx in a sidecar and call CancelRead
-// when it fires (audit F11). The stream is bidi; we only use the
-// receive direction here.
-func inputPump(ctx context.Context, sess *session.Session, r *quic.Stream) error {
-	cancelOnDone(ctx, func() { r.CancelRead(0) })
-	chunk := make([]byte, 4096)
+// QUIC's idle timeout. We watch ctx in a sidecar (audit F11).
+func readPump(ctx context.Context, sess *session.Session, s *quic.Stream, write frameWriter) error {
+	cancelOnDone(ctx, func() { s.CancelRead(0) })
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		n, err := r.Read(chunk)
-		if n > 0 {
-			if _, werr := sess.WriteStdin(chunk[:n]); werr != nil {
-				return werr
-			}
-		}
+		frameType, body, err := protocol.ReadTaggedFrame(s)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err
 		}
+		switch frameType {
+		case protocol.FrameTypeStdin:
+			if len(body) > 0 {
+				if _, werr := sess.WriteStdin(body); werr != nil {
+					return werr
+				}
+			}
+		case protocol.FrameTypeControl:
+			if err := handleControlFrame(sess, body, write); err != nil {
+				return err
+			}
+		default:
+			// FrameTypeStdout from the client is a protocol violation
+			// (only the server emits stdout). Ignore for forward
+			// compat instead of tearing down — the same posture as
+			// unknown CBOR control message types.
+			continue
+		}
+	}
+}
+
+// handleControlFrame dispatches one CBOR control message read off
+// the single stream. Mirrors the previous controlPump body, except
+// outbound responses (Pong) go through the shared frameWriter so
+// they're serialised against outputPump's writes.
+//
+// Per the protocol spec, Ack is informational in v0 — we don't trim
+// the ring buffer below the ack point yet (the buffer's FIFO drop
+// policy already bounds memory). Future versions may use Ack to
+// keep the buffer larger when network is healthy and clients keep up.
+func handleControlFrame(sess *session.Session, body []byte, write frameWriter) error {
+	t, err := protocol.PeekType(body)
+	if err != nil {
+		return err
+	}
+	switch t {
+	case protocol.TypeAck:
+		// v0: informational only.
+		return nil
+	case protocol.TypeResize:
+		var m protocol.Resize
+		if err := protocol.StrictDecMode.Unmarshal(body, &m); err != nil {
+			return nil // skip malformed; don't tear the connection down
+		}
+		if m.Rows > 0 && m.Cols > 0 {
+			_ = sess.Resize(m.Rows, m.Cols)
+		}
+		return nil
+	case protocol.TypePing:
+		var m protocol.Ping
+		if err := protocol.StrictDecMode.Unmarshal(body, &m); err != nil {
+			return nil
+		}
+		pong, err := protocol.MarshalPong(protocol.Pong{Nonce: m.Nonce})
+		if err != nil {
+			return err
+		}
+		return write(protocol.FrameTypeControl, pong)
+	case protocol.TypeGoodbye:
+		return io.EOF // signal graceful close to readPump
+	default:
+		// Unknown control message type — ignore for forward compat.
+		return nil
 	}
 }
 
@@ -89,65 +149,4 @@ func cancelOnDone(ctx context.Context, cancel func()) {
 		<-ctx.Done()
 		cancel()
 	}()
-}
-
-// controlPump reads control-stream frames from the client (Ack,
-// Resize, Ping, Goodbye) and dispatches them. Returns nil on a
-// graceful Goodbye, ctx.Err on cancel, or any frame/decode error
-// otherwise.
-//
-// Per the protocol spec, Ack is informational in v0 — we don't
-// trim the ring buffer below the ack point yet (the buffer's FIFO
-// drop policy already bounds memory). Future versions may use Ack
-// to keep the buffer larger when network is healthy and clients
-// keep up.
-func controlPump(ctx context.Context, sess *session.Session, s *quic.Stream) error {
-	cancelOnDone(ctx, func() { s.CancelRead(0) })
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		body, err := protocol.ReadFrame(s)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		}
-		t, err := protocol.PeekType(body)
-		if err != nil {
-			return err
-		}
-		switch t {
-		case protocol.TypeAck:
-			// v0: informational only. We could pass to Session for
-			// buffer management; currently a no-op.
-			continue
-		case protocol.TypeResize:
-			var m protocol.Resize
-			if err := protocol.StrictDecMode.Unmarshal(body, &m); err != nil {
-				continue // skip malformed; don't tear the connection down
-			}
-			if m.Rows > 0 && m.Cols > 0 {
-				_ = sess.Resize(m.Rows, m.Cols)
-			}
-		case protocol.TypePing:
-			var m protocol.Ping
-			if err := protocol.StrictDecMode.Unmarshal(body, &m); err != nil {
-				continue
-			}
-			pong, err := protocol.MarshalPong(protocol.Pong{Nonce: m.Nonce})
-			if err != nil {
-				return err
-			}
-			if err := protocol.WriteFrame(s, pong); err != nil {
-				return err
-			}
-		case protocol.TypeGoodbye:
-			return nil
-		default:
-			// Unknown frame type — ignore for forward compat.
-			continue
-		}
-	}
 }

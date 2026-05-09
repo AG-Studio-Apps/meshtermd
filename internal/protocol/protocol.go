@@ -202,6 +202,81 @@ func PeekType(body []byte) (string, error) {
 	return d.T, nil
 }
 
+// Frame type discriminators for the single-stream Roam protocol.
+// Every frame on the bidi stream is wrapped in a tagged envelope:
+//
+//	[u8 type][u32 BE length][body]
+//
+// Stays in sync with iOS `RoamProtocol.FrameType` — both sides MUST
+// agree.
+const (
+	FrameTypeControl uint8 = 0 // body = CBOR-encoded control message
+	FrameTypeStdin   uint8 = 1 // client → server only; body = raw stdin bytes
+	FrameTypeStdout  uint8 = 2 // server → client only; body = [u64 BE seq][raw bytes]
+)
+
+// WriteTaggedFrame writes a `[u8 type][u32 BE len][body]` envelope.
+// The body is rejected if its length exceeds MaxControlFrameBytes
+// (the unified per-frame ceiling — covers control, stdin, and the
+// stdout body's seq+payload combined).
+func WriteTaggedFrame(w io.Writer, t uint8, body []byte) error {
+	if len(body) > MaxControlFrameBytes {
+		return fmt.Errorf("tagged frame body %d bytes exceeds limit %d", len(body), MaxControlFrameBytes)
+	}
+	var hdr [5]byte
+	hdr[0] = t
+	binary.BigEndian.PutUint32(hdr[1:5], uint32(len(body)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return fmt.Errorf("write tagged frame header: %w", err)
+	}
+	if _, err := w.Write(body); err != nil {
+		return fmt.Errorf("write tagged frame body: %w", err)
+	}
+	return nil
+}
+
+// ReadTaggedFrame reads exactly one tagged envelope from r and
+// returns the type tag + body. Frames larger than MaxControlFrameBytes
+// return an error without consuming the oversized body — the
+// connection MUST be torn down with ErrOversizedFrame.
+func ReadTaggedFrame(r io.Reader) (uint8, []byte, error) {
+	var hdr [5]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return 0, nil, err // io.EOF, io.ErrUnexpectedEOF, or transport error
+	}
+	t := hdr[0]
+	n := binary.BigEndian.Uint32(hdr[1:5])
+	if n > MaxControlFrameBytes {
+		return 0, nil, fmt.Errorf("tagged frame length %d exceeds limit %d", n, MaxControlFrameBytes)
+	}
+	body := make([]byte, n)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return 0, nil, fmt.Errorf("read tagged frame body: %w", err)
+	}
+	return t, body, nil
+}
+
+// EncodeStdoutBody composes the body of an FrameTypeStdout frame:
+// `[u64 BE seq][raw bytes]`. The caller wraps this in WriteTaggedFrame
+// with FrameTypeStdout.
+func EncodeStdoutBody(seq uint64, payload []byte) []byte {
+	out := make([]byte, 8+len(payload))
+	binary.BigEndian.PutUint64(out[0:8], seq)
+	copy(out[8:], payload)
+	return out
+}
+
+// DecodeStdoutBody splits an FrameTypeStdout body into (seq, payload).
+// payload aliases body[8:] — caller must copy if the body slice may
+// be reused.
+func DecodeStdoutBody(body []byte) (uint64, []byte, error) {
+	if len(body) < 8 {
+		return 0, nil, fmt.Errorf("stdout body %d bytes < 8 bytes for seq header", len(body))
+	}
+	seq := binary.BigEndian.Uint64(body[0:8])
+	return seq, body[8:], nil
+}
+
 // WriteFrame writes a length-prefixed CBOR frame to w. The body is
 // rejected if its length exceeds MaxControlFrameBytes — that's a bug
 // in the caller, not a wire issue.

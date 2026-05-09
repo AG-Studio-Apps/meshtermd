@@ -52,16 +52,20 @@ func (c *ctxReader) Read(p []byte) (int, error) {
 // the session.Registry it dispatches into.
 //
 // HandleConnection orchestrates the per-attach goroutines and waits
-// for any of them to return before tearing down. Stream lifecycles
-// are: client opens Control (bidi), client opens Data (bidi). The
-// data stream is full-duplex — the client side writes raw stdin
-// keystrokes; the server side writes [seq][len][bytes] output
-// frames. The Attach handshake is the first thing on Control;
-// AttachAck is sent on the same stream.
+// for any of them to return before tearing down. The whole protocol
+// runs on one client-initiated bidirectional stream: every frame is
+// wrapped in a `[u8 type][u32 len][body]` tagged envelope, where
+// type ∈ {control, stdin, stdout}. The Attach handshake is the
+// first frame; AttachAck is the response.
 //
-// We use two bidi streams instead of one bidi + two uni because iOS
-// Network.framework's NWConnection(from: NWConnectionGroup) only
-// supports opening client-initiated bidirectional streams.
+// We use a single stream rather than QUIC multistream because iOS
+// Network.framework's NWMultiplexGroup-based multistream API has
+// proved unworkable: NWConnection(from: NWConnectionGroup) returns
+// nil if called immediately after group.start, and the parent group
+// never transitions to .ready without a child being opened first
+// (chicken-and-egg). Type-tagged framing on a single bidi stream
+// keeps the persistence + replay-on-reattach semantics intact
+// without depending on Apple's multistream API.
 type ProtocolHandler struct {
 	Registry *session.Registry
 	Logger   *slog.Logger
@@ -80,10 +84,11 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 		_ = conn.CloseWithError(quic.ApplicationErrorCode(closeErr), closeMsg)
 	}()
 
-	// Accept the control stream — client opens it first, bidirectional.
+	// Accept the single bidi stream — the whole protocol multiplexes
+	// over this one stream via tagged-frame envelopes.
 	ctrl, err := conn.AcceptStream(ctx)
 	if err != nil {
-		log.WarnContext(ctx, "accept control stream", "err", err)
+		log.WarnContext(ctx, "accept stream", "err", err)
 		return
 	}
 
@@ -149,45 +154,31 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 
 	start, head, trunc := computeReplayWindow(buf, att.AckSeq)
 
-	if err := sendAttachAck(ctrl, protocol.AttachAck{
+	// Sync writes on the single stream — outputPump and the read
+	// pump's control responses (Pong, AttachAck etc.) both call
+	// writeFrame; quic-go's Stream.Write is not safe for concurrent
+	// callers, so we serialise via this mutex.
+	var writeMu sync.Mutex
+	writeFrame := func(t uint8, body []byte) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return protocol.WriteTaggedFrame(ctrl, t, body)
+	}
+
+	ackBody, err := protocol.MarshalAttachAck(protocol.AttachAck{
 		V:         1,
 		OK:        true,
 		SessionID: sess.ID().Bytes(),
 		Start:     start,
 		BufSeq:    head,
 		Trunc:     trunc,
-	}); err != nil {
-		log.WarnContext(ctx, "send AttachAck", "err", err)
-		return
-	}
-
-	// Open the data stream — server-initiated bidi. We initiate
-	// rather than waiting for the client because iOS NW.framework's
-	// `NWConnection(from: group)` returns a stream ID but won't put
-	// a STREAM frame on the wire until the client writes; if the
-	// user hasn't typed yet there's nothing to write, and a
-	// daemon-side AcceptStream would hang. By opening from the
-	// daemon and writing an immediate zero-length output beacon, the
-	// stream materialises promptly in the client's newConnectionHandler.
-	//
-	// Client writes raw stdin to this stream; we write [seq][len][bytes]
-	// output frames to the same stream. inputPump and outputPump
-	// share it (independent read + write directions on a bidi stream
-	// are safe under quic-go).
-	dataStream, err := conn.OpenStreamSync(ctx)
+	})
 	if err != nil {
-		log.WarnContext(ctx, "open data stream", "err", err)
+		log.WarnContext(ctx, "marshal AttachAck", "err", err)
 		return
 	}
-	defer dataStream.Close()
-
-	// Open beacon: zero-length output frame at the replay-start seq.
-	// EncodeOutputFrame writes [seq][len=0][no payload], which
-	// DecodeOutputFrame handles cleanly. The first server-side write
-	// is what causes quic-go to flush the STREAM frame and the iOS
-	// client's newConnectionHandler to fire.
-	if err := protocol.EncodeOutputFrame(dataStream, start, nil); err != nil {
-		log.WarnContext(ctx, "send data stream open beacon", "err", err)
+	if err := writeFrame(protocol.FrameTypeControl, ackBody); err != nil {
+		log.WarnContext(ctx, "send AttachAck", "err", err)
 		return
 	}
 
@@ -195,36 +186,28 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 	defer pumpsCancel()
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(2)
 
-	// Output pump runs immediately on the data stream's server-write
-	// side. It never blocks waiting for the client to start writing
-	// stdin.
+	// Output pump: read from the session's ring buffer and emit
+	// FrameTypeStdout frames on the single stream.
 	go func() {
 		defer wg.Done()
 		defer pumpsCancel()
-		if err := outputPump(pumpsCtx, sess, dataStream, start); err != nil && !errors.Is(err, context.Canceled) {
+		if err := outputPump(pumpsCtx, sess, writeFrame, start); err != nil && !errors.Is(err, context.Canceled) {
 			log.DebugContext(pumpsCtx, "output pump exit", "err", err)
 		}
 	}()
 
-	// Input pump reads from the data stream's client-write side and
-	// pipes into the session's PTY.
+	// Read pump: parse tagged frames from the single stream and
+	// dispatch by type. Control frames (Ack/Resize/Ping/Goodbye)
+	// route through the existing control handler; stdin frames
+	// stream into the PTY.
 	go func() {
 		defer wg.Done()
 		defer pumpsCancel()
-		if err := inputPump(pumpsCtx, sess, dataStream); err != nil &&
+		if err := readPump(pumpsCtx, sess, ctrl, writeFrame); err != nil &&
 			!errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
-			log.DebugContext(pumpsCtx, "input pump exit", "err", err)
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		defer pumpsCancel()
-		if err := controlPump(pumpsCtx, sess, ctrl); err != nil &&
-			!errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
-			log.DebugContext(pumpsCtx, "control pump exit", "err", err)
+			log.DebugContext(pumpsCtx, "read pump exit", "err", err)
 		}
 	}()
 
@@ -288,18 +271,22 @@ func (h *ProtocolHandler) resolveAttach(att protocol.Attach, ctrl *quic.Stream) 
 	return sess, nil
 }
 
-// readAttach reads the first frame from the control stream and
-// validates it's an Attach. Returns sentinel errors so the caller
-// can pick the right QUIC application error code via errors.Is.
+// readAttach reads the first tagged frame from the stream and
+// validates it's a control frame carrying an Attach. Returns
+// sentinel errors so the caller can pick the right QUIC application
+// error code via errors.Is.
 //
 // Notably we do NOT include the peer-supplied "got %q" type tag in
 // the wrapped error — that string round-trips into the
 // CONNECTION_CLOSE reason via closeMsgFor, and we don't echo peer
 // bytes there (audit F8).
-func readAttach(ctrl *quic.Stream) (protocol.Attach, error) {
-	body, err := protocol.ReadFrame(ctrl)
+func readAttach(s *quic.Stream) (protocol.Attach, error) {
+	frameType, body, err := protocol.ReadTaggedFrame(s)
 	if err != nil {
 		return protocol.Attach{}, fmt.Errorf("%w: %v", errAttachBadFrame, err)
+	}
+	if frameType != protocol.FrameTypeControl {
+		return protocol.Attach{}, errAttachWrongFirstFrame
 	}
 	t, err := protocol.PeekType(body)
 	if err != nil {
@@ -315,14 +302,15 @@ func readAttach(ctrl *quic.Stream) (protocol.Attach, error) {
 	return att, nil
 }
 
-// sendAttachAck stamps the type discriminator and writes the framed
-// response on the control stream.
+// sendAttachAck encodes a CBOR AttachAck and writes it as a control-
+// type tagged frame on the single stream. Used by resolveAttach for
+// failure responses where the writeMu serialiser isn't yet in scope.
 func sendAttachAck(s *quic.Stream, ack protocol.AttachAck) error {
 	body, err := protocol.MarshalAttachAck(ack)
 	if err != nil {
 		return err
 	}
-	return protocol.WriteFrame(s, body)
+	return protocol.WriteTaggedFrame(s, protocol.FrameTypeControl, body)
 }
 
 // Sentinel errors readAttach returns. Classifying via errors.Is

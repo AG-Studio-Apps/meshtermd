@@ -11,9 +11,13 @@
 # stripped via -ldflags="-s -w" and the build path is normalised via
 # -trimpath so binaries are reproducible.
 
-GO       := go
-PKG      := github.com/AG-Studio-Apps/meshtermd
-CMD_PKG  := $(PKG)/cmd/meshtermd
+GO        := go
+PKG       := github.com/AG-Studio-Apps/meshtermd
+# CMD_PATH is the on-disk relative path; CMD_PKG is the module-import
+# path. Use CMD_PATH for `go build` so the module-aware toolchain
+# never tries to resolve our own package via the module proxy.
+CMD_PATH  := ./cmd/meshtermd
+CMD_PKG   := $(PKG)/cmd/meshtermd
 
 VERSION ?= $(shell git describe --tags --dirty --always 2>/dev/null || echo v0.0.0-dev)
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -42,7 +46,7 @@ DIST_TARGETS := \
 all: vet test build
 
 build:
-	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./meshtermd $(CMD_PKG)
+	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./meshtermd $(CMD_PATH)
 
 test:
 	$(GO) test ./... -race -count=1
@@ -68,31 +72,31 @@ dist: $(addprefix dist-,$(DIST_TARGETS))
 
 dist-linux-amd64:
 	@mkdir -p dist
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/meshtermd-linux-amd64 $(CMD_PKG)
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/meshtermd-linux-amd64 $(CMD_PATH)
 
 dist-linux-arm64:
 	@mkdir -p dist
-	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/meshtermd-linux-arm64 $(CMD_PKG)
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/meshtermd-linux-arm64 $(CMD_PATH)
 
 dist-linux-armv7:
 	@mkdir -p dist
-	GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/meshtermd-linux-armv7 $(CMD_PKG)
+	GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/meshtermd-linux-armv7 $(CMD_PATH)
 
 dist-darwin-amd64:
 	@mkdir -p dist
-	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/meshtermd-darwin-amd64 $(CMD_PKG)
+	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/meshtermd-darwin-amd64 $(CMD_PATH)
 
 dist-darwin-arm64:
 	@mkdir -p dist
-	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/meshtermd-darwin-arm64 $(CMD_PKG)
+	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/meshtermd-darwin-arm64 $(CMD_PATH)
 
 dist-freebsd-amd64:
 	@mkdir -p dist
-	GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/meshtermd-freebsd-amd64 $(CMD_PKG)
+	GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/meshtermd-freebsd-amd64 $(CMD_PATH)
 
 dist-freebsd-arm64:
 	@mkdir -p dist
-	GOOS=freebsd GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/meshtermd-freebsd-arm64 $(CMD_PKG)
+	GOOS=freebsd GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/meshtermd-freebsd-arm64 $(CMD_PATH)
 
 clean:
 	rm -rf dist meshtermd

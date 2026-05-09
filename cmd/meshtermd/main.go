@@ -33,13 +33,9 @@ func main() {
 	case "version", "--version", "-v":
 		fmt.Println(build.String())
 	case "serve":
-		fmt.Fprintln(os.Stderr, "meshtermd serve: not implemented yet (Phase 2 in progress)")
-		_ = args
-		os.Exit(1)
+		os.Exit(runServe(args))
 	case "connect":
-		fmt.Fprintln(os.Stderr, "meshtermd connect: not implemented yet (Phase 2 in progress)")
-		_ = args
-		os.Exit(1)
+		os.Exit(runConnect(args))
 	case "help", "--help", "-h":
 		usage(os.Stdout)
 	default:

@@ -1,0 +1,27 @@
+# Binaries
+meshtermd
+meshtermd-*
+/dist/
+/build/
+/out/
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Local cert / state directories used during dev
+.local-state/
+testdata/keys/

@@ -11,16 +11,22 @@ import (
 	"github.com/AG-Studio-Apps/meshtermd/internal/session"
 )
 
-// outputPump streams the session's ring buffer to the client's
-// stdout stream, framing each chunk with [seq][len][payload]. It
-// blocks on RingBuffer.WaitForData when the buffer has nothing
+// outputPump streams the session's ring buffer to the data stream's
+// server-write side, framing each chunk with [seq][len][payload].
+// It blocks on RingBuffer.WaitForData when the buffer has nothing
 // past the last-sent seq, and returns when ctx cancels (typical
 // teardown path).
 //
 // fromSeq is the position to start emitting from — the AttachAck's
 // Start field; this is either the client's last_ack_seq, or the
 // buffer's tail when ack < tail (truncated replay).
-func outputPump(ctx context.Context, sess *session.Session, w *quic.SendStream, fromSeq uint64) error {
+//
+// The stream is bidi (the client's data stream); we only use the
+// send direction here. inputPump runs concurrently on the same
+// stream's receive direction. quic-go is fine with concurrent
+// read+write on the same Stream as long as the directions are
+// independent.
+func outputPump(ctx context.Context, sess *session.Session, w *quic.Stream, fromSeq uint64) error {
 	buf := sess.Buffer()
 	if buf == nil {
 		return nil
@@ -45,15 +51,16 @@ func outputPump(ctx context.Context, sess *session.Session, w *quic.SendStream, 
 	}
 }
 
-// inputPump forwards the client's stdin stream into the session's
-// PTY. The QUIC stream's reliability + ordering means we don't need
-// any framing — bytes received are bytes typed.
+// inputPump forwards the data stream's client-write side into the
+// session's PTY. The QUIC stream's reliability + ordering means we
+// don't need any framing — bytes received are bytes typed.
 //
-// quic-go's ReceiveStream.Read does NOT abort on context cancel;
-// without an explicit CancelRead a stuck Read would pin this
-// goroutine until QUIC's idle timeout. We watch ctx in a sidecar
-// and call CancelRead when it fires (audit F11).
-func inputPump(ctx context.Context, sess *session.Session, r *quic.ReceiveStream) error {
+// quic-go's Read does NOT abort on context cancel; without an
+// explicit CancelRead a stuck Read would pin this goroutine until
+// QUIC's idle timeout. We watch ctx in a sidecar and call CancelRead
+// when it fires (audit F11). The stream is bidi; we only use the
+// receive direction here.
+func inputPump(ctx context.Context, sess *session.Session, r *quic.Stream) error {
 	cancelOnDone(ctx, func() { r.CancelRead(0) })
 	chunk := make([]byte, 4096)
 	for {

@@ -134,7 +134,7 @@ func newHandlerHarness(t *testing.T) *harness {
 // dialAndAttach drives the client side of the Attach handshake.
 // Returns the QUIC connection (with control + stdin streams open),
 // the AttachAck, and the AcceptStream-derived stdout stream.
-func dialAndAttach(t *testing.T, h *harness, sid session.SessionID, token session.AttachToken) (*quic.Conn, *quic.Stream, protocol.AttachAck, *quic.ReceiveStream) {
+func dialAndAttach(t *testing.T, h *harness, sid session.SessionID, token session.AttachToken) (*quic.Conn, *quic.Stream, protocol.AttachAck, *quic.Stream) {
 	t.Helper()
 	var fp [32]byte
 	copy(fp[:], h.fp)
@@ -183,12 +183,19 @@ func dialAndAttach(t *testing.T, h *harness, sid session.SessionID, token sessio
 		return conn, ctrl, ack, nil
 	}
 
-	// Server opens stdout uni stream.
-	stdout, err := conn.AcceptUniStream(dialCtx)
+	// Accept the server-initiated bidi data stream. The daemon opens
+	// it + writes a zero-length open beacon frame immediately after
+	// AttachAck, so this should return promptly.
+	data, err := conn.AcceptStream(dialCtx)
 	if err != nil {
-		t.Fatalf("accept stdout uni stream: %v", err)
+		t.Fatalf("accept data bidi stream: %v", err)
 	}
-	return conn, ctrl, ack, stdout
+	// Drain the open-beacon (zero-length output frame) so callers
+	// see only real output.
+	if _, _, err := protocol.DecodeOutputFrame(data); err != nil {
+		t.Fatalf("decode data stream open beacon: %v", err)
+	}
+	return conn, ctrl, ack, data
 }
 
 func TestProtocolHandlerHappyPath(t *testing.T) {
@@ -238,24 +245,19 @@ func TestProtocolHandlerStdinReachesPTY(t *testing.T) {
 	defer h.cleanup()
 
 	tok, _ := h.reg.IssueAttachToken(h.sess.ID())
-	conn, ctrl, ack, _ := dialAndAttach(t, h, h.sess.ID(), tok)
+	conn, ctrl, ack, data := dialAndAttach(t, h, h.sess.ID(), tok)
 	defer conn.CloseWithError(0, "")
 	defer ctrl.Close()
 	if !ack.OK {
 		t.Fatalf("AttachAck.OK = false: %s %s", ack.Err, ack.Msg)
 	}
 
-	// Open client-initiated stdin uni stream.
-	dialCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	stdin, err := conn.OpenUniStreamSync(dialCtx)
-	if err != nil {
+	// Write stdin on the data stream's client-write side. We don't
+	// close it — that would also tear down the read side, killing
+	// the output pump on the server.
+	if _, err := data.Write([]byte("hi\n")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := stdin.Write([]byte("hi\n")); err != nil {
-		t.Fatal(err)
-	}
-	_ = stdin.Close()
 
 	// Wait for the bytes to arrive at the PTY.
 	deadline := time.Now().Add(2 * time.Second)

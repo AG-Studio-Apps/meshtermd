@@ -53,9 +53,15 @@ func (c *ctxReader) Read(p []byte) (int, error) {
 //
 // HandleConnection orchestrates the per-attach goroutines and waits
 // for any of them to return before tearing down. Stream lifecycles
-// are: client opens Control (bidi), client opens Stdin (uni), server
-// opens Stdout (uni). The Attach handshake is the first thing on
-// Control; AttachAck is sent on the same stream.
+// are: client opens Control (bidi), client opens Data (bidi). The
+// data stream is full-duplex — the client side writes raw stdin
+// keystrokes; the server side writes [seq][len][bytes] output
+// frames. The Attach handshake is the first thing on Control;
+// AttachAck is sent on the same stream.
+//
+// We use two bidi streams instead of one bidi + two uni because iOS
+// Network.framework's NWConnection(from: NWConnectionGroup) only
+// supports opening client-initiated bidirectional streams.
 type ProtocolHandler struct {
 	Registry *session.Registry
 	Logger   *slog.Logger
@@ -155,22 +161,33 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 		return
 	}
 
-	stdoutStream, err := conn.OpenUniStream()
+	// Open the data stream — server-initiated bidi. We initiate
+	// rather than waiting for the client because iOS NW.framework's
+	// `NWConnection(from: group)` returns a stream ID but won't put
+	// a STREAM frame on the wire until the client writes; if the
+	// user hasn't typed yet there's nothing to write, and a
+	// daemon-side AcceptStream would hang. By opening from the
+	// daemon and writing an immediate zero-length output beacon, the
+	// stream materialises promptly in the client's newConnectionHandler.
+	//
+	// Client writes raw stdin to this stream; we write [seq][len][bytes]
+	// output frames to the same stream. inputPump and outputPump
+	// share it (independent read + write directions on a bidi stream
+	// are safe under quic-go).
+	dataStream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
-		log.WarnContext(ctx, "open stdout stream", "err", err)
+		log.WarnContext(ctx, "open data stream", "err", err)
 		return
 	}
-	defer stdoutStream.Close()
+	defer dataStream.Close()
 
-	// quic-go's OpenUniStream is lazy: the peer doesn't see the
-	// stream until we send data on it. Write a zero-length output
-	// frame at the replay-start seq as a deterministic "stream open"
-	// beacon — DecodeOutputFrame handles len=0 cleanly, so this is
-	// a no-op in payload terms but ensures the client's
-	// AcceptUniStream returns even if there's no buffered output
-	// yet.
-	if err := protocol.EncodeOutputFrame(stdoutStream, start, nil); err != nil {
-		log.WarnContext(ctx, "send stdout open beacon", "err", err)
+	// Open beacon: zero-length output frame at the replay-start seq.
+	// EncodeOutputFrame writes [seq][len=0][no payload], which
+	// DecodeOutputFrame handles cleanly. The first server-side write
+	// is what causes quic-go to flush the STREAM frame and the iOS
+	// client's newConnectionHandler to fire.
+	if err := protocol.EncodeOutputFrame(dataStream, start, nil); err != nil {
+		log.WarnContext(ctx, "send data stream open beacon", "err", err)
 		return
 	}
 
@@ -180,30 +197,23 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 	var wg sync.WaitGroup
 	wg.Add(3)
 
-	// Output pump runs immediately — never blocks waiting for the
-	// client's stdin stream to appear.
+	// Output pump runs immediately on the data stream's server-write
+	// side. It never blocks waiting for the client to start writing
+	// stdin.
 	go func() {
 		defer wg.Done()
 		defer pumpsCancel()
-		if err := outputPump(pumpsCtx, sess, stdoutStream, start); err != nil && !errors.Is(err, context.Canceled) {
+		if err := outputPump(pumpsCtx, sess, dataStream, start); err != nil && !errors.Is(err, context.Canceled) {
 			log.DebugContext(pumpsCtx, "output pump exit", "err", err)
 		}
 	}()
 
-	// Input pump accepts the client's stdin uni stream at its own
-	// leisure. The client may delay opening it (e.g., during initial
-	// replay) without blocking output.
+	// Input pump reads from the data stream's client-write side and
+	// pipes into the session's PTY.
 	go func() {
 		defer wg.Done()
 		defer pumpsCancel()
-		stdinStream, err := conn.AcceptUniStream(pumpsCtx)
-		if err != nil {
-			if !errors.Is(err, context.Canceled) {
-				log.DebugContext(pumpsCtx, "accept stdin stream", "err", err)
-			}
-			return
-		}
-		if err := inputPump(pumpsCtx, sess, stdinStream); err != nil &&
+		if err := inputPump(pumpsCtx, sess, dataStream); err != nil &&
 			!errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
 			log.DebugContext(pumpsCtx, "input pump exit", "err", err)
 		}

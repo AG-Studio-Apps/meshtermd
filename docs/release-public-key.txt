@@ -5,15 +5,14 @@
 # at build time and uses it to verify the daemon binary it's about
 # to upload via SFTP.
 #
-# Generation procedure (one-time, on a trusted machine):
+# To verify a release manually:
 #
-#   minisign -G -s minisign.key -p minisign.pub
+#   minisign -V -p docs/release-public-key.txt -m SHA256SUMS
 #
-# Then commit the contents of minisign.pub here. Store minisign.key
-# offline + as a GitHub secret named MINISIGN_KEY (with
-# MINISIGN_PASSWORD if set). Never commit the private key.
-#
-# Status: not yet provisioned. Releases prior to provisioning are
-# unsigned (verifiable only against SHA256SUMS hash). The iOS
-# integration will refuse to auto-install daemons until a key is
-# set.
+# The iOS client also trusts an EMERGENCY key (held offline, not
+# published here) so the primary can be rotated without shipping a
+# new iOS build. Both public keys live in the iOS source at
+# Sources/meshTerm/Roam/RoamInstallConstants.swift.
+
+untrusted comment: minisign public key 94562DC3EC2D6EB4
+RWS0bi3swy1WlKoCoCnTQtCYAvt01ue3mMxhVy/Q6qxmVOdPpt8eIyQ1

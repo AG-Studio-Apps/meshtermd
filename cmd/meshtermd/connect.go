@@ -38,6 +38,10 @@ func runConnect(args []string) int {
 		"per-session idle timeout — how long the daemon keeps this session alive while no client is attached "+
 			"and the shell is producing no output. 0 = use the daemon's default. Ignored when reattaching: the "+
 			"timeout is fixed at session creation. Clamped at the daemon's --max-idle-timeout ceiling when set.")
+	name := fs.String("name", "",
+		"user-visible session name. With --session=new (or omitted), enables 'create-if-missing': the daemon "+
+			"reattaches to an existing session of this name, or spawns a fresh one with this name. With "+
+			"--session=<hex>, --name is ignored (the session's identity is fixed at creation).")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: meshtermd connect [flags]\n\n")
 		fs.PrintDefaults()
@@ -75,6 +79,7 @@ func runConnect(args []string) int {
 		Exec:             execArgs,
 		Shell:            *shell,
 		IdleTimeoutNanos: int64(*idleTimeout),
+		Name:             *name,
 	})
 	if err != nil {
 		if errors.Is(err, ipc.ErrDaemonNotRunning) {

@@ -291,14 +291,40 @@ func (d *Daemon) HandleKillSession(ctx context.Context, req ipc.KillSessionReque
 	return ipc.KillSessionResponse{Ok: true}
 }
 
-// lookupOrCreateSession returns the session referenced by req. If
-// SessionID is empty or "new", a new session is spawned (which
-// includes opening a PTY and starting the Pump goroutine).
+// lookupOrCreateSession returns the session referenced by req. The
+// resolution rules cover four cases:
+//
+//  1. SessionID is hex (parses cleanly) → look up by ID; error
+//     if missing. Reattach path; req.Name is ignored.
+//  2. SessionID == "" || SessionID == "new", req.Name is set →
+//     "create-if-missing": look up by name; if found, attach to
+//     it. If not found, spawn a fresh session with that name.
+//     Matches tmux's `new -A -s name` idiom and is what the iOS
+//     picker uses for "+ New named X" + every plain-tap probe.
+//  3. SessionID == "" || SessionID == "new", req.Name is empty →
+//     spawn a fresh anonymous session (daemon synthesises name).
+//     Legacy "any session, no preferences" allocate.
+//  4. SessionID is neither "new" nor a parseable hex string →
+//     ErrBadRequest. Future overload (e.g., "name:foo") would land
+//     here, but we don't ship that — see B1 in the plan.
 //
 // Errors are wrapped in allocateErr so the caller can map them to
 // AllocateResponse fields.
 func (d *Daemon) lookupOrCreateSession(req ipc.AllocateRequest) (*session.Session, error) {
 	if req.SessionID == "" || req.SessionID == "new" {
+		// Name-driven path: prefer reattach to an existing session
+		// with this name, fall back to spawn. Empty Name → plain
+		// anonymous spawn (legacy).
+		if req.Name != "" {
+			if sess, err := d.registry.LookupByName(req.Name); err == nil {
+				return sess, nil
+			}
+			// Not found — fall through to spawn (which will use
+			// req.Name and may collide if the name was added
+			// concurrently between LookupByName and Add; in that
+			// race the spawn returns ErrNameInUse, which is
+			// surfaced verbatim).
+		}
 		return d.spawnSession(req)
 	}
 

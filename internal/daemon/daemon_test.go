@@ -199,40 +199,86 @@ func TestDaemonAllocateAssignsDefaultName(t *testing.T) {
 	}
 }
 
-// TestDaemonAllocateNameCollisionReturnsError pins the create-fresh
-// path's failure surface when a non-empty name is taken.
-func TestDaemonAllocateNameCollisionReturnsError(t *testing.T) {
+// TestDaemonAllocateNameRoundtripsThroughResponse asserts that the
+// Name field on the request comes back on the response — clients
+// rely on this to confirm what the daemon resolved (especially in
+// the create-if-missing flow where the server may attach to a
+// pre-existing session of that name and the client wants to know
+// about it).
+func TestDaemonAllocateNameRoundtripsThroughResponse(t *testing.T) {
+	t.Parallel()
+	_, c, cleanup := startDaemon(t)
+	defer cleanup()
+
+	resp, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID: "new",
+		Name:      "namedreq",
+		Shell:     "/bin/sh",
+		Exec:      []string{"-c", "while true; do sleep 1; done"},
+	})
+	if err != nil || !resp.Ok {
+		t.Fatalf("allocate: %v %s %s", err, resp.Err, resp.Msg)
+	}
+	if resp.Name != "namedreq" {
+		t.Errorf("Name = %q, want %q (echo)", resp.Name, "namedreq")
+	}
+}
+
+// TestDaemonAllocateByNameAttachExisting verifies the create-if-
+// missing idiom. Two Allocates with the same Name and SessionID="new"
+// must return the SAME SessionID — the second call attached to the
+// first's session rather than spawning a duplicate.
+func TestDaemonAllocateByNameAttachExisting(t *testing.T) {
 	t.Parallel()
 	_, c, cleanup := startDaemon(t)
 	defer cleanup()
 
 	first, err := c.Allocate(context.Background(), ipc.AllocateRequest{
-		SessionID: "new",
-		Name:      "dev",
-		Shell:     "/bin/sh",
-		Exec:      []string{"-c", "while true; do sleep 1; done"},
+		SessionID: "new", Name: "shared",
+		Shell: "/bin/sh", Exec: []string{"-c", "while true; do sleep 1; done"},
 	})
 	if err != nil || !first.Ok {
-		t.Fatalf("first allocate: %v %s %s", err, first.Err, first.Msg)
-	}
-	if first.Name != "dev" {
-		t.Errorf("first.Name = %q, want %q", first.Name, "dev")
+		t.Fatalf("first allocate: %v %s", err, first.Err)
 	}
 
+	// Second allocate with same name + SessionID="new" — must
+	// reattach, not spawn.
 	second, err := c.Allocate(context.Background(), ipc.AllocateRequest{
-		SessionID: "new",
-		Name:      "dev", // explicit collision on a fresh-spawn request
-		Shell:     "/bin/sh",
-		Exec:      []string{"-c", "while true; do sleep 1; done"},
+		SessionID: "new", Name: "shared",
 	})
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || !second.Ok {
+		t.Fatalf("second allocate: %v %s", err, second.Err)
 	}
-	if second.Ok {
-		t.Error("Ok=true on duplicate-name fresh-spawn; want failure")
+	if second.SessionID != first.SessionID {
+		t.Errorf("second.SessionID = %q, want %q (must reattach by name, not spawn)",
+			second.SessionID, first.SessionID)
 	}
-	if second.Err != ipc.ErrNameInUse {
-		t.Errorf("Err = %q, want %q", second.Err, ipc.ErrNameInUse)
+	if second.AttachToken == first.AttachToken {
+		t.Error("second allocate reused the same attach token (must be fresh)")
+	}
+}
+
+// TestDaemonAllocateByNameCreateIfMissing verifies the spawn-if-
+// missing branch. Allocate with a fresh name → daemon spawns a new
+// session; the returned SessionID is non-empty and the resolved
+// Name matches the request.
+func TestDaemonAllocateByNameCreateIfMissing(t *testing.T) {
+	t.Parallel()
+	_, c, cleanup := startDaemon(t)
+	defer cleanup()
+
+	resp, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID: "new", Name: "fresh",
+		Shell: "/bin/sh", Exec: []string{"-c", "while true; do sleep 1; done"},
+	})
+	if err != nil || !resp.Ok {
+		t.Fatalf("allocate: %v %s", err, resp.Err)
+	}
+	if resp.Name != "fresh" {
+		t.Errorf("Name = %q, want %q", resp.Name, "fresh")
+	}
+	if resp.SessionID == "" {
+		t.Error("SessionID empty on successful create-if-missing")
 	}
 }
 

@@ -130,6 +130,27 @@ type Attach struct {
 }
 
 // AttachAck is the server's response to Attach.
+//
+// Reserved-for-future-use CBOR map keys (NOT to be used by other
+// fields; the StrictDecMode ignores unknowns, so adding these later
+// is forward-compatible):
+//
+//	"mode"  - string. "exclusive" (default, current behaviour:
+//	          the new attach displaces any prior client) or
+//	          "shared" (multiple clients receive the same output
+//	          stream; future read-only watcher / pair-programming
+//	          mode). Ship today's clients without the field; old
+//	          clients ignoring it on the wire is intentional.
+//	"peers" - []string. Hex SessionIDs of other clients currently
+//	          attached to this session. Useful for the iOS picker
+//	          to render an "also attached: <name>" hint before the
+//	          user displaces them. Empty when this is the only
+//	          attach.
+//
+// Add fields here when the multi-attach work lands; the IPC
+// `SessionInfo.AttachedNow bool` already flags "someone is here"
+// at picker-list time, but a per-attach snapshot needs the AttachAck
+// extension to be useful.
 type AttachAck struct {
 	T         string `cbor:"t"`
 	V         uint32 `cbor:"v"`

@@ -3,6 +3,8 @@
 # in the tree; "/meshtermd" matches only the build artifact at the root.
 /meshtermd
 /meshtermd-*
+/mtctl
+/mtctl-*
 /dist/
 /build/
 /out/

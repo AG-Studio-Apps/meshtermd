@@ -21,6 +21,23 @@ Pre-1.0. The wire protocol is not yet stable. Do not depend on this for anything
 - Sessions persist across client disconnects; reattach replays buffered output since last ack
 - Bootstrap is performed inside an existing SSH session for trust establishment
 
+## Companion CLI: `mtctl`
+
+`mtctl` is the laptop/desktop counterpart to the iOS app — manages
+remote sessions over SSH. Same binary distribution; same release
+artifacts. Tier 1 today: `list`, `status`, `new`, `kill`, `rename`.
+Terminal attach is future work.
+
+```
+mtctl --host me@dev-box list
+mtctl --host me@dev-box new --name dev
+mtctl --host me@dev-box rename dev staging
+mtctl --host me@dev-box kill staging
+```
+
+Set `MTCTL_HOST` once per shell or write the target into
+`~/.config/mtctl/host` to omit `--host`.
+
 The transport-layer security is TLS 1.3 (provided by Go's standard library inside `quic-go`); we add cert pinning bootstrapped over SSH. There is no application-layer cryptography in this codebase.
 
 ## Reporting issues

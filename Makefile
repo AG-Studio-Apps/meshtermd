@@ -19,6 +19,10 @@ PKG       := github.com/AG-Studio-Apps/meshtermd
 CMD_PATH  := ./cmd/meshtermd
 CMD_PKG   := $(PKG)/cmd/meshtermd
 
+# mtctl is the laptop/desktop management CLI. Built from the same
+# module as meshtermd so it shares the IPC type definitions.
+MTCTL_PATH := ./cmd/mtctl
+
 VERSION ?= $(shell git describe --tags --dirty --always 2>/dev/null || echo v0.0.0-dev)
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -43,10 +47,13 @@ DIST_TARGETS := \
 
 .PHONY: all build test vet lint vuln dist clean
 
-all: vet test build
+all: vet test build build-mtctl
 
 build:
 	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./meshtermd $(CMD_PATH)
+
+build-mtctl:
+	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./mtctl $(MTCTL_PATH)
 
 test:
 	$(GO) test ./... -race -count=1
@@ -68,7 +75,7 @@ lint-deps:
 	$(GO) install honnef.co/go/tools/cmd/staticcheck@latest
 	$(GO) install golang.org/x/vuln/cmd/govulncheck@latest
 
-dist: $(addprefix dist-,$(DIST_TARGETS))
+dist: $(addprefix dist-,$(DIST_TARGETS)) $(addprefix dist-mtctl-,$(DIST_TARGETS))
 
 dist-linux-amd64:
 	@mkdir -p dist
@@ -98,5 +105,36 @@ dist-freebsd-arm64:
 	@mkdir -p dist
 	GOOS=freebsd GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/meshtermd-freebsd-arm64 $(CMD_PATH)
 
+# mtctl cross-compile rows. Mirrors the meshtermd matrix exactly —
+# someone running the daemon on a freebsd-arm64 box presumably
+# wants the matching CLI on their laptop.
+dist-mtctl-linux-amd64:
+	@mkdir -p dist
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/mtctl-linux-amd64 $(MTCTL_PATH)
+
+dist-mtctl-linux-arm64:
+	@mkdir -p dist
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/mtctl-linux-arm64 $(MTCTL_PATH)
+
+dist-mtctl-linux-armv7:
+	@mkdir -p dist
+	GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/mtctl-linux-armv7 $(MTCTL_PATH)
+
+dist-mtctl-darwin-amd64:
+	@mkdir -p dist
+	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/mtctl-darwin-amd64 $(MTCTL_PATH)
+
+dist-mtctl-darwin-arm64:
+	@mkdir -p dist
+	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/mtctl-darwin-arm64 $(MTCTL_PATH)
+
+dist-mtctl-freebsd-amd64:
+	@mkdir -p dist
+	GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/mtctl-freebsd-amd64 $(MTCTL_PATH)
+
+dist-mtctl-freebsd-arm64:
+	@mkdir -p dist
+	GOOS=freebsd GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o ./dist/mtctl-freebsd-arm64 $(MTCTL_PATH)
+
 clean:
-	rm -rf dist meshtermd
+	rm -rf dist meshtermd mtctl

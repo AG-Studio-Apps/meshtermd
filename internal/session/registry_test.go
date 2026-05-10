@@ -321,6 +321,89 @@ func TestLookupByName(t *testing.T) {
 	}
 }
 
+// TestRenameUpdatesBothIndices: the secondary byName index and the
+// Session.Name field must move in lockstep. After rename:
+//   - LookupByName(old) misses
+//   - LookupByName(new) hits the same Session pointer
+//   - sess.Name() returns the new name
+func TestRenameUpdatesBothIndices(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry(0, 0, 0, 0)
+	id, _ := NewSessionID()
+	s, _ := NewSession(id, "old", newFakePTY(), 24, 80, 1024, 0)
+	if err := r.Add(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Rename(id, "new"); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if _, err := r.LookupByName("old"); !errors.Is(err, ErrUnknownSession) {
+		t.Errorf("old name still resolves after rename: %v", err)
+	}
+	got, err := r.LookupByName("new")
+	if err != nil {
+		t.Fatalf("LookupByName(new): %v", err)
+	}
+	if got != s {
+		t.Error("LookupByName(new) returned wrong pointer")
+	}
+	if s.Name() != "new" {
+		t.Errorf("Name() = %q, want %q", s.Name(), "new")
+	}
+}
+
+// TestRenameRejectsDuplicate: renaming to a name in use returns
+// ErrDuplicateName; the original session keeps its old name.
+func TestRenameRejectsDuplicate(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry(0, 0, 0, 0)
+	a, _ := NewSession(must(NewSessionID()), "alpha", newFakePTY(), 24, 80, 1024, 0)
+	b, _ := NewSession(must(NewSessionID()), "beta", newFakePTY(), 24, 80, 1024, 0)
+	_ = r.Add(a)
+	_ = r.Add(b)
+	if err := r.Rename(b.ID(), "alpha"); !errors.Is(err, ErrDuplicateName) {
+		t.Errorf("Rename(b, alpha) = %v, want ErrDuplicateName", err)
+	}
+	if b.Name() != "beta" {
+		t.Errorf("b.Name() = %q after failed rename, want %q", b.Name(), "beta")
+	}
+}
+
+// TestRenameUnknownSessionErrors: renaming a non-existent session
+// returns ErrUnknownSession.
+func TestRenameUnknownSessionErrors(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry(0, 0, 0, 0)
+	missing, _ := NewSessionID()
+	if err := r.Rename(missing, "anything"); !errors.Is(err, ErrUnknownSession) {
+		t.Errorf("Rename(missing) = %v, want ErrUnknownSession", err)
+	}
+}
+
+// TestRenameToSameNameIsNoOp: setting the current name returns nil
+// and doesn't disturb the byName index.
+func TestRenameToSameNameIsNoOp(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry(0, 0, 0, 0)
+	s, _ := NewSession(must(NewSessionID()), "x", newFakePTY(), 24, 80, 1024, 0)
+	_ = r.Add(s)
+	if err := r.Rename(s.ID(), "x"); err != nil {
+		t.Errorf("Rename to same name = %v, want nil", err)
+	}
+	if got, _ := r.LookupByName("x"); got != s {
+		t.Error("byName index disturbed by no-op rename")
+	}
+}
+
+// must is a tiny helper that unwraps `(T, error)` returns for one-
+// shot test setup where the error path is unreachable.
+func must[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
 // TestSweepClearsByNameIndex asserts the secondary index doesn't leak
 // after GC reaps a named session.
 func TestSweepClearsByNameIndex(t *testing.T) {

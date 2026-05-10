@@ -44,6 +44,10 @@ func main() {
 		os.Exit(runList(args))
 	case "kill":
 		os.Exit(runKill(args))
+	case "rename":
+		os.Exit(runRename(args))
+	case "status":
+		os.Exit(runStatus(args))
 	case "help", "--help", "-h":
 		usage(os.Stdout)
 	default:
@@ -64,6 +68,8 @@ Subcommands:
   connect            SSH-side bootstrap helper invoked by the meshTerm iOS app
   list               enumerate live sessions on this daemon (--json for machine-readable output)
   kill               reap a session by id or name
+  rename             change a session's user-visible name (PTY + buffer unaffected)
+  status             print the daemon's operational snapshot (--json for tooling)
 
 Run 'meshtermd <subcommand> --help' for subcommand-specific flags.
 `, build.Version)

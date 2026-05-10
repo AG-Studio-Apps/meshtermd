@@ -370,6 +370,148 @@ func TestDaemonKillSessionByName(t *testing.T) {
 	}
 }
 
+// TestDaemonStatusReturnsLiveCounters: spawn N sessions, then
+// Status reports the matching count, a non-zero uptime, and the
+// expected idle-timeout config.
+func TestDaemonStatusReturnsLiveCounters(t *testing.T) {
+	t.Parallel()
+	_, c, cleanup := startDaemon(t)
+	defer cleanup()
+
+	for i := 0; i < 3; i++ {
+		_, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+			SessionID: "new", Name: fmt.Sprintf("s%d", i),
+			Shell: "/bin/sh", Exec: []string{"-c", "while true; do sleep 1; done"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	resp, err := c.Status(context.Background())
+	if err != nil || !resp.Ok {
+		t.Fatalf("status: %v %s", err, resp.Err)
+	}
+	if resp.SessionCount != 3 {
+		t.Errorf("SessionCount = %d, want 3", resp.SessionCount)
+	}
+	if resp.MaxSessions <= 0 {
+		t.Errorf("MaxSessions = %d, want > 0", resp.MaxSessions)
+	}
+	if resp.IdleTimeoutNs <= 0 {
+		t.Errorf("IdleTimeoutNs = %d, want > 0", resp.IdleTimeoutNs)
+	}
+	if resp.UptimeNs <= 0 {
+		t.Errorf("UptimeNs = %d, want > 0", resp.UptimeNs)
+	}
+	if resp.QUICAddr == "" {
+		t.Error("QUICAddr empty in status response")
+	}
+	if resp.CertFingerprint == "" {
+		t.Error("CertFingerprint empty in status response")
+	}
+}
+
+// TestDaemonRenameSessionByName covers the end-to-end rename via
+// IPC: spawn → rename by name → verify list reflects the new name
+// and the old name no longer resolves.
+func TestDaemonRenameSessionByName(t *testing.T) {
+	t.Parallel()
+	_, c, cleanup := startDaemon(t)
+	defer cleanup()
+
+	_, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID: "new", Name: "oldlabel",
+		Shell: "/bin/sh", Exec: []string{"-c", "while true; do sleep 1; done"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rn, err := c.RenameSession(context.Background(), "oldlabel", "newlabel")
+	if err != nil || !rn.Ok {
+		t.Fatalf("rename: %v %s %s", err, rn.Err, rn.Msg)
+	}
+	if rn.Name != "newlabel" {
+		t.Errorf("rename echoed Name = %q, want %q", rn.Name, "newlabel")
+	}
+
+	list, _ := c.ListSessions(context.Background())
+	var found bool
+	for _, s := range list.Sessions {
+		if s.Name == "newlabel" {
+			found = true
+		}
+		if s.Name == "oldlabel" {
+			t.Error("old name still appears in list after rename")
+		}
+	}
+	if !found {
+		t.Error("new name not in list after rename")
+	}
+}
+
+// TestDaemonRenameSessionEmptyNewNameErrors: the daemon rejects an
+// empty NewName at the IPC layer (a session must remain reachable
+// via the picker; anonymous-by-rename would orphan it).
+func TestDaemonRenameSessionEmptyNewNameErrors(t *testing.T) {
+	t.Parallel()
+	_, c, cleanup := startDaemon(t)
+	defer cleanup()
+
+	_, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID: "new", Name: "anchor",
+		Shell: "/bin/sh", Exec: []string{"-c", "while true; do sleep 1; done"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := c.RenameSession(context.Background(), "anchor", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Ok {
+		t.Error("Ok=true with empty new name; want bad_request")
+	}
+	if resp.Err != ipc.ErrBadRequest {
+		t.Errorf("Err = %q, want %q", resp.Err, ipc.ErrBadRequest)
+	}
+}
+
+// TestDaemonRenameSessionCollisionErrors: renaming to a name held
+// by another session returns ErrNameInUse; the source session
+// retains its old name.
+func TestDaemonRenameSessionCollisionErrors(t *testing.T) {
+	t.Parallel()
+	_, c, cleanup := startDaemon(t)
+	defer cleanup()
+
+	_, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID: "new", Name: "first",
+		Shell: "/bin/sh", Exec: []string{"-c", "while true; do sleep 1; done"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID: "new", Name: "second",
+		Shell: "/bin/sh", Exec: []string{"-c", "while true; do sleep 1; done"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := c.RenameSession(context.Background(), "second", "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Ok {
+		t.Error("Ok=true on collision; want name_in_use")
+	}
+	if resp.Err != ipc.ErrNameInUse {
+		t.Errorf("Err = %q, want %q", resp.Err, ipc.ErrNameInUse)
+	}
+}
+
 // TestDaemonKillSessionByID covers the hex-ID kill path.
 func TestDaemonKillSessionByID(t *testing.T) {
 	t.Parallel()

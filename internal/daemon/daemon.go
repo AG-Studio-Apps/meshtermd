@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AG-Studio-Apps/meshtermd/internal/build"
 	"github.com/AG-Studio-Apps/meshtermd/internal/cert"
 	"github.com/AG-Studio-Apps/meshtermd/internal/ipc"
 	"github.com/AG-Studio-Apps/meshtermd/internal/pty"
@@ -73,6 +74,9 @@ type Daemon struct {
 	registry *session.Registry
 	quic     *transport.Server
 	ipc      *ipc.Server
+	// startedAt is set once in New so HandleStatus can compute
+	// uptime without keeping a separate state machine.
+	startedAt time.Time
 }
 
 // New constructs a Daemon. Loads or generates the TLS cert,
@@ -104,11 +108,12 @@ func New(cfg Config) (*Daemon, error) {
 	reg := session.NewRegistry(cfg.MaxSessions, cfg.IdleTimeout, 0, cfg.MaxIdleTimeout)
 
 	d := &Daemon{
-		cfg:      cfg,
-		logger:   logger,
-		cert:     tlsCert,
-		certFP:   fp,
-		registry: reg,
+		cfg:       cfg,
+		logger:    logger,
+		cert:      tlsCert,
+		certFP:    fp,
+		registry:  reg,
+		startedAt: time.Now(),
 	}
 
 	d.quic, err = transport.New(transport.Config{
@@ -258,6 +263,64 @@ func (d *Daemon) HandleListSessions(ctx context.Context, _ ipc.ListSessionsReque
 		})
 	}
 	return ipc.ListSessionsResponse{Ok: true, Sessions: out}
+}
+
+// HandleStatus returns the daemon's operational snapshot. Pure
+// read — no side effects. Used by `meshtermd status`, by Phase 5's
+// install-flow version probe, and by systemd-unit health checks.
+func (d *Daemon) HandleStatus(ctx context.Context, _ ipc.StatusRequest) ipc.StatusResponse {
+	now := time.Now()
+	return ipc.StatusResponse{
+		Ok:               true,
+		Version:          build.String(),
+		StartedAtNs:      d.startedAt.UnixNano(),
+		UptimeNs:         now.Sub(d.startedAt).Nanoseconds(),
+		QUICAddr:         d.quic.Addr().String(),
+		CertFingerprint:  d.certFP.String(),
+		SessionCount:     d.registry.Len(),
+		MaxSessions:      d.registry.Capacity(),
+		IdleTimeoutNs:    int64(d.registry.IdleTimeout()),
+		MaxIdleTimeoutNs: int64(d.registry.MaxIdleTimeout()),
+		PendingTokens:    d.registry.PendingTokenCount(),
+	}
+}
+
+// HandleRenameSession changes a session's user-visible Name.
+// Selector resolution mirrors KillSession: hex SessionID first,
+// fall back to LookupByName. The PTY + ring buffer + active
+// attach are unaffected — this is a pure-label change.
+func (d *Daemon) HandleRenameSession(ctx context.Context, req ipc.RenameSessionRequest) ipc.RenameSessionResponse {
+	if req.Sel == "" {
+		return ipc.RenameSessionResponse{Ok: false, Err: ipc.ErrBadRequest, Msg: "selector required"}
+	}
+	if req.NewName == "" {
+		return ipc.RenameSessionResponse{Ok: false, Err: ipc.ErrBadRequest, Msg: "new name required"}
+	}
+
+	// Resolve selector → SessionID.
+	var sid session.SessionID
+	if parsed, err := session.ParseSessionID(req.Sel); err == nil {
+		sid = parsed
+	} else {
+		sess, lerr := d.registry.LookupByName(req.Sel)
+		if lerr != nil {
+			return ipc.RenameSessionResponse{Ok: false, Err: ipc.ErrUnknownSession, Msg: lerr.Error()}
+		}
+		sid = sess.ID()
+	}
+
+	if err := d.registry.Rename(sid, req.NewName); err != nil {
+		code := ipc.ErrInternal
+		switch {
+		case errors.Is(err, session.ErrUnknownSession):
+			code = ipc.ErrUnknownSession
+		case errors.Is(err, session.ErrDuplicateName):
+			code = ipc.ErrNameInUse
+		}
+		return ipc.RenameSessionResponse{Ok: false, Err: code, Msg: err.Error()}
+	}
+	d.logger.Info("session renamed", "session", sid.String(), "name", req.NewName)
+	return ipc.RenameSessionResponse{Ok: true, Name: req.NewName}
 }
 
 // HandleKillSession reaps a session by hex SessionID or by Name.

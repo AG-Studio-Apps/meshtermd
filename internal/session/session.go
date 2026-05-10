@@ -178,6 +178,17 @@ func (s *Session) Name() string {
 	return s.name
 }
 
+// setName mutates the Session's user-visible label under its lock.
+// Package-private: only the Registry calls this, as part of an
+// atomic rename that ALSO updates the byName index. Callers from
+// outside the package must use Registry.Rename to keep the
+// indices in lockstep.
+func (s *Session) setName(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.name = name
+}
+
 // LastActiveAt returns the wall-clock time of the most recent
 // activity event (PTY output, stdin write, resize, or attach).
 // Symmetric with IdleFor; ListSessions uses this for the picker

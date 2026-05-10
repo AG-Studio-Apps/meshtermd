@@ -178,6 +178,70 @@ func DecodeKillSessionResponse(body []byte) (KillSessionResponse, error) {
 	return resp, nil
 }
 
+// DecodeRenameSessionRequest decodes a frame body as a RenameSessionRequest.
+func DecodeRenameSessionRequest(body []byte) (RenameSessionRequest, error) {
+	t, err := PeekType(body)
+	if err != nil {
+		return RenameSessionRequest{}, err
+	}
+	if t != TypeRenameSession {
+		return RenameSessionRequest{}, fmt.Errorf("expected RenameSession frame, got %q", t)
+	}
+	var req RenameSessionRequest
+	if err := protocol.StrictDecMode.Unmarshal(body, &req); err != nil {
+		return RenameSessionRequest{}, err
+	}
+	return req, nil
+}
+
+// DecodeRenameSessionResponse mirrors DecodeRenameSessionRequest.
+func DecodeRenameSessionResponse(body []byte) (RenameSessionResponse, error) {
+	t, err := PeekType(body)
+	if err != nil {
+		return RenameSessionResponse{}, err
+	}
+	if t != TypeRenameSession {
+		return RenameSessionResponse{}, fmt.Errorf("expected RenameSession response, got %q", t)
+	}
+	var resp RenameSessionResponse
+	if err := protocol.StrictDecMode.Unmarshal(body, &resp); err != nil {
+		return RenameSessionResponse{}, err
+	}
+	return resp, nil
+}
+
+// DecodeStatusRequest decodes a frame body as a StatusRequest.
+func DecodeStatusRequest(body []byte) (StatusRequest, error) {
+	t, err := PeekType(body)
+	if err != nil {
+		return StatusRequest{}, err
+	}
+	if t != TypeStatus {
+		return StatusRequest{}, fmt.Errorf("expected Status frame, got %q", t)
+	}
+	var req StatusRequest
+	if err := protocol.StrictDecMode.Unmarshal(body, &req); err != nil {
+		return StatusRequest{}, err
+	}
+	return req, nil
+}
+
+// DecodeStatusResponse mirrors DecodeStatusRequest.
+func DecodeStatusResponse(body []byte) (StatusResponse, error) {
+	t, err := PeekType(body)
+	if err != nil {
+		return StatusResponse{}, err
+	}
+	if t != TypeStatus {
+		return StatusResponse{}, fmt.Errorf("expected Status response, got %q", t)
+	}
+	var resp StatusResponse
+	if err := protocol.StrictDecMode.Unmarshal(body, &resp); err != nil {
+		return StatusResponse{}, err
+	}
+	return resp, nil
+}
+
 func cborMarshal(v any) ([]byte, error) {
 	em, err := cbor.CTAP2EncOptions().EncMode()
 	if err != nil {

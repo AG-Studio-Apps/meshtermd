@@ -228,6 +228,57 @@ func (r *Registry) LookupByName(name string) (*Session, error) {
 	return s, nil
 }
 
+// Rename changes the user-visible name of an existing session.
+// Atomic across both the session's own Name field and the
+// registry's byName index — callers can rely on a successful
+// return meaning LookupByName(newName) hits immediately and any
+// in-flight ListSessions snapshots observe one of {old name, new
+// name} but never a half-way state.
+//
+// Errors:
+//
+//   - ErrUnknownSession if the SessionID isn't in the registry.
+//   - ErrDuplicateName if newName is non-empty and already taken.
+//   - returns nil and is a no-op if oldName == newName.
+//
+// newName == "" is rejected; renaming a session to anonymous
+// would make it unreachable via the picker. To detach a name
+// from a session, kill the session and create a fresh one.
+func (r *Registry) Rename(id SessionID, newName string) error {
+	if newName == "" {
+		return errors.New("session name must not be empty")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	s, ok := r.sessions[id]
+	if !ok {
+		return ErrUnknownSession
+	}
+
+	// Both r.mu and s.mu under our control for the read+write
+	// window so concurrent ListSessions / Name() readers observe
+	// either old or new state, never a half-applied byName +
+	// stale Session.name combo.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	oldName := s.name
+	if oldName == newName {
+		return nil
+	}
+	if existing, ok := r.byName[newName]; ok && existing != s {
+		return ErrDuplicateName
+	}
+	if oldName != "" {
+		if cur, ok := r.byName[oldName]; ok && cur == s {
+			delete(r.byName, oldName)
+		}
+	}
+	r.byName[newName] = s
+	s.name = newName
+	return nil
+}
+
 // Remove drops the session from the catalogue and closes it. Safe to
 // call with an unknown ID (no-op).
 func (r *Registry) Remove(id SessionID) {
@@ -262,6 +313,10 @@ func (r *Registry) Capacity() int { return r.maxSessions }
 
 // IdleTimeout returns the configured idle timeout.
 func (r *Registry) IdleTimeout() time.Duration { return r.idleTimeout }
+
+// MaxIdleTimeout returns the operator-imposed ceiling on per-session
+// idle timeouts. Zero means no ceiling.
+func (r *Registry) MaxIdleTimeout() time.Duration { return r.maxIdleTimeout }
 
 // IDs returns the session IDs currently in the registry. Order is not
 // stable. Useful for diagnostics; the registry is the authority on

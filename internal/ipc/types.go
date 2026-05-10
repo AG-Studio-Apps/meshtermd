@@ -18,10 +18,12 @@ package ipc
 // messages. Discriminated by the `t` tag, like the protocol's
 // control stream.
 const (
-	TypeAllocate     = "Allocate"
-	TypePing         = "Ping"
-	TypeListSessions = "ListSessions"
-	TypeKillSession  = "KillSession"
+	TypeAllocate      = "Allocate"
+	TypePing          = "Ping"
+	TypeListSessions  = "ListSessions"
+	TypeKillSession   = "KillSession"
+	TypeRenameSession = "RenameSession"
+	TypeStatus        = "Status"
 )
 
 // AllocateRequest reserves an attach for the named session (or
@@ -145,6 +147,59 @@ type KillSessionResponse struct {
 	Ok  bool   `cbor:"ok"`
 	Err string `cbor:"err,omitempty"`
 	Msg string `cbor:"msg,omitempty"`
+}
+
+// RenameSessionRequest changes a session's user-visible Name. Sel
+// follows the same id-or-name resolution as KillSession.
+// The PTY + ring buffer + active attach are untouched — this is a
+// pure-label change. Empty NewName is rejected (anonymous-by-rename
+// would leave a session unreachable via the picker).
+type RenameSessionRequest struct {
+	T       string `cbor:"t"`
+	Sel     string `cbor:"sel"`
+	NewName string `cbor:"new"`
+}
+
+// RenameSessionResponse echoes the new name on success so the
+// caller can confirm the daemon's view matches.
+type RenameSessionResponse struct {
+	T    string `cbor:"t"`
+	Ok   bool   `cbor:"ok"`
+	Name string `cbor:"name,omitempty"`
+	Err  string `cbor:"err,omitempty"`
+	Msg  string `cbor:"msg,omitempty"`
+}
+
+// StatusRequest asks the daemon for its current operational
+// snapshot. Read-only; no parameters. Useful for health probes
+// (Phase 5 install flow + systemd unit health checks) and for
+// debugging "is the daemon I think I'm talking to actually the
+// daemon I'm talking to?"
+type StatusRequest struct {
+	T string `cbor:"t"`
+}
+
+// StatusResponse carries one snapshot of the daemon's
+// configuration + live counters. Field tags are short stable
+// strings; JSON tags match the wire shape `meshtermd status
+// --json` emits for tooling consumers.
+type StatusResponse struct {
+	T  string `cbor:"t" json:"-"`
+	Ok bool   `cbor:"ok" json:"ok"`
+
+	Version             string `cbor:"ver,omitempty" json:"version"`
+	StartedAtNs         int64  `cbor:"sat,omitempty" json:"started_at_ns"`
+	UptimeNs            int64  `cbor:"upt,omitempty" json:"uptime_ns"`
+	QUICAddr            string `cbor:"qa,omitempty" json:"quic_addr"`
+	CertFingerprint     string `cbor:"fp,omitempty" json:"cert_fingerprint"`
+	SessionCount        int    `cbor:"sc,omitempty" json:"session_count"`
+	MaxSessions         int    `cbor:"ms,omitempty" json:"max_sessions"`
+	IdleTimeoutNs       int64  `cbor:"itn,omitempty" json:"idle_timeout_ns"`
+	MaxIdleTimeoutNs    int64  `cbor:"mitn,omitempty" json:"max_idle_timeout_ns"`
+	PendingTokens       int    `cbor:"pt,omitempty" json:"pending_tokens"`
+
+	Err string `cbor:"err,omitempty" json:"err,omitempty"`
+	Msg string `cbor:"msg,omitempty" json:"msg,omitempty"`
 }
 
 // PingRequest is a liveness check used by `meshtermd connect` to

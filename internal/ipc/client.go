@@ -89,6 +89,48 @@ func (c *Client) ListSessions(ctx context.Context) (ListSessionsResponse, error)
 	return DecodeListSessionsResponse(body)
 }
 
+// Status returns the daemon's operational snapshot — uptime,
+// session count, idle-timeout config, attach-token pool size, QUIC
+// bound address, cert fingerprint. Read-only.
+func (c *Client) Status(ctx context.Context) (StatusResponse, error) {
+	conn, err := c.dial(ctx)
+	if err != nil {
+		return StatusResponse{}, err
+	}
+	defer conn.Close()
+
+	if err := EncodeRequest(conn, StatusRequest{T: TypeStatus}); err != nil {
+		return StatusResponse{}, fmt.Errorf("send: %w", err)
+	}
+	body, err := ReadFrame(conn)
+	if err != nil {
+		return StatusResponse{}, fmt.Errorf("recv: %w", err)
+	}
+	return DecodeStatusResponse(body)
+}
+
+// RenameSession changes a session's user-visible Name. Sel uses
+// the same id-or-name resolution as KillSession; newName must be
+// non-empty. Returns ErrNameInUse if newName is already taken by
+// another session.
+func (c *Client) RenameSession(ctx context.Context, idOrName, newName string) (RenameSessionResponse, error) {
+	conn, err := c.dial(ctx)
+	if err != nil {
+		return RenameSessionResponse{}, err
+	}
+	defer conn.Close()
+
+	req := RenameSessionRequest{T: TypeRenameSession, Sel: idOrName, NewName: newName}
+	if err := EncodeRequest(conn, req); err != nil {
+		return RenameSessionResponse{}, fmt.Errorf("send: %w", err)
+	}
+	body, err := ReadFrame(conn)
+	if err != nil {
+		return RenameSessionResponse{}, fmt.Errorf("recv: %w", err)
+	}
+	return DecodeRenameSessionResponse(body)
+}
+
 // KillSession reaps a session by hex SessionID or by Name. The
 // daemon resolves the selector — try-as-id-first, fall back to
 // name lookup. Idempotent on already-gone sessions: returns

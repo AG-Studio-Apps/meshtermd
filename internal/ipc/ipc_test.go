@@ -46,6 +46,14 @@ func (h *echoHandler) HandleKillSession(ctx context.Context, _ KillSessionReques
 	return KillSessionResponse{Ok: true}
 }
 
+func (h *echoHandler) HandleRenameSession(ctx context.Context, req RenameSessionRequest) RenameSessionResponse {
+	return RenameSessionResponse{Ok: true, Name: req.NewName}
+}
+
+func (h *echoHandler) HandleStatus(ctx context.Context, _ StatusRequest) StatusResponse {
+	return StatusResponse{Ok: true, Version: "test", SessionCount: 0, MaxSessions: 100}
+}
+
 func startServer(t *testing.T, h Handler) (*Server, string) {
 	t.Helper()
 	dir := tempDirWith0700(t)

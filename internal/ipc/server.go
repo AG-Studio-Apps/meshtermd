@@ -24,6 +24,8 @@ type Handler interface {
 	HandlePing(ctx context.Context, req PingRequest) PingResponse
 	HandleListSessions(ctx context.Context, req ListSessionsRequest) ListSessionsResponse
 	HandleKillSession(ctx context.Context, req KillSessionRequest) KillSessionResponse
+	HandleRenameSession(ctx context.Context, req RenameSessionRequest) RenameSessionResponse
+	HandleStatus(ctx context.Context, req StatusRequest) StatusResponse
 }
 
 // Server listens on a Unix socket and dispatches incoming requests
@@ -219,6 +221,30 @@ func (s *Server) handle(ctx context.Context, conn *net.UnixConn) {
 		}
 		resp := s.handler.HandleKillSession(ctx, req)
 		resp.T = TypeKillSession
+		_ = EncodeResponse(conn, resp)
+	case TypeRenameSession:
+		req, err := DecodeRenameSessionRequest(body)
+		if err != nil {
+			_ = EncodeResponse(conn, RenameSessionResponse{
+				T: TypeRenameSession, Ok: false,
+				Err: ErrBadRequest, Msg: err.Error(),
+			})
+			return
+		}
+		resp := s.handler.HandleRenameSession(ctx, req)
+		resp.T = TypeRenameSession
+		_ = EncodeResponse(conn, resp)
+	case TypeStatus:
+		req, err := DecodeStatusRequest(body)
+		if err != nil {
+			_ = EncodeResponse(conn, StatusResponse{
+				T: TypeStatus, Ok: false,
+				Err: ErrBadRequest, Msg: err.Error(),
+			})
+			return
+		}
+		resp := s.handler.HandleStatus(ctx, req)
+		resp.T = TypeStatus
 		_ = EncodeResponse(conn, resp)
 	default:
 		_ = EncodeResponse(conn, AllocateResponse{

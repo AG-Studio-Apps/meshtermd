@@ -124,6 +124,30 @@ There is no application-layer cryptography in `meshtermd` or the iOS client's Ro
 | Concern | A user audits our binary and asks "does this thing exfiltrate my data" |
 | Defense | Only data flowing through the active terminal session reaches the QUIC connection. The daemon does not read files outside `~/.local/share/meshtermd/` (its own state) and the PTY of its child process. The source is auditable; the binary build is reproducible (Go build flags pinned). |
 
+### K. IPC surface — read access (information disclosure)
+
+| | |
+|---|---|
+| Concern | The IPC unix socket carries more than `Allocate` now — it grew `ListSessions` (full inventory) and `Status` (daemon-wide stats) as part of the named-multi-session work. A local process that can read the socket sees every active session's name, ID, created/last-active timestamps, attached-or-not flag, and PTY geometry. |
+| Defense | The socket is filesystem-protected: mode 0600, parent dir verified at mode ≤ 0700 with `uid == getuid()` (see `verifyParentDir` in `internal/ipc/server.go`). Any other local user with read access to the parent dir is already trusted at the OS level — they could `ptrace`/`cat /proc/<pid>/mem` the daemon directly. SSH-as-auth-boundary stands: if you can reach the socket, you're the user the daemon serves. |
+| Residual | Session **names** are user-chosen and may carry secrets ("prod-db-recovery-2026-05-10"). They're disclosed to anything reading the socket, but no further. |
+
+### L. IPC surface — destructive ops
+
+| | |
+|---|---|
+| Concern | `KillSession` terminates a session's PTY + closes its ring buffer + invalidates its attach. `RenameSession` mutates a user-visible label. Both are reachable from the IPC socket without an additional permission check. |
+| Defense | Same filesystem-permission posture as J. The daemon does not require a confirmation token or capability check for destructive ops beyond "you can talk to the socket." Acceptable because the socket is uid-scoped and the user can already trivially `pkill meshtermd` to achieve the same destruction. |
+| Residual | A confused-deputy attack via a script that the user runs would be able to invoke `kill`/`rename`. The same script could `rm -rf ~/.local/share/meshtermd/` for greater damage, so this is not the weakest link. |
+
+### M. Session-name collisions as a denial vector
+
+| | |
+|---|---|
+| Concern | A user (or a script the user is tricked into running) repeatedly `Allocate`s sessions until the daemon's `MaxSessions` cap is hit, or names every session "main" to mask a hidden one. |
+| Defense | `MaxSessions` (default 100) bounds total resource use. Duplicate-name `Allocate` returns `ErrNameInUse` rather than silently spawning. The picker UI shows hex SessionIDs alongside names so a hidden session can't be perfectly camouflaged. |
+| Residual | A user who'd run a malicious script with shell access has many worse options. The 100-session cap is configurable down for hardened deployments via `--max-sessions`. |
+
 ## Cert lifecycle
 
 - Generated on first daemon startup, stored at `~/.local/share/meshtermd/{cert,key}.pem` with mode 0600.
@@ -181,3 +205,7 @@ This is the checklist we run before each release. Contributors are encouraged to
 - [ ] No timing-sensitive comparisons of secrets; use `crypto/subtle.ConstantTimeCompare`
 - [ ] `~/.local/share/meshtermd/key.pem` written with 0600 mode atomically
 - [ ] `/proc/<pid>/environ`, `/proc/<pid>/cmdline` do not contain secrets
+- [ ] IPC socket bound at mode 0600 with `verifyParentDir` covering the containing dir
+- [ ] `Status` response does not leak fields that aren't already user-derivable (cert FP and QUIC addr are fine — they appear in the bootstrap line anyway)
+- [ ] `RenameSession` rejects empty new-name (would orphan the session from the picker)
+- [ ] `KillSession` resolves selector through `ParseSessionID` first, then `LookupByName` — never executes shell strings

@@ -94,10 +94,10 @@ type harness struct {
 func newHandlerHarness(t *testing.T) *harness {
 	t.Helper()
 	c, fp := freshCert(t)
-	reg := session.NewRegistry(0, time.Hour, time.Hour)
+	reg := session.NewRegistry(0, time.Hour, time.Hour, 0)
 	id, _ := session.NewSessionID()
 	pty := newFakePTY()
-	sess, err := session.NewSession(id, pty, 24, 80, 4096)
+	sess, err := session.NewSession(id, pty, 24, 80, 4096, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

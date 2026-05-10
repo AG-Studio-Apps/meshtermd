@@ -19,8 +19,17 @@ import (
 // Shutdown to drain.
 type Registry struct {
 	maxSessions int
+	// idleTimeout is the daemon-wide *default* timeout used for any
+	// session that didn't request its own (Session.idleTimeout == 0).
+	// The actual GC decision is made per-session in Sweep.
 	idleTimeout time.Duration
-	gcInterval  time.Duration
+	// maxIdleTimeout is the operator's ceiling on per-session
+	// timeouts. A client requesting a longer value is silently
+	// clamped at allocate time. Zero means no ceiling — the
+	// personal-server default; shared deployments would set this to
+	// e.g. 7d to bound resource cost.
+	maxIdleTimeout time.Duration
+	gcInterval     time.Duration
 
 	mu       sync.Mutex
 	sessions map[SessionID]*Session
@@ -107,8 +116,10 @@ var ErrDuplicateID = errors.New("session id already exists")
 var ErrUnknownSession = errors.New("unknown session id")
 
 // NewRegistry constructs a Registry with the given limits. Zero or
-// negative limits fall back to the Default* constants.
-func NewRegistry(maxSessions int, idleTimeout, gcInterval time.Duration) *Registry {
+// negative limits fall back to the Default* constants. maxIdleTimeout
+// = 0 means no operator-imposed ceiling (per-session timeouts may go
+// arbitrarily large, bounded only by the time.Duration type).
+func NewRegistry(maxSessions int, idleTimeout, gcInterval, maxIdleTimeout time.Duration) *Registry {
 	if maxSessions <= 0 {
 		maxSessions = DefaultMaxSessions
 	}
@@ -118,13 +129,31 @@ func NewRegistry(maxSessions int, idleTimeout, gcInterval time.Duration) *Regist
 	if gcInterval <= 0 {
 		gcInterval = DefaultGCInterval
 	}
-	return &Registry{
-		maxSessions: maxSessions,
-		idleTimeout: idleTimeout,
-		gcInterval:  gcInterval,
-		sessions:    make(map[SessionID]*Session),
-		tokens:      make(map[AttachToken]pendingAttach),
+	if maxIdleTimeout < 0 {
+		maxIdleTimeout = 0
 	}
+	return &Registry{
+		maxSessions:    maxSessions,
+		idleTimeout:    idleTimeout,
+		maxIdleTimeout: maxIdleTimeout,
+		gcInterval:     gcInterval,
+		sessions:       make(map[SessionID]*Session),
+		tokens:         make(map[AttachToken]pendingAttach),
+	}
+}
+
+// ResolveIdleTimeout maps a client-requested timeout to the value the
+// session will actually carry. Zero from the client means "use the
+// daemon default". A non-zero value is clamped at the registry's
+// MaxIdleTimeout ceiling when one is set.
+func (r *Registry) ResolveIdleTimeout(requested time.Duration) time.Duration {
+	if requested <= 0 {
+		return r.idleTimeout
+	}
+	if r.maxIdleTimeout > 0 && requested > r.maxIdleTimeout {
+		return r.maxIdleTimeout
+	}
+	return requested
 }
 
 // Add inserts an already-constructed Session into the registry. The
@@ -288,7 +317,13 @@ func (r *Registry) Sweep() int {
 
 	r.mu.Lock()
 	for id, s := range r.sessions {
-		if now.Sub(s.lastActivityForGC()) >= r.idleTimeout {
+		// Per-session timeout takes precedence; zero means
+		// "inherit the registry default", set at NewSession time.
+		timeout := s.idleTimeoutForGC()
+		if timeout <= 0 {
+			timeout = r.idleTimeout
+		}
+		if now.Sub(s.lastActivityForGC()) >= timeout {
 			doomed = append(doomed, s)
 			delete(r.sessions, id)
 		}
@@ -351,4 +386,13 @@ func (s *Session) lastActivityForGC() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastActiveAt
+}
+
+// idleTimeoutForGC mirrors lastActivityForGC: a package-private
+// no-lock-leak accessor for the GC sweep. Zero return means "fall
+// back to the registry default" — the sweep handles that branch.
+func (s *Session) idleTimeoutForGC() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.idleTimeout
 }

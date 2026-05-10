@@ -41,7 +41,7 @@ func TestParseAttachTokenRejectsBad(t *testing.T) {
 
 func TestIssueAttachTokenRequiresSessionInRegistry(t *testing.T) {
 	t.Parallel()
-	r := NewRegistry(0, 0, 0)
+	r := NewRegistry(0, 0, 0, 0)
 	id, _ := NewSessionID()
 	if _, err := r.IssueAttachToken(id); !errors.Is(err, ErrUnknownSession) {
 		t.Errorf("IssueAttachToken on unknown session = %v, want ErrUnknownSession", err)
@@ -50,7 +50,7 @@ func TestIssueAttachTokenRequiresSessionInRegistry(t *testing.T) {
 
 func TestIssueThenConsumeRoundTrip(t *testing.T) {
 	t.Parallel()
-	r := NewRegistry(0, 0, 0)
+	r := NewRegistry(0, 0, 0, 0)
 	s := mustNewSession(t)
 	if err := r.Add(s); err != nil {
 		t.Fatal(err)
@@ -78,7 +78,7 @@ func TestIssueThenConsumeRoundTrip(t *testing.T) {
 
 func TestConsumeAttachTokenIsSingleUse(t *testing.T) {
 	t.Parallel()
-	r := NewRegistry(0, 0, 0)
+	r := NewRegistry(0, 0, 0, 0)
 	s := mustNewSession(t)
 	r.Add(s)
 	tok, _ := r.IssueAttachToken(s.ID())
@@ -93,7 +93,7 @@ func TestConsumeAttachTokenIsSingleUse(t *testing.T) {
 
 func TestConsumeAttachTokenRejectsExpired(t *testing.T) {
 	t.Parallel()
-	r := NewRegistry(0, 0, 0)
+	r := NewRegistry(0, 0, 0, 0)
 	s := mustNewSession(t)
 	r.Add(s)
 
@@ -122,7 +122,7 @@ func TestConsumeAttachTokenRejectsExpired(t *testing.T) {
 
 func TestConsumeAttachTokenRejectsUnknown(t *testing.T) {
 	t.Parallel()
-	r := NewRegistry(0, 0, 0)
+	r := NewRegistry(0, 0, 0, 0)
 	var unused AttachToken
 	if _, err := r.ConsumeAttachToken(unused); !errors.Is(err, ErrAttachTokenInvalid) {
 		t.Errorf("ConsumeAttachToken unknown = %v, want ErrAttachTokenInvalid", err)
@@ -131,7 +131,7 @@ func TestConsumeAttachTokenRejectsUnknown(t *testing.T) {
 
 func TestSweepAttachTokensRemovesExpired(t *testing.T) {
 	t.Parallel()
-	r := NewRegistry(0, 0, 0)
+	r := NewRegistry(0, 0, 0, 0)
 	s := mustNewSession(t)
 	r.Add(s)
 
@@ -153,7 +153,7 @@ func TestSweepAttachTokensRemovesExpired(t *testing.T) {
 
 func TestIssuedTokensAreUnpredictable(t *testing.T) {
 	t.Parallel()
-	r := NewRegistry(0, 0, 0)
+	r := NewRegistry(0, 0, 0, 0)
 	s := mustNewSession(t)
 	r.Add(s)
 

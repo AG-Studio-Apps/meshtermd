@@ -34,6 +34,10 @@ func runConnect(args []string) int {
 	shell := fs.String("shell", "", "override the user's shell for new sessions")
 	socket := fs.String("socket", "", "unix socket path (default: $XDG_RUNTIME_DIR/meshtermd.sock)")
 	timeout := fs.Duration("timeout", 5*time.Second, "max time to wait for the daemon to respond")
+	idleTimeout := fs.Duration("idle-timeout", 0,
+		"per-session idle timeout — how long the daemon keeps this session alive while no client is attached "+
+			"and the shell is producing no output. 0 = use the daemon's default. Ignored when reattaching: the "+
+			"timeout is fixed at session creation. Clamped at the daemon's --max-idle-timeout ceiling when set.")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: meshtermd connect [flags]\n\n")
 		fs.PrintDefaults()
@@ -65,11 +69,12 @@ func runConnect(args []string) int {
 	defer cancel()
 
 	resp, err := client.Allocate(ctx, ipc.AllocateRequest{
-		SessionID: *sessionID,
-		Rows:      uint16(*rows),
-		Cols:      uint16(*cols),
-		Exec:      execArgs,
-		Shell:     *shell,
+		SessionID:        *sessionID,
+		Rows:             uint16(*rows),
+		Cols:             uint16(*cols),
+		Exec:             execArgs,
+		Shell:            *shell,
+		IdleTimeoutNanos: int64(*idleTimeout),
 	})
 	if err != nil {
 		if errors.Is(err, ipc.ErrDaemonNotRunning) {

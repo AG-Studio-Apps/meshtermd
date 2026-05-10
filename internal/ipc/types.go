@@ -48,6 +48,18 @@ type AllocateRequest struct {
 	// means use the daemon's resolveShell logic ($SHELL → /bin/bash
 	// → /bin/sh). Ignored when Exec is set or when reattaching.
 	Shell string `cbor:"shell,omitempty"`
+
+	// IdleTimeoutNanos is the per-session GC timeout the client
+	// is requesting. Zero means "use the daemon's default" — the
+	// registry then applies whatever the operator configured via
+	// `--idle-timeout` on serve. A non-zero value is clamped at
+	// the daemon's `--max-idle-timeout` ceiling when one is set.
+	// Ignored when reattaching: the timeout is fixed at session
+	// creation; reattach inherits whatever the original Allocate
+	// chose. Encoded as nanoseconds rather than time.Duration so
+	// the wire form stays portable across CBOR libraries that
+	// don't know about Go's Duration type.
+	IdleTimeoutNanos int64 `cbor:"itn,omitempty"`
 }
 
 // AllocateResponse carries the fields that go into the bootstrap

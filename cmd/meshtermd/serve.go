@@ -30,7 +30,10 @@ func runServe(args []string) int {
 			"Override to 0.0.0.0 only if you genuinely need remote QUIC on a non-loopback path.")
 	socket := fs.String("socket", "", "unix socket path for the connect helper (default: $XDG_RUNTIME_DIR/meshtermd.sock)")
 	maxSessions := fs.Int("max-sessions", 0, "concurrent session cap (0 = default 100)")
-	idleTimeout := fs.Duration("idle-timeout", 0, "idle timeout before reaping a detached session (0 = default 1h)")
+	idleTimeout := fs.Duration("idle-timeout", 0, "default idle timeout for sessions whose client didn't request one (0 = 1h)")
+	maxIdleTimeout := fs.Duration("max-idle-timeout", 0,
+		"ceiling on per-session idle-timeout requests from clients. 0 = no ceiling (appropriate for personal-server "+
+			"deployments). Set on shared/multi-user hosts to bound resource cost (e.g. 168h = 7d).")
 	verbose := fs.Bool("v", false, "verbose logging (slog DEBUG level)")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: meshtermd serve [flags]\n\n")
@@ -50,11 +53,12 @@ func runServe(args []string) int {
 	}
 
 	d, err := daemon.New(daemon.Config{
-		QUICAddr:      *addr,
-		IPCSocketPath: socketPath,
-		MaxSessions:   *maxSessions,
-		IdleTimeout:   *idleTimeout,
-		Logger:        logger,
+		QUICAddr:       *addr,
+		IPCSocketPath:  socketPath,
+		MaxSessions:    *maxSessions,
+		IdleTimeout:    *idleTimeout,
+		MaxIdleTimeout: *maxIdleTimeout,
+		Logger:         logger,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "meshtermd serve: %v\n", err)

@@ -47,9 +47,18 @@ type Config struct {
 	// session.DefaultMaxSessions.
 	MaxSessions int
 
-	// IdleTimeout is how long a detached session can sit before GC.
-	// Defaults to session.DefaultIdleTimeout.
+	// IdleTimeout is how long a detached session can sit before GC
+	// when the client doesn't request its own value. Defaults to
+	// session.DefaultIdleTimeout.
 	IdleTimeout time.Duration
+
+	// MaxIdleTimeout is the ceiling on per-session timeouts a client
+	// may request. Zero means no ceiling — appropriate for the
+	// personal-server deployment where one user trusts the daemon
+	// they're running. Operators of multi-user / shared meshtermd
+	// hosts should set this to bound resource cost from a runaway
+	// client requesting a 30-day timeout on every session.
+	MaxIdleTimeout time.Duration
 
 	// Logger receives operational logs. Defaults to slog.Default().
 	Logger *slog.Logger
@@ -92,7 +101,7 @@ func New(cfg Config) (*Daemon, error) {
 		return nil, fmt.Errorf("load/generate cert: %w", err)
 	}
 
-	reg := session.NewRegistry(cfg.MaxSessions, cfg.IdleTimeout, 0)
+	reg := session.NewRegistry(cfg.MaxSessions, cfg.IdleTimeout, 0, cfg.MaxIdleTimeout)
 
 	d := &Daemon{
 		cfg:      cfg,
@@ -270,6 +279,11 @@ func (d *Daemon) spawnSession(req ipc.AllocateRequest) (*session.Session, error)
 		cols = 80
 	}
 
+	// Resolve the per-session idle timeout: client request → ceiling
+	// → daemon default. Stored on the Session itself so future GC
+	// sweeps consult its value rather than the daemon-wide default.
+	idleTimeout := d.registry.ResolveIdleTimeout(time.Duration(req.IdleTimeoutNanos))
+
 	spawnCfg := pty.SpawnConfig{
 		Shell: req.Shell,
 		Args:  req.Exec,
@@ -301,7 +315,7 @@ func (d *Daemon) spawnSession(req ipc.AllocateRequest) (*session.Session, error)
 		return nil, &allocateErr{Code: ipc.ErrSpawnFailed, Msg: err.Error()}
 	}
 
-	sess, err := session.NewSession(sid, ptyHandle, rows, cols, 0)
+	sess, err := session.NewSession(sid, ptyHandle, rows, cols, 0, idleTimeout)
 	if err != nil {
 		_ = ptyHandle.Close()
 		return nil, &allocateErr{Code: ipc.ErrInternal, Msg: err.Error()}

@@ -84,6 +84,15 @@ type Session struct {
 	rows uint16
 	cols uint16
 
+	// idleTimeout is how long this session may sit idle (no PTY
+	// output, no stdin, no resize, no attach) before the registry's
+	// GC reaps it. Set per-session at creation time so different
+	// hosts/sessions can carry different lifetimes — a long-lived
+	// dev box wants 7 days, a one-off CI shell can stay at the
+	// daemon's hour default. Zero means "use the registry's
+	// default", per the constructor's contract.
+	idleTimeout time.Duration
+
 	// Last time something happened on this session (PTY output or
 	// active attach). Drives the registry's idle-GC.
 	lastActiveAt time.Time
@@ -121,7 +130,13 @@ type Session struct {
 // NewSession constructs a Session. The caller is expected to start
 // the pump goroutine separately (see Pump). We don't do it inside the
 // constructor so test code can inject deterministic behaviour.
-func NewSession(id SessionID, pty PTY, rows, cols uint16, bufCapacity int) (*Session, error) {
+//
+// idleTimeout = 0 means "inherit the registry's default at GC
+// time"; the registry's Sweep falls back to its own idleTimeout
+// when this field is zero. Pass an explicit duration to give this
+// session a per-session lifetime independent of the daemon-wide
+// default.
+func NewSession(id SessionID, pty PTY, rows, cols uint16, bufCapacity int, idleTimeout time.Duration) (*Session, error) {
 	if pty == nil {
 		return nil, errors.New("pty must not be nil")
 	}
@@ -141,8 +156,18 @@ func NewSession(id SessionID, pty PTY, rows, cols uint16, bufCapacity int) (*Ses
 		pty:          pty,
 		rows:         rows,
 		cols:         cols,
+		idleTimeout:  idleTimeout,
 		lastActiveAt: now,
 	}, nil
+}
+
+// IdleTimeout returns the per-session GC timeout configured at
+// construction. Returns zero when the session was constructed with
+// `idleTimeout == 0` (registry-default fallback).
+func (s *Session) IdleTimeout() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.idleTimeout
 }
 
 // ID returns the session's hex-encoded identifier.

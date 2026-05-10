@@ -74,6 +74,7 @@ type PTY interface {
 // attach by ID, the buffer replays anything they missed.
 type Session struct {
 	id      SessionID
+	name    string
 	created time.Time
 	cap     int
 
@@ -131,12 +132,19 @@ type Session struct {
 // the pump goroutine separately (see Pump). We don't do it inside the
 // constructor so test code can inject deterministic behaviour.
 //
+// `name` is the user-visible label addressable via Registry.LookupByName
+// and surfaced in `meshtermd list`. The empty string is allowed —
+// such a session is anonymous (registry doesn't index it by name)
+// but the daemon's spawnSession synthesises a non-empty default
+// (`session-<6hex>`) so client UIs never see blank names. `name` is
+// immutable post-construction; rename support is a future addition.
+//
 // idleTimeout = 0 means "inherit the registry's default at GC
 // time"; the registry's Sweep falls back to its own idleTimeout
 // when this field is zero. Pass an explicit duration to give this
 // session a per-session lifetime independent of the daemon-wide
 // default.
-func NewSession(id SessionID, pty PTY, rows, cols uint16, bufCapacity int, idleTimeout time.Duration) (*Session, error) {
+func NewSession(id SessionID, name string, pty PTY, rows, cols uint16, bufCapacity int, idleTimeout time.Duration) (*Session, error) {
 	if pty == nil {
 		return nil, errors.New("pty must not be nil")
 	}
@@ -150,6 +158,7 @@ func NewSession(id SessionID, pty PTY, rows, cols uint16, bufCapacity int, idleT
 	now := time.Now()
 	return &Session{
 		id:           id,
+		name:         name,
 		created:      now,
 		cap:          bufCapacity,
 		buf:          buf,
@@ -159,6 +168,35 @@ func NewSession(id SessionID, pty PTY, rows, cols uint16, bufCapacity int, idleT
 		idleTimeout:  idleTimeout,
 		lastActiveAt: now,
 	}, nil
+}
+
+// Name returns the user-visible session label. Empty for anonymous
+// sessions (legacy callers that don't supply a name).
+func (s *Session) Name() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.name
+}
+
+// LastActiveAt returns the wall-clock time of the most recent
+// activity event (PTY output, stdin write, resize, or attach).
+// Symmetric with IdleFor; ListSessions uses this for the picker
+// UI's "last active" hint.
+func (s *Session) LastActiveAt() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastActiveAt
+}
+
+// IsAttached reports whether a client is currently attached to this
+// session. Used by ListSessions to surface the AttachedNow flag in
+// the picker. Note that the underlying activeCancel slot can transit
+// between two attaches with no externally-visible window; this is a
+// snapshot, not a mutex-fenced guarantee.
+func (s *Session) IsAttached() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.activeCancel != nil
 }
 
 // IdleTimeout returns the per-session GC timeout configured at

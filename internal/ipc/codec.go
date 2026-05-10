@@ -114,6 +114,70 @@ func DecodePingResponse(body []byte) (PingResponse, error) {
 	return resp, nil
 }
 
+// DecodeListSessionsRequest decodes a frame body as a ListSessionsRequest.
+func DecodeListSessionsRequest(body []byte) (ListSessionsRequest, error) {
+	t, err := PeekType(body)
+	if err != nil {
+		return ListSessionsRequest{}, err
+	}
+	if t != TypeListSessions {
+		return ListSessionsRequest{}, fmt.Errorf("expected ListSessions frame, got %q", t)
+	}
+	var req ListSessionsRequest
+	if err := protocol.StrictDecMode.Unmarshal(body, &req); err != nil {
+		return ListSessionsRequest{}, err
+	}
+	return req, nil
+}
+
+// DecodeListSessionsResponse mirrors DecodeListSessionsRequest.
+func DecodeListSessionsResponse(body []byte) (ListSessionsResponse, error) {
+	t, err := PeekType(body)
+	if err != nil {
+		return ListSessionsResponse{}, err
+	}
+	if t != TypeListSessions {
+		return ListSessionsResponse{}, fmt.Errorf("expected ListSessions response, got %q", t)
+	}
+	var resp ListSessionsResponse
+	if err := protocol.StrictDecMode.Unmarshal(body, &resp); err != nil {
+		return ListSessionsResponse{}, err
+	}
+	return resp, nil
+}
+
+// DecodeKillSessionRequest decodes a frame body as a KillSessionRequest.
+func DecodeKillSessionRequest(body []byte) (KillSessionRequest, error) {
+	t, err := PeekType(body)
+	if err != nil {
+		return KillSessionRequest{}, err
+	}
+	if t != TypeKillSession {
+		return KillSessionRequest{}, fmt.Errorf("expected KillSession frame, got %q", t)
+	}
+	var req KillSessionRequest
+	if err := protocol.StrictDecMode.Unmarshal(body, &req); err != nil {
+		return KillSessionRequest{}, err
+	}
+	return req, nil
+}
+
+// DecodeKillSessionResponse mirrors DecodeKillSessionRequest.
+func DecodeKillSessionResponse(body []byte) (KillSessionResponse, error) {
+	t, err := PeekType(body)
+	if err != nil {
+		return KillSessionResponse{}, err
+	}
+	if t != TypeKillSession {
+		return KillSessionResponse{}, fmt.Errorf("expected KillSession response, got %q", t)
+	}
+	var resp KillSessionResponse
+	if err := protocol.StrictDecMode.Unmarshal(body, &resp); err != nil {
+		return KillSessionResponse{}, err
+	}
+	return resp, nil
+}
+
 func cborMarshal(v any) ([]byte, error) {
 	em, err := cbor.CTAP2EncOptions().EncMode()
 	if err != nil {

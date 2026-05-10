@@ -363,6 +363,67 @@ The server logs every termination with the error code and (where safe) the offen
 | Stdout | 16 KiB per frame | balance of overhead and chunking |
 | Datagrams | 64 KiB | with QUIC datagram fragmentation as path-MTU allows |
 
+## 14a. IPC for client tooling
+
+The unix socket between `meshtermd connect` (the SSH-side helper) and
+`meshtermd serve` (the long-running daemon) carries the same CBOR
+framing as the QUIC control stream. The IPC surface is intentionally
+broader than what `connect` alone needs — `meshtermd list` and
+`meshtermd kill` use it directly, and a future `mtctl` CLI can speak
+either CBOR-over-IPC (when SSH-tunnelling the socket) or shell out to
+`meshtermd list --json` over SSH.
+
+**Auth model:** the SSH boundary is the auth boundary. Any client that
+can reach the unix socket (i.e., is running as the same uid as
+`meshtermd serve`) may invoke any of these. Filesystem permissions on
+the socket (mode 0600, uid-owned parent) keep other local users out.
+
+### IPC message types
+
+| `t` discriminator | Direction | Purpose |
+|---|---|---|
+| `Allocate` | client → daemon | reserve an attach for an existing session, or spawn a new one. Returns `MTRM_QUIC` bootstrap fields + the session's `Name`. |
+| `Ping` | client → daemon | liveness probe (echo nonce). |
+| `ListSessions` | client → daemon | enumerate every live session. Returns `[]SessionInfo`. |
+| `KillSession` | client → daemon | reap a session by hex SessionID or by Name. |
+
+`SessionInfo` carries `id, name, created_at_ns, last_active_at_ns,
+attached_now, idle_timeout_ns, rows, cols`. Field tags are wire-stable
+short strings (`sid, name, cn, la, att, itn, rows, cols`).
+
+### `meshtermd list --json` stable contract
+
+Output is a JSON array of `SessionInfo` objects, one per live session,
+on a single line ending with `\n`. Field names match the JSON tags on
+`SessionInfo` (e.g. `created_at_ns`, not `cn`). An empty inventory is
+`[]`, not `null`. iOS consumes this verbatim via the SSH exec channel.
+
+### Session naming
+
+Every session has a non-empty user-visible name. Clients can request
+one via `Allocate.Name`; if unset, the daemon synthesises
+`session-<6-hex-of-id>` so picker UIs never see blank rows. Names are
+unique per daemon — colliding names on a fresh-spawn request return
+`ipc.ErrNameInUse`.
+
+### Daemon-restart semantics — explicit caveat
+
+**Sessions do not survive a `meshtermd serve` restart.** PTY child
+processes are direct children of the daemon process; killing the
+daemon SIGHUPs every child and unmaps every ring buffer. There is no
+disk persistence. A restarted daemon presents an empty session list;
+clients with cached SessionIDs hit `ErrUnknownSession` and the iOS
+flow falls back to spawning a fresh session.
+
+This is an intentional architectural choice — meshtermd is a
+transparent byte-passthrough layer, and persistent-layout-without-
+processes (the Zellij approach) doesn't fit that posture. Operators
+who need restart survival should run `meshtermd serve` under a
+supervisor (systemd-user, launchd) so it's restarted promptly, but
+must accept that any in-flight session is lost. Reattach-style
+persistence works **across QUIC drops** (network roam, app
+foreground/background, force-quit), not across daemon process death.
+
 ## 15. Open questions for v0 → v1
 
 - Should `EchoConfirm` carry stdin_seq for client-side echo prediction synchronisation? (Currently reserved.)

@@ -18,8 +18,10 @@ package ipc
 // messages. Discriminated by the `t` tag, like the protocol's
 // control stream.
 const (
-	TypeAllocate = "Allocate"
-	TypePing     = "Ping"
+	TypeAllocate     = "Allocate"
+	TypePing         = "Ping"
+	TypeListSessions = "ListSessions"
+	TypeKillSession  = "KillSession"
 )
 
 // AllocateRequest reserves an attach for the named session (or
@@ -60,6 +62,16 @@ type AllocateRequest struct {
 	// the wire form stays portable across CBOR libraries that
 	// don't know about Go's Duration type.
 	IdleTimeoutNanos int64 `cbor:"itn,omitempty"`
+
+	// Name is the optional user-visible session label. When
+	// SessionID is empty or "new" and Name is set, the daemon does
+	// a "create-if-missing" attach — looks up an existing session
+	// by name first, spawns a new one with that name if absent.
+	// When SessionID is set explicitly, Name is ignored on
+	// reattach (the session's identity is fixed at creation).
+	// Names must be unique per daemon; collisions on a fresh
+	// spawn return ErrNameInUse.
+	Name string `cbor:"name,omitempty"`
 }
 
 // AllocateResponse carries the fields that go into the bootstrap
@@ -70,12 +82,67 @@ type AllocateResponse struct {
 	Ok bool   `cbor:"ok"`
 
 	// On success:
-	SessionID   string `cbor:"sid,omitempty"`    // 32 hex chars
-	AttachToken string `cbor:"tok,omitempty"`    // 32 hex chars, single-use, 30s TTL
-	Port        uint16 `cbor:"port,omitempty"`   // QUIC UDP port
+	SessionID   string `cbor:"sid,omitempty"`     // 32 hex chars
+	AttachToken string `cbor:"tok,omitempty"`     // 32 hex chars, single-use, 30s TTL
+	Port        uint16 `cbor:"port,omitempty"`    // QUIC UDP port
 	CertFP      string `cbor:"cert_fp,omitempty"` // 64 hex chars, SHA-256 of cert DER
+	// Name is the resolved user-visible session label. Echoed back
+	// so the client knows what the daemon synthesised when the
+	// request didn't supply one (see ipc/types.go AllocateRequest.Name).
+	Name string `cbor:"name,omitempty"`
 
 	// On failure:
+	Err string `cbor:"err,omitempty"`
+	Msg string `cbor:"msg,omitempty"`
+}
+
+// SessionInfo is one row of the ListSessionsResponse inventory.
+// Used both over CBOR (IPC response shape) and over JSON (the
+// `meshtermd list --json` output that iOS consumes via SSH);
+// field tags are short stable strings so CBOR + JSON tooling
+// produce a consistent wire form.
+type SessionInfo struct {
+	ID             string `cbor:"sid" json:"id"`
+	Name           string `cbor:"name" json:"name"`
+	CreatedAtNs    int64  `cbor:"cn" json:"created_at_ns"`
+	LastActiveAtNs int64  `cbor:"la" json:"last_active_at_ns"`
+	AttachedNow    bool   `cbor:"att" json:"attached_now"`
+	IdleTimeoutNs  int64  `cbor:"itn,omitempty" json:"idle_timeout_ns,omitempty"`
+	Rows           uint16 `cbor:"rows,omitempty" json:"rows,omitempty"`
+	Cols           uint16 `cbor:"cols,omitempty" json:"cols,omitempty"`
+}
+
+// ListSessionsRequest enumerates every live session on the daemon.
+// No filter — the SSH boundary is the auth boundary; if you can
+// reach the IPC socket you can see everything.
+type ListSessionsRequest struct {
+	T string `cbor:"t"`
+}
+
+// ListSessionsResponse returns the inventory snapshot. Ok=false
+// indicates an internal failure; the snapshot is empty in that case.
+type ListSessionsResponse struct {
+	T        string        `cbor:"t"`
+	Ok       bool          `cbor:"ok"`
+	Sessions []SessionInfo `cbor:"sessions,omitempty"`
+	Err      string        `cbor:"err,omitempty"`
+	Msg      string        `cbor:"msg,omitempty"`
+}
+
+// KillSessionRequest reaps a session by ID or name. Sel is the
+// selector — tried as a hex SessionID first, falls back to a name
+// lookup on parse failure. Single-arg form keeps the CLI surface
+// simple (`meshtermd kill <id-or-name>`).
+type KillSessionRequest struct {
+	T   string `cbor:"t"`
+	Sel string `cbor:"sel"`
+}
+
+// KillSessionResponse mirrors AllocateResponse's success/failure
+// shape. ErrUnknownSession when the selector resolves to nothing.
+type KillSessionResponse struct {
+	T   string `cbor:"t"`
+	Ok  bool   `cbor:"ok"`
 	Err string `cbor:"err,omitempty"`
 	Msg string `cbor:"msg,omitempty"`
 }
@@ -96,9 +163,10 @@ type PingResponse struct {
 
 // Error codes used in AllocateResponse.Err. Wire-stable strings.
 const (
-	ErrUnknownSession  = "unknown_session"
-	ErrCapacity        = "capacity"
-	ErrSpawnFailed     = "spawn_failed"
-	ErrInternal        = "internal"
-	ErrBadRequest      = "bad_request"
+	ErrUnknownSession = "unknown_session"
+	ErrCapacity       = "capacity"
+	ErrSpawnFailed    = "spawn_failed"
+	ErrInternal       = "internal"
+	ErrBadRequest     = "bad_request"
+	ErrNameInUse      = "name_in_use"
 )

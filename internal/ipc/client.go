@@ -71,6 +71,46 @@ func (c *Client) Ping(ctx context.Context, nonce uint64) (PingResponse, error) {
 	return DecodePingResponse(body)
 }
 
+// ListSessions enumerates every live session on the daemon.
+func (c *Client) ListSessions(ctx context.Context) (ListSessionsResponse, error) {
+	conn, err := c.dial(ctx)
+	if err != nil {
+		return ListSessionsResponse{}, err
+	}
+	defer conn.Close()
+
+	if err := EncodeRequest(conn, ListSessionsRequest{T: TypeListSessions}); err != nil {
+		return ListSessionsResponse{}, fmt.Errorf("send: %w", err)
+	}
+	body, err := ReadFrame(conn)
+	if err != nil {
+		return ListSessionsResponse{}, fmt.Errorf("recv: %w", err)
+	}
+	return DecodeListSessionsResponse(body)
+}
+
+// KillSession reaps a session by hex SessionID or by Name. The
+// daemon resolves the selector — try-as-id-first, fall back to
+// name lookup. Idempotent on already-gone sessions: returns
+// ErrUnknownSession in that case.
+func (c *Client) KillSession(ctx context.Context, idOrName string) (KillSessionResponse, error) {
+	conn, err := c.dial(ctx)
+	if err != nil {
+		return KillSessionResponse{}, err
+	}
+	defer conn.Close()
+
+	req := KillSessionRequest{T: TypeKillSession, Sel: idOrName}
+	if err := EncodeRequest(conn, req); err != nil {
+		return KillSessionResponse{}, fmt.Errorf("send: %w", err)
+	}
+	body, err := ReadFrame(conn)
+	if err != nil {
+		return KillSessionResponse{}, fmt.Errorf("recv: %w", err)
+	}
+	return DecodeKillSessionResponse(body)
+}
+
 func (c *Client) dial(ctx context.Context) (net.Conn, error) {
 	deadline, ok := ctx.Deadline()
 	if !ok {

@@ -22,6 +22,8 @@ import (
 type Handler interface {
 	HandleAllocate(ctx context.Context, req AllocateRequest) AllocateResponse
 	HandlePing(ctx context.Context, req PingRequest) PingResponse
+	HandleListSessions(ctx context.Context, req ListSessionsRequest) ListSessionsResponse
+	HandleKillSession(ctx context.Context, req KillSessionRequest) KillSessionResponse
 }
 
 // Server listens on a Unix socket and dispatches incoming requests
@@ -193,6 +195,30 @@ func (s *Server) handle(ctx context.Context, conn *net.UnixConn) {
 		}
 		resp := s.handler.HandlePing(ctx, req)
 		resp.T = TypePing
+		_ = EncodeResponse(conn, resp)
+	case TypeListSessions:
+		req, err := DecodeListSessionsRequest(body)
+		if err != nil {
+			_ = EncodeResponse(conn, ListSessionsResponse{
+				T: TypeListSessions, Ok: false,
+				Err: ErrBadRequest, Msg: err.Error(),
+			})
+			return
+		}
+		resp := s.handler.HandleListSessions(ctx, req)
+		resp.T = TypeListSessions
+		_ = EncodeResponse(conn, resp)
+	case TypeKillSession:
+		req, err := DecodeKillSessionRequest(body)
+		if err != nil {
+			_ = EncodeResponse(conn, KillSessionResponse{
+				T: TypeKillSession, Ok: false,
+				Err: ErrBadRequest, Msg: err.Error(),
+			})
+			return
+		}
+		resp := s.handler.HandleKillSession(ctx, req)
+		resp.T = TypeKillSession
 		_ = EncodeResponse(conn, resp)
 	default:
 		_ = EncodeResponse(conn, AllocateResponse{

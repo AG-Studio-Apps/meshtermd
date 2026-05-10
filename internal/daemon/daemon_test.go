@@ -176,6 +176,179 @@ func TestDaemonReattachOnUnknownSessionFails(t *testing.T) {
 	}
 }
 
+// TestDaemonAllocateAssignsDefaultName asserts that Allocate without
+// a Name still produces a non-empty user-visible name.
+func TestDaemonAllocateAssignsDefaultName(t *testing.T) {
+	t.Parallel()
+	_, c, cleanup := startDaemon(t)
+	defer cleanup()
+
+	resp, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID: "new",
+		Shell:     "/bin/sh",
+		Exec:      []string{"-c", "while true; do sleep 1; done"},
+	})
+	if err != nil || !resp.Ok {
+		t.Fatalf("allocate: %v %s %s", err, resp.Err, resp.Msg)
+	}
+	if resp.Name == "" {
+		t.Error("Name = \"\", want a daemon-synthesised default")
+	}
+	if !strings.HasPrefix(resp.Name, "session-") {
+		t.Errorf("Name = %q, want session-* default", resp.Name)
+	}
+}
+
+// TestDaemonAllocateNameCollisionReturnsError pins the create-fresh
+// path's failure surface when a non-empty name is taken.
+func TestDaemonAllocateNameCollisionReturnsError(t *testing.T) {
+	t.Parallel()
+	_, c, cleanup := startDaemon(t)
+	defer cleanup()
+
+	first, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID: "new",
+		Name:      "dev",
+		Shell:     "/bin/sh",
+		Exec:      []string{"-c", "while true; do sleep 1; done"},
+	})
+	if err != nil || !first.Ok {
+		t.Fatalf("first allocate: %v %s %s", err, first.Err, first.Msg)
+	}
+	if first.Name != "dev" {
+		t.Errorf("first.Name = %q, want %q", first.Name, "dev")
+	}
+
+	second, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID: "new",
+		Name:      "dev", // explicit collision on a fresh-spawn request
+		Shell:     "/bin/sh",
+		Exec:      []string{"-c", "while true; do sleep 1; done"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Ok {
+		t.Error("Ok=true on duplicate-name fresh-spawn; want failure")
+	}
+	if second.Err != ipc.ErrNameInUse {
+		t.Errorf("Err = %q, want %q", second.Err, ipc.ErrNameInUse)
+	}
+}
+
+// TestDaemonListSessions exercises the inventory snapshot. Spawn 2
+// named sessions, list, expect both with their names + non-zero
+// timestamps + AttachedNow=false.
+func TestDaemonListSessions(t *testing.T) {
+	t.Parallel()
+	_, c, cleanup := startDaemon(t)
+	defer cleanup()
+
+	a, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID: "new", Name: "alpha",
+		Shell: "/bin/sh", Exec: []string{"-c", "while true; do sleep 1; done"},
+	})
+	if err != nil || !a.Ok {
+		t.Fatalf("allocate alpha: %v %s", err, a.Err)
+	}
+	b, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID: "new", Name: "beta",
+		Shell: "/bin/sh", Exec: []string{"-c", "while true; do sleep 1; done"},
+	})
+	if err != nil || !b.Ok {
+		t.Fatalf("allocate beta: %v %s", err, b.Err)
+	}
+
+	list, err := c.ListSessions(context.Background())
+	if err != nil || !list.Ok {
+		t.Fatalf("list: %v %s", err, list.Err)
+	}
+	if len(list.Sessions) != 2 {
+		t.Fatalf("list returned %d sessions, want 2", len(list.Sessions))
+	}
+	names := map[string]bool{}
+	for _, s := range list.Sessions {
+		names[s.Name] = true
+		if s.ID == "" {
+			t.Error("session has empty ID in list response")
+		}
+		if s.CreatedAtNs == 0 || s.LastActiveAtNs == 0 {
+			t.Errorf("session %s has zero timestamps", s.Name)
+		}
+		if s.AttachedNow {
+			t.Errorf("session %s reports AttachedNow=true before any QUIC attach", s.Name)
+		}
+	}
+	if !names["alpha"] || !names["beta"] {
+		t.Errorf("names = %v, want alpha+beta", names)
+	}
+}
+
+// TestDaemonKillSessionByName covers the name-based kill path.
+func TestDaemonKillSessionByName(t *testing.T) {
+	t.Parallel()
+	_, c, cleanup := startDaemon(t)
+	defer cleanup()
+
+	created, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID: "new", Name: "doomed",
+		Shell: "/bin/sh", Exec: []string{"-c", "while true; do sleep 1; done"},
+	})
+	if err != nil || !created.Ok {
+		t.Fatalf("allocate: %v %s", err, created.Err)
+	}
+
+	resp, err := c.KillSession(context.Background(), "doomed")
+	if err != nil || !resp.Ok {
+		t.Fatalf("kill: %v %s", err, resp.Err)
+	}
+
+	// Verify it's gone via List.
+	list, _ := c.ListSessions(context.Background())
+	for _, s := range list.Sessions {
+		if s.ID == created.SessionID {
+			t.Error("session still present after kill")
+		}
+	}
+
+	// Killing again should report unknown_session, not crash.
+	again, err := c.KillSession(context.Background(), "doomed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Ok {
+		t.Error("second kill succeeded; want unknown_session")
+	}
+	if again.Err != ipc.ErrUnknownSession {
+		t.Errorf("Err = %q, want %q", again.Err, ipc.ErrUnknownSession)
+	}
+}
+
+// TestDaemonKillSessionByID covers the hex-ID kill path.
+func TestDaemonKillSessionByID(t *testing.T) {
+	t.Parallel()
+	_, c, cleanup := startDaemon(t)
+	defer cleanup()
+
+	created, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID: "new", Name: "byidtarget",
+		Shell: "/bin/sh", Exec: []string{"-c", "while true; do sleep 1; done"},
+	})
+	if err != nil || !created.Ok {
+		t.Fatalf("allocate: %v %s", err, created.Err)
+	}
+
+	resp, err := c.KillSession(context.Background(), created.SessionID)
+	if err != nil || !resp.Ok {
+		t.Fatalf("kill by id: %v %s", err, resp.Err)
+	}
+
+	list, _ := c.ListSessions(context.Background())
+	if len(list.Sessions) != 0 {
+		t.Errorf("list after kill = %d sessions, want 0", len(list.Sessions))
+	}
+}
+
 func TestDaemonClientReportsDaemonNotRunning(t *testing.T) {
 	t.Parallel()
 	c := ipc.NewClient(filepath.Join(t.TempDir(), "no-daemon.sock"), 100*time.Millisecond)

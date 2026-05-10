@@ -33,7 +33,12 @@ type Registry struct {
 
 	mu       sync.Mutex
 	sessions map[SessionID]*Session
-	tokens   map[AttachToken]pendingAttach
+	// byName maps a non-empty Session.Name to its Session pointer.
+	// The empty string is excluded; anonymous sessions are reachable
+	// only by ID. Kept under the same mu as `sessions`; the two
+	// indices must move in lockstep on Add/Remove/Sweep.
+	byName map[string]*Session
+	tokens map[AttachToken]pendingAttach
 }
 
 // pendingAttach is the registry-side state for a single in-flight
@@ -115,6 +120,13 @@ var ErrDuplicateID = errors.New("session id already exists")
 // caller cares only that they should not attempt to attach.
 var ErrUnknownSession = errors.New("unknown session id")
 
+// ErrDuplicateName is returned by Add when a session's non-empty Name
+// collides with an existing session in the registry. Reserved for
+// the `meshtermd connect --name foo` create-if-missing flow's
+// failure case (i.e., when the caller wanted a fresh session but
+// the name is taken).
+var ErrDuplicateName = errors.New("session name already in use")
+
 // NewRegistry constructs a Registry with the given limits. Zero or
 // negative limits fall back to the Default* constants. maxIdleTimeout
 // = 0 means no operator-imposed ceiling (per-session timeouts may go
@@ -138,6 +150,7 @@ func NewRegistry(maxSessions int, idleTimeout, gcInterval, maxIdleTimeout time.D
 		maxIdleTimeout: maxIdleTimeout,
 		gcInterval:     gcInterval,
 		sessions:       make(map[SessionID]*Session),
+		byName:         make(map[string]*Session),
 		tokens:         make(map[AttachToken]pendingAttach),
 	}
 }
@@ -160,12 +173,14 @@ func (r *Registry) ResolveIdleTimeout(requested time.Duration) time.Duration {
 // caller is responsible for starting the session's Pump goroutine —
 // keeping that contract outside the registry simplifies test wiring.
 //
-// Returns ErrCapacityReached if the registry is full,
-// ErrDuplicateID if the ID is already present.
+// Returns ErrCapacityReached if the registry is full, ErrDuplicateID
+// if the ID is already present, ErrDuplicateName if the session's
+// non-empty Name collides with an existing entry.
 func (r *Registry) Add(s *Session) error {
 	if s == nil {
 		return errors.New("nil session")
 	}
+	name := s.Name()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(r.sessions) >= r.maxSessions {
@@ -174,7 +189,15 @@ func (r *Registry) Add(s *Session) error {
 	if _, exists := r.sessions[s.ID()]; exists {
 		return ErrDuplicateID
 	}
+	if name != "" {
+		if _, exists := r.byName[name]; exists {
+			return ErrDuplicateName
+		}
+	}
 	r.sessions[s.ID()] = s
+	if name != "" {
+		r.byName[name] = s
+	}
 	return nil
 }
 
@@ -189,12 +212,38 @@ func (r *Registry) Lookup(id SessionID) (*Session, error) {
 	return s, nil
 }
 
+// LookupByName returns the session whose Name matches `name`, or
+// ErrUnknownSession. Empty names are never indexed; passing "" is
+// treated as a miss.
+func (r *Registry) LookupByName(name string) (*Session, error) {
+	if name == "" {
+		return nil, ErrUnknownSession
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.byName[name]
+	if !ok {
+		return nil, ErrUnknownSession
+	}
+	return s, nil
+}
+
 // Remove drops the session from the catalogue and closes it. Safe to
 // call with an unknown ID (no-op).
 func (r *Registry) Remove(id SessionID) {
 	r.mu.Lock()
 	s := r.sessions[id]
 	delete(r.sessions, id)
+	if s != nil {
+		if name := s.Name(); name != "" {
+			// Defensive: clear the name index entry only when it
+			// still points at this session. Rename support (future)
+			// could otherwise stomp a re-bound name.
+			if cur, ok := r.byName[name]; ok && cur == s {
+				delete(r.byName, name)
+			}
+		}
+	}
 	r.mu.Unlock()
 	if s != nil {
 		_ = s.Close()
@@ -326,6 +375,11 @@ func (r *Registry) Sweep() int {
 		if now.Sub(s.lastActivityForGC()) >= timeout {
 			doomed = append(doomed, s)
 			delete(r.sessions, id)
+			if name := s.Name(); name != "" {
+				if cur, ok := r.byName[name]; ok && cur == s {
+					delete(r.byName, name)
+				}
+			}
 		}
 	}
 	for k, p := range r.tokens {
@@ -368,6 +422,7 @@ func (r *Registry) Shutdown() {
 		all = append(all, s)
 	}
 	r.sessions = make(map[SessionID]*Session)
+	r.byName = make(map[string]*Session)
 	r.mu.Unlock()
 
 	for _, s := range all {

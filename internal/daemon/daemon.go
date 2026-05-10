@@ -222,12 +222,73 @@ func (d *Daemon) HandleAllocate(ctx context.Context, req ipc.AllocateRequest) ip
 		AttachToken: tok.String(),
 		Port:        uint16(d.quic.Addr().Port),
 		CertFP:      d.certFP.String(),
+		Name:        sess.Name(),
 	}
 }
 
 // HandlePing implements ipc.Handler.
 func (d *Daemon) HandlePing(ctx context.Context, req ipc.PingRequest) ipc.PingResponse {
 	return ipc.PingResponse{Nonce: req.Nonce}
+}
+
+// HandleListSessions returns a snapshot of every live session on
+// the registry. The snapshot is taken in two passes — registry.IDs()
+// under the registry's lock, then per-session Lookup + accessors —
+// so a slow session reader (e.g. one whose mu is held by an Acquire
+// in flight) can't stall the registry-wide enumeration. Best-effort:
+// a session reaped between IDs() and Lookup is silently skipped.
+func (d *Daemon) HandleListSessions(ctx context.Context, _ ipc.ListSessionsRequest) ipc.ListSessionsResponse {
+	ids := d.registry.IDs()
+	out := make([]ipc.SessionInfo, 0, len(ids))
+	for _, id := range ids {
+		sess, err := d.registry.Lookup(id)
+		if err != nil {
+			continue
+		}
+		rows, cols := sess.WindowSize()
+		out = append(out, ipc.SessionInfo{
+			ID:             sess.ID().String(),
+			Name:           sess.Name(),
+			CreatedAtNs:    sess.Created().UnixNano(),
+			LastActiveAtNs: sess.LastActiveAt().UnixNano(),
+			AttachedNow:    sess.IsAttached(),
+			IdleTimeoutNs:  int64(sess.IdleTimeout()),
+			Rows:           rows,
+			Cols:           cols,
+		})
+	}
+	return ipc.ListSessionsResponse{Ok: true, Sessions: out}
+}
+
+// HandleKillSession reaps a session by hex SessionID or by Name.
+// Selector resolution: try parse as hex SessionID first; on parse
+// failure, try LookupByName. Either way, the registry's Remove
+// closes the session (which terminates the PTY and cancels any
+// active attach).
+func (d *Daemon) HandleKillSession(ctx context.Context, req ipc.KillSessionRequest) ipc.KillSessionResponse {
+	if req.Sel == "" {
+		return ipc.KillSessionResponse{Ok: false, Err: ipc.ErrBadRequest, Msg: "selector required"}
+	}
+	if sid, err := session.ParseSessionID(req.Sel); err == nil {
+		// Selector parsed as a SessionID — verify the session exists
+		// before reporting success, so the caller can distinguish
+		// "I asked you to kill X" from "X was already gone."
+		if _, lerr := d.registry.Lookup(sid); lerr != nil {
+			return ipc.KillSessionResponse{Ok: false, Err: ipc.ErrUnknownSession, Msg: lerr.Error()}
+		}
+		d.registry.Remove(sid)
+		d.logger.Info("session killed", "session", sid.String(), "by", "id")
+		return ipc.KillSessionResponse{Ok: true}
+	}
+	// Fall through: treat as a name.
+	sess, err := d.registry.LookupByName(req.Sel)
+	if err != nil {
+		return ipc.KillSessionResponse{Ok: false, Err: ipc.ErrUnknownSession, Msg: err.Error()}
+	}
+	id := sess.ID()
+	d.registry.Remove(id)
+	d.logger.Info("session killed", "session", id.String(), "name", req.Sel, "by", "name")
+	return ipc.KillSessionResponse{Ok: true}
 }
 
 // lookupOrCreateSession returns the session referenced by req. If
@@ -279,6 +340,16 @@ func (d *Daemon) spawnSession(req ipc.AllocateRequest) (*session.Session, error)
 		cols = 80
 	}
 
+	// Default-naming policy: every session has a non-empty
+	// user-visible name, even when the client didn't supply one.
+	// `session-<first-6-hex-of-id>` is short enough to fit a chip,
+	// stable across reattaches, and impossible to collide with a
+	// user-chosen name (no user picks 6 hex chars deliberately).
+	name := req.Name
+	if name == "" {
+		name = "session-" + sid.String()[:6]
+	}
+
 	// Resolve the per-session idle timeout: client request → ceiling
 	// → daemon default. Stored on the Session itself so future GC
 	// sweeps consult its value rather than the daemon-wide default.
@@ -315,7 +386,7 @@ func (d *Daemon) spawnSession(req ipc.AllocateRequest) (*session.Session, error)
 		return nil, &allocateErr{Code: ipc.ErrSpawnFailed, Msg: err.Error()}
 	}
 
-	sess, err := session.NewSession(sid, ptyHandle, rows, cols, 0, idleTimeout)
+	sess, err := session.NewSession(sid, name, ptyHandle, rows, cols, 0, idleTimeout)
 	if err != nil {
 		_ = ptyHandle.Close()
 		return nil, &allocateErr{Code: ipc.ErrInternal, Msg: err.Error()}
@@ -324,8 +395,11 @@ func (d *Daemon) spawnSession(req ipc.AllocateRequest) (*session.Session, error)
 	if err := d.registry.Add(sess); err != nil {
 		_ = sess.Close()
 		code := ipc.ErrInternal
-		if errors.Is(err, session.ErrCapacityReached) {
+		switch {
+		case errors.Is(err, session.ErrCapacityReached):
 			code = ipc.ErrCapacity
+		case errors.Is(err, session.ErrDuplicateName):
+			code = ipc.ErrNameInUse
 		}
 		return nil, &allocateErr{Code: code, Msg: err.Error()}
 	}
@@ -333,6 +407,7 @@ func (d *Daemon) spawnSession(req ipc.AllocateRequest) (*session.Session, error)
 	go sess.Pump()
 	d.logger.Info("session spawned",
 		"session", sid.String(),
+		"name", name,
 		"rows", rows, "cols", cols,
 	)
 	return sess, nil

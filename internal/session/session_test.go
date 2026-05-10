@@ -128,7 +128,7 @@ func TestParseSessionIDRejectsBadInput(t *testing.T) {
 func TestNewSessionRejectsNilPTY(t *testing.T) {
 	t.Parallel()
 	id, _ := NewSessionID()
-	if _, err := NewSession(id, nil, 24, 80, 0, 0); err == nil {
+	if _, err := NewSession(id, "", nil, 24, 80, 0, 0); err == nil {
 		t.Error("NewSession(nil pty) returned nil error")
 	}
 }
@@ -137,7 +137,7 @@ func TestPumpCopiesPTYIntoBuffer(t *testing.T) {
 	t.Parallel()
 	id, _ := NewSessionID()
 	pty := newFakePTY()
-	s, err := NewSession(id, pty, 24, 80, 1024, 0)
+	s, err := NewSession(id, "", pty, 24, 80, 1024, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestWriteStdinReachesPTY(t *testing.T) {
 	t.Parallel()
 	id, _ := NewSessionID()
 	pty := newFakePTY()
-	s, _ := NewSession(id, pty, 24, 80, 1024, 0)
+	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
 	if _, err := s.WriteStdin([]byte("ls\n")); err != nil {
 		t.Fatalf("WriteStdin: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestResizeUpdatesPTYAndState(t *testing.T) {
 	t.Parallel()
 	id, _ := NewSessionID()
 	pty := newFakePTY()
-	s, _ := NewSession(id, pty, 24, 80, 1024, 0)
+	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
 	if err := s.Resize(40, 120); err != nil {
 		t.Fatalf("Resize: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestAcquireDisplacesPriorAttach(t *testing.T) {
 	t.Parallel()
 	id, _ := NewSessionID()
 	pty := newFakePTY()
-	s, _ := NewSession(id, pty, 24, 80, 1024, 0)
+	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
 	parent := context.Background()
 
 	first, gen1, err := s.Acquire(parent)
@@ -247,7 +247,7 @@ func TestReleaseDoesNotClearWhenDisplaced(t *testing.T) {
 	t.Parallel()
 	id, _ := NewSessionID()
 	pty := newFakePTY()
-	s, _ := NewSession(id, pty, 24, 80, 1024, 0)
+	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
 	parent := context.Background()
 
 	_, gen1, _ := s.Acquire(parent)
@@ -269,7 +269,7 @@ func TestReleaseStaleGenerationIsNoOp(t *testing.T) {
 	// got this wrong.
 	id, _ := NewSessionID()
 	pty := newFakePTY()
-	s, _ := NewSession(id, pty, 24, 80, 1024, 0)
+	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
 	parent, cancel := context.WithCancel(context.Background())
 	_, gen1, _ := s.Acquire(parent)
 	_, gen2, _ := s.Acquire(parent)
@@ -288,7 +288,7 @@ func TestCloseIsIdempotent(t *testing.T) {
 	t.Parallel()
 	id, _ := NewSessionID()
 	pty := newFakePTY()
-	s, _ := NewSession(id, pty, 24, 80, 1024, 0)
+	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +311,7 @@ func TestCloseCancelsActiveAttach(t *testing.T) {
 	t.Parallel()
 	id, _ := NewSessionID()
 	pty := newFakePTY()
-	s, _ := NewSession(id, pty, 24, 80, 1024, 0)
+	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
 	ctx, _, _ := s.Acquire(context.Background())
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
@@ -328,7 +328,7 @@ func TestIdleForGrows(t *testing.T) {
 	t.Parallel()
 	id, _ := NewSessionID()
 	pty := newFakePTY()
-	s, _ := NewSession(id, pty, 24, 80, 1024, 0)
+	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
 	time.Sleep(20 * time.Millisecond)
 	if got := s.IdleFor(); got < 20*time.Millisecond {
 		t.Errorf("IdleFor = %v, want ≥ 20ms", got)

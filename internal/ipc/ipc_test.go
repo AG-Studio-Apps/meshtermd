@@ -33,6 +33,19 @@ func (h *echoHandler) HandlePing(ctx context.Context, req PingRequest) PingRespo
 	return PingResponse{Nonce: req.Nonce}
 }
 
+// HandleListSessions / HandleKillSession exist only to satisfy the
+// Handler interface added when meshtermd grew named multi-sessions.
+// The IPC-level tests in this package focus on Allocate/Ping framing
+// and lifecycle; daemon-level coverage of List/Kill behaviour lives
+// in internal/daemon/daemon_test.go where there's a real registry.
+func (h *echoHandler) HandleListSessions(ctx context.Context, _ ListSessionsRequest) ListSessionsResponse {
+	return ListSessionsResponse{Ok: true}
+}
+
+func (h *echoHandler) HandleKillSession(ctx context.Context, _ KillSessionRequest) KillSessionResponse {
+	return KillSessionResponse{Ok: true}
+}
+
 func startServer(t *testing.T, h Handler) (*Server, string) {
 	t.Helper()
 	dir := tempDirWith0700(t)

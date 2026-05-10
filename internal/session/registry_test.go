@@ -15,7 +15,7 @@ func mustNewSession(t *testing.T) *Session {
 		t.Fatal(err)
 	}
 	pty := newFakePTY()
-	s, err := NewSession(id, pty, 24, 80, 1024, 0)
+	s, err := NewSession(id, "", pty, 24, 80, 1024, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func newSessionWithTimeout(idle time.Duration) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	return NewSession(id, newFakePTY(), 24, 80, 1024, idle)
+	return NewSession(id, "", newFakePTY(), 24, 80, 1024, idle)
 }
 
 func TestRegistryRunStopsOnContextCancel(t *testing.T) {
@@ -259,8 +259,85 @@ func TestRegistryConcurrentAddLookup(t *testing.T) {
 func mustNewSessionConcurrent() *Session {
 	id, _ := NewSessionID()
 	pty := newFakePTY()
-	s, _ := NewSession(id, pty, 24, 80, 1024, 0)
+	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
 	return s
+}
+
+// TestRegistryRejectsDuplicateName asserts that two sessions with
+// the same non-empty Name can't both live in the registry. Empty
+// names are NOT considered colliding (anonymous sessions remain a
+// supported posture for legacy callers).
+func TestRegistryRejectsDuplicateName(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry(0, 0, 0, 0)
+	mk := func(name string) *Session {
+		id, _ := NewSessionID()
+		s, err := NewSession(id, name, newFakePTY(), 24, 80, 1024, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+
+	a := mk("dev")
+	if err := r.Add(a); err != nil {
+		t.Fatalf("Add(a): %v", err)
+	}
+	b := mk("dev")
+	if err := r.Add(b); !errors.Is(err, ErrDuplicateName) {
+		t.Errorf("Add(b) = %v, want ErrDuplicateName", err)
+	}
+
+	// Two anonymous sessions are allowed.
+	c := mk("")
+	if err := r.Add(c); err != nil {
+		t.Fatalf("Add(c anon): %v", err)
+	}
+	d := mk("")
+	if err := r.Add(d); err != nil {
+		t.Errorf("Add(d anon): %v, want no error (anon names don't collide)", err)
+	}
+}
+
+// TestLookupByName covers the index lookup + miss + empty-name posture.
+func TestLookupByName(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry(0, 0, 0, 0)
+	id, _ := NewSessionID()
+	s, _ := NewSession(id, "build", newFakePTY(), 24, 80, 1024, 0)
+	if err := r.Add(s); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := r.LookupByName("build"); err != nil {
+		t.Errorf("LookupByName(build) = %v, want hit", err)
+	} else if got != s {
+		t.Error("LookupByName returned wrong pointer")
+	}
+	if _, err := r.LookupByName("missing"); !errors.Is(err, ErrUnknownSession) {
+		t.Errorf("LookupByName(missing) = %v, want ErrUnknownSession", err)
+	}
+	if _, err := r.LookupByName(""); !errors.Is(err, ErrUnknownSession) {
+		t.Errorf("LookupByName(\"\") = %v, want ErrUnknownSession", err)
+	}
+}
+
+// TestSweepClearsByNameIndex asserts the secondary index doesn't leak
+// after GC reaps a named session.
+func TestSweepClearsByNameIndex(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry(0, 20*time.Millisecond, time.Hour, 0)
+	id, _ := NewSessionID()
+	s, _ := NewSession(id, "doomed", newFakePTY(), 24, 80, 1024, 0)
+	if err := r.Add(s); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if reaped := r.Sweep(); reaped != 1 {
+		t.Fatalf("Sweep reaped %d, want 1", reaped)
+	}
+	if _, err := r.LookupByName("doomed"); !errors.Is(err, ErrUnknownSession) {
+		t.Errorf("byName index leaked after Sweep: LookupByName = %v", err)
+	}
 }
 
 func TestRegistryDefaults(t *testing.T) {

@@ -1,18 +1,2 @@
-# minisign release-signing public key
-#
-# When the maintainer signs a release's SHA256SUMS with minisign,
-# this is the matching public key. The iOS app embeds this value
-# at build time and uses it to verify the daemon binary it's about
-# to upload via SFTP.
-#
-# To verify a release manually:
-#
-#   minisign -V -p docs/release-public-key.txt -m SHA256SUMS
-#
-# The iOS client also trusts an EMERGENCY key (held offline, not
-# published here) so the primary can be rotated without shipping a
-# new iOS build. Both public keys live in the iOS source at
-# Sources/meshTerm/Roam/RoamInstallConstants.swift.
-
-untrusted comment: minisign public key 94562DC3EC2D6EB4
+untrusted comment: minisign public key 94562DC3EC2D6EB4 — meshtermd primary release-signing key. Verify a release with: minisign -V -p docs/release-public-key.txt -m SHA256SUMS
 RWS0bi3swy1WlKoCoCnTQtCYAvt01ue3mMxhVy/Q6qxmVOdPpt8eIyQ1

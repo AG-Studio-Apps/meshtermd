@@ -31,6 +31,14 @@ type Registry struct {
 	maxIdleTimeout time.Duration
 	gcInterval     time.Duration
 
+	// OnReap, when set, fires for each session the idle-GC reaps.
+	// Called OUTSIDE the registry mutex with the reaped session,
+	// after Close has been invoked — observers can safely read the
+	// session's terminal state (Name, ID, IdleFor at reap time).
+	// Daemon wires this to slog so reaped events show up in the
+	// operational log alongside attach/detach.
+	OnReap func(*Session)
+
 	mu       sync.Mutex
 	sessions map[SessionID]*Session
 	// byName maps a non-empty Session.Name to its Session pointer.
@@ -446,6 +454,9 @@ func (r *Registry) Sweep() int {
 
 	for _, s := range doomed {
 		_ = s.Close()
+		if r.OnReap != nil {
+			r.OnReap(s)
+		}
 	}
 	return len(doomed)
 }

@@ -106,6 +106,16 @@ func New(cfg Config) (*Daemon, error) {
 	}
 
 	reg := session.NewRegistry(cfg.MaxSessions, cfg.IdleTimeout, 0, cfg.MaxIdleTimeout)
+	// Surface idle-GC reap events in the operational log. Pairs
+	// with the session.attach / session.detach events emitted by
+	// the transport layer so operators tailing logs see the full
+	// lifecycle of a session.
+	reg.OnReap = func(s *session.Session) {
+		logger.Info("session.reaped",
+			"session", s.ID().String(),
+			"name", s.Name(),
+		)
+	}
 
 	d := &Daemon{
 		cfg:       cfg,

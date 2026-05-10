@@ -240,11 +240,17 @@ func (d *Daemon) lookupOrCreateSession(req ipc.AllocateRequest) (*session.Sessio
 	if err != nil {
 		return nil, &allocateErr{Code: ipc.ErrUnknownSession, Msg: err.Error()}
 	}
-	// Apply rows/cols if the caller supplied them — useful for
-	// reattach where the iOS device's window size has changed.
-	if req.Rows > 0 && req.Cols > 0 {
-		_ = sess.Resize(req.Rows, req.Cols)
-	}
+	// Do NOT resize the PTY on reattach. iOS sends a Resize control
+	// frame after Attach with the actual terminal size; if we also
+	// resize here from req.Rows/Cols, the PTY size bounces (e.g.
+	// 40×45 → 24×80 from the hardcoded CLI args, then 40×45 again
+	// from the QUIC Resize) and each transition fires SIGWINCH at
+	// the child shell, which redraws its prompt — two extra prompt
+	// bytes go into the ring buffer per cold-start.
+	//
+	// req.Rows/Cols are still meaningful for the spawn path above
+	// (initial PTY size for new sessions). For reattach, the QUIC
+	// control-frame path is the single source of truth.
 	return sess, nil
 }
 

@@ -103,6 +103,18 @@ type Session struct {
 	// ctx-error-as-identity heuristic.
 	activeGen uint64
 
+	// suppressNextRedraw is set by Resize when the kernel actually
+	// fires SIGWINCH at the child shell. The Pump loop checks this
+	// flag on its next chunk and, if the chunk starts with
+	// `\r\x1b[K` (bash's prompt-redraw introducer from SIGWINCH),
+	// drops that single chunk so it never reaches the ring buffer.
+	// Without this filter, every Resize that legitimately changes
+	// size leaves a stale prompt-redraw blob in the buffer; on
+	// replay those redraws render at whatever cursor position they
+	// were emitted at, producing the visible "extra prompts"
+	// pollution that grows on each cold-start.
+	suppressNextRedraw bool
+
 	closed bool
 }
 
@@ -167,18 +179,50 @@ func (s *Session) WriteStdin(p []byte) (int, error) {
 
 // Resize updates the PTY's window size and remembers the latest
 // values for any future re-attachers that join without sending their
-// own Resize.
+// own Resize. If the new size differs from the current one, the
+// kernel will fire SIGWINCH at the child shell, which (for an
+// interactive bash) reacts by writing a prompt-redraw blob to the
+// PTY output. We arm `suppressNextRedraw` so the Pump loop drops
+// that one chunk before it enters the ring buffer — replays don't
+// then accumulate stale prompt redraws on each cold-start.
 func (s *Session) Resize(rows, cols uint16) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return ErrSessionClosed
 	}
+	sizeChanged := s.rows != rows || s.cols != cols
 	s.rows, s.cols = rows, cols
 	pty := s.pty
 	s.lastActiveAt = time.Now()
+	if sizeChanged {
+		s.suppressNextRedraw = true
+	}
 	s.mu.Unlock()
 	return pty.SetSize(rows, cols)
+}
+
+// shouldSuppressRedraw consumes the suppress-next-redraw flag if
+// `chunk` looks like bash's SIGWINCH prompt-redraw blob (starts
+// with `\r\x1b[K`). Returns true if the chunk should be skipped.
+// Called by Pump on each PTY read.
+func (s *Session) shouldSuppressRedraw(chunk []byte) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.suppressNextRedraw {
+		return false
+	}
+	// Match `\r\x1b[K` at chunk start — bash readline's
+	// rl_redisplay() canonical "redraw current line" intro.
+	if len(chunk) >= 4 && chunk[0] == '\r' && chunk[1] == 0x1B && chunk[2] == '[' && chunk[3] == 'K' {
+		s.suppressNextRedraw = false
+		return true
+	}
+	// Not a redraw — clear the flag anyway so we don't suppress a
+	// legitimate later chunk if bash decides not to redraw for
+	// whatever reason.
+	s.suppressNextRedraw = false
+	return false
 }
 
 // WindowSize returns the latest known window size.
@@ -309,7 +353,22 @@ func (s *Session) Pump() {
 	for {
 		n, err := s.pty.Read(chunk)
 		if n > 0 {
-			filtered := filter.Process(chunk[:n])
+			data := chunk[:n]
+			// Drop bash's SIGWINCH-driven prompt redraw if Resize
+			// just armed the flag. The redraw bytes don't add
+			// information to the persistent shell state — they're
+			// a transient reaction to a screen-size event — and
+			// keeping them in the ring buffer means each replay
+			// renders an extra prompt at the cursor position the
+			// redraw was emitted at.
+			if s.shouldSuppressRedraw(data) {
+				s.Touch()
+				if err != nil {
+					return
+				}
+				continue
+			}
+			filtered := filter.Process(data)
 			if len(filtered) > 0 {
 				_, _ = s.buf.Write(filtered)
 			}

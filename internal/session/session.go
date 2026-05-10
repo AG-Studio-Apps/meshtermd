@@ -290,6 +290,13 @@ func (s *Session) Close() error {
 // is closed. On exit it calls Close so the registry can reap the
 // session.
 //
+// Each PTY chunk is run through a QueryFilter that intercepts
+// terminal-query escape sequences (Device Attributes, Device Status
+// Report) and synthesises responses server-side — apps querying the
+// terminal get answered without the query bytes ever reaching the
+// ring buffer. This keeps replay-on-reattach pollution-free without
+// breaking interactive apps' capability negotiation.
+//
 // Callers should run Pump in its own goroutine immediately after
 // constructing a Session.
 func (s *Session) Pump() {
@@ -298,10 +305,14 @@ func (s *Session) Pump() {
 	// hundreds-of-bytes chunks, occasionally a few KB. 8 KiB is more
 	// than enough to not be the bottleneck.
 	chunk := make([]byte, 8*1024)
+	filter := NewQueryFilter(s.pty)
 	for {
 		n, err := s.pty.Read(chunk)
 		if n > 0 {
-			_, _ = s.buf.Write(chunk[:n])
+			filtered := filter.Process(chunk[:n])
+			if len(filtered) > 0 {
+				_, _ = s.buf.Write(filtered)
+			}
 			s.Touch()
 		}
 		if err != nil {

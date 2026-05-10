@@ -112,9 +112,8 @@ func (q *QueryFilter) Process(chunk []byte) []byte {
 		// where:
 		//   private:      one of `?`, `>`, `=` (zero or one)
 		//   params:       digits and `;` separators (any count)
-		//   intermediate: bytes 0x20..0x2F (we don't see these for
-		//                 the queries we care about, so we don't
-		//                 enumerate them here)
+		//   intermediate: bytes 0x20..0x2F (e.g. `$` in DECRQM
+		//                 `\x1b[?<n>$p` private-mode queries)
 		//   final:        byte 0x40..0x7E
 		end := idx + 2
 		// Optional private prefix.
@@ -123,8 +122,17 @@ func (q *QueryFilter) Process(chunk []byte) []byte {
 				end++
 			}
 		}
-		// Params.
-		for end < len(chunk) && (isDigit(chunk[end]) || chunk[end] == ';') {
+		// Params + intermediate bytes. We accept intermediates
+		// (0x20-0x2F) inline with params so DECRQM `$p` queries
+		// are recognised — without that the `$` exits the loop and
+		// gets misread as the final byte.
+		for end < len(chunk) {
+			byte_ := chunk[end]
+			isParam := isDigit(byte_) || byte_ == ';'
+			isIntermediate := byte_ >= 0x20 && byte_ <= 0x2F
+			if !isParam && !isIntermediate {
+				break
+			}
 			end++
 		}
 		// We need at least one more byte for the final.
@@ -232,6 +240,26 @@ func (q *QueryFilter) matchQuery(seq []byte) ([]byte, bool) {
 			"14", "14;0", "14;2",
 			"15", "16", "18", "19",
 			"20", "21", "22", "23":
+			return nil, true
+		}
+	case 'q':
+		// XTVERSION query: `\x1b[>q`. Returns the terminal name +
+		// version. SwiftTerm fires this on init to identify the
+		// remote terminal class. Strip without responding — the
+		// shell doesn't care about terminal-self-identity, and apps
+		// that genuinely use it (very few) fall back gracefully.
+		if params == ">" {
+			return nil, true
+		}
+	case 'p':
+		// DECRQM (Request Mode): `\x1b[?<n>$p` (DEC private) or
+		// `\x1b[<n>$p` (ANSI). Asks the terminal whether a mode is
+		// set/reset; response is `\x1b[?<n>;<state>$y` (or `$y`
+		// without `?` for ANSI). SwiftTerm queries DECSET 2004
+		// (bracketed paste) and friends on init. Strip without
+		// responding — apps that need the answer either set the
+		// mode unconditionally or check via a different mechanism.
+		if len(params) > 1 && params[len(params)-1] == '$' {
 			return nil, true
 		}
 	}

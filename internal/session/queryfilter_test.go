@@ -174,6 +174,37 @@ func TestQueryFilterEchoedDAResponseIsPassedThrough(t *testing.T) {
 	}
 }
 
+func TestQueryFilterXTVERSIONStripped(t *testing.T) {
+	// SwiftTerm fires XTVERSION on view init to learn the remote
+	// terminal class. Returns `\x1bP>|<name>(<version>)\x1b\\`.
+	// Strip silently — shell doesn't care about terminal identity.
+	f := NewQueryFilter(nil)
+	got := f.Process([]byte("X\x1b[>qY"))
+	if string(got) != "XY" {
+		t.Errorf("XTVERSION not stripped: got %q", got)
+	}
+}
+
+func TestQueryFilterDECRQMStripped(t *testing.T) {
+	// DECRQM (Request Mode) — DEC-private and ANSI variants both
+	// elicit responses (`$y` final). SwiftTerm queries common
+	// modes (bracketed paste 2004, mouse modes 1000/1006, etc.)
+	// on init.
+	for _, query := range []string{
+		"\x1b[?2004$p",  // bracketed paste
+		"\x1b[?1000$p",  // X11 mouse
+		"\x1b[?1006$p",  // SGR mouse
+		"\x1b[?25$p",    // cursor visibility
+		"\x1b[4$p",      // ANSI variant: insert mode
+	} {
+		f := NewQueryFilter(nil)
+		got := f.Process([]byte("A" + query + "B"))
+		if string(got) != "AB" {
+			t.Errorf("DECRQM %q not stripped: got %q", query, got)
+		}
+	}
+}
+
 func TestQueryFilterWindowManipulationQueriesStripped(t *testing.T) {
 	// xterm window-manipulation queries — SwiftTerm fires these
 	// at view init to discover terminal size + decoration state.

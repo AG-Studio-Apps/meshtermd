@@ -46,6 +46,8 @@ func main() {
 		os.Exit(runKill(args))
 	case "rename":
 		os.Exit(runRename(args))
+	case "session-info":
+		os.Exit(runSessionInfo(args))
 	case "status":
 		os.Exit(runStatus(args))
 	case "help", "--help", "-h":
@@ -67,6 +69,7 @@ Subcommands:
   serve              run the long-lived daemon (owns session registry, accepts QUIC)
   connect            SSH-side bootstrap helper invoked by the meshTerm iOS app
   list               enumerate live sessions on this daemon (--json for machine-readable output)
+  session-info       print one session's detail (attach state, geometry, idle)
   kill               reap a session by id or name
   rename             change a session's user-visible name (PTY + buffer unaffected)
   status             print the daemon's operational snapshot (--json for tooling)

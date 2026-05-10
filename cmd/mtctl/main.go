@@ -49,6 +49,8 @@ func main() {
 		os.Exit(runNew(args))
 	case "status":
 		os.Exit(runStatus(args))
+	case "session-info":
+		os.Exit(runSessionInfo(args))
 	case "attach":
 		os.Exit(runAttach(args))
 	case "help", "--help", "-h":
@@ -68,6 +70,7 @@ Usage: mtctl <subcommand> [flags]
 Subcommands:
   version            print build identifier
   list               enumerate sessions on the remote daemon
+  session-info       print one session's detail (attach state, geometry, idle)
   status             print the remote daemon's operational snapshot
   new                create a new named session (does not attach)
   attach             attach to a session as your local terminal

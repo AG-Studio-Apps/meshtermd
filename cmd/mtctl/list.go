@@ -87,11 +87,52 @@ func runList(args []string) int {
 			truncateID(s.ID),
 			shortDur(now.Sub(created)),
 			shortDur(now.Sub(lastActive)),
-			boolMark(s.AttachedNow),
+			formatAttachedModes(s.AttachedModes, s.AttachedNow),
 		)
 	}
 	_ = w.Flush()
 	return exitOK
+}
+
+// formatAttachedModes renders the ATTACHED column compactly. See the
+// daemon-side `meshtermd list` for the same logic — kept duplicated
+// across binaries to avoid pulling cmd/* into a shared package.
+//
+// Falls back to the legacy yes/no when the daemon didn't supply
+// AttachedModes (older daemon — old wire didn't carry the field).
+func formatAttachedModes(modes []string, fallback bool) string {
+	if modes == nil {
+		if fallback {
+			return "yes"
+		}
+		return "—"
+	}
+	if len(modes) == 0 {
+		return "—"
+	}
+	var ex, ro int
+	for _, m := range modes {
+		switch m {
+		case "exclusive":
+			ex++
+		case "readonly":
+			ro++
+		}
+	}
+	switch {
+	case ex == 1 && ro == 0:
+		return "exclusive"
+	case ex == 0 && ro == 1:
+		return "readonly"
+	case ex == 0 && ro > 1:
+		return fmt.Sprintf("%d× readonly", ro)
+	case ex == 1 && ro == 1:
+		return "exclusive+readonly"
+	case ex == 1 && ro > 1:
+		return fmt.Sprintf("exclusive+%d× readonly", ro)
+	default:
+		return fmt.Sprintf("%d clients", len(modes))
+	}
 }
 
 func truncateID(id string) string {

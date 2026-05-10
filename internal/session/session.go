@@ -447,6 +447,24 @@ func (s *Session) HasExclusiveStdinWriter() bool {
 	return false
 }
 
+// AttachedModes returns the modes of every currently-attached
+// client. Snapshot — clients can come and go between this read
+// and the caller using the result. Used by ListSessions /
+// session-info to render multi-attach state in pickers and CLI
+// tools.
+func (s *Session) AttachedModes() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.clients) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(s.clients))
+	for _, c := range s.clients {
+		out = append(out, c.mode.String())
+	}
+	return out
+}
+
 // PeerModes returns a snapshot of attached clients' modes excluding
 // the caller's gen. Used to populate `AttachAck.Peers` so a
 // freshly-attaching client can render a "also attached: 1

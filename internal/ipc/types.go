@@ -103,15 +103,24 @@ type AllocateResponse struct {
 // `meshtermd list --json` output that iOS consumes via SSH);
 // field tags are short stable strings so CBOR + JSON tooling
 // produce a consistent wire form.
+//
+// AttachedNow is preserved as a bool for backwards-compat with
+// pre-multi-attach iOS clients (decoding via Codable's
+// decodeIfPresent on the field). AttachedModes is the richer
+// multi-attach view: one entry per attached client, value is
+// "exclusive" or "readonly". Equivalent to len(AttachedModes) > 0
+// for AttachedNow's purposes; emitted by daemons that know about
+// the field, ignored by older clients that don't.
 type SessionInfo struct {
-	ID             string `cbor:"sid" json:"id"`
-	Name           string `cbor:"name" json:"name"`
-	CreatedAtNs    int64  `cbor:"cn" json:"created_at_ns"`
-	LastActiveAtNs int64  `cbor:"la" json:"last_active_at_ns"`
-	AttachedNow    bool   `cbor:"att" json:"attached_now"`
-	IdleTimeoutNs  int64  `cbor:"itn,omitempty" json:"idle_timeout_ns,omitempty"`
-	Rows           uint16 `cbor:"rows,omitempty" json:"rows,omitempty"`
-	Cols           uint16 `cbor:"cols,omitempty" json:"cols,omitempty"`
+	ID             string   `cbor:"sid" json:"id"`
+	Name           string   `cbor:"name" json:"name"`
+	CreatedAtNs    int64    `cbor:"cn" json:"created_at_ns"`
+	LastActiveAtNs int64    `cbor:"la" json:"last_active_at_ns"`
+	AttachedNow    bool     `cbor:"att" json:"attached_now"`
+	AttachedModes  []string `cbor:"am,omitempty" json:"attached_modes,omitempty"`
+	IdleTimeoutNs  int64    `cbor:"itn,omitempty" json:"idle_timeout_ns,omitempty"`
+	Rows           uint16   `cbor:"rows,omitempty" json:"rows,omitempty"`
+	Cols           uint16   `cbor:"cols,omitempty" json:"cols,omitempty"`
 }
 
 // ListSessionsRequest enumerates every live session on the daemon.

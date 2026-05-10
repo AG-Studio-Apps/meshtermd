@@ -251,12 +251,14 @@ func (d *Daemon) HandleListSessions(ctx context.Context, _ ipc.ListSessionsReque
 			continue
 		}
 		rows, cols := sess.WindowSize()
+		modes := sess.AttachedModes()
 		out = append(out, ipc.SessionInfo{
 			ID:             sess.ID().String(),
 			Name:           sess.Name(),
 			CreatedAtNs:    sess.Created().UnixNano(),
 			LastActiveAtNs: sess.LastActiveAt().UnixNano(),
-			AttachedNow:    sess.IsAttached(),
+			AttachedNow:    len(modes) > 0,
+			AttachedModes:  modes,
 			IdleTimeoutNs:  int64(sess.IdleTimeout()),
 			Rows:           rows,
 			Cols:           cols,

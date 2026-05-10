@@ -109,6 +109,32 @@ const (
 	ReasonReplaced     = "replaced"
 )
 
+// Attach mode constants. The wire encoding is the lowercase-string
+// field on Attach and AttachAck; an empty string is treated as
+// "exclusive" for backward compat with v0 clients that don't set
+// the field. iOS today emits no Mode and inherits exclusive
+// semantics — the post-change default exactly matches the
+// pre-change behaviour.
+const (
+	// AttachModeExclusive: the default. Receives output, sends
+	// stdin, owns PTY size via Resize. A new exclusive attach
+	// displaces any prior exclusive client. Readonly clients are
+	// unaffected by exclusive turnover.
+	AttachModeExclusive = "exclusive"
+
+	// AttachModeReadonly: receives output only. Stdin frames from
+	// this client are silently dropped by the daemon — they're not
+	// a protocol violation (a misbehaving keystroke shouldn't tear
+	// the connection down). Resize frames are also dropped: the
+	// PTY size is owned by the exclusive client; readonly clients
+	// just observe whatever bytes arrive. Multiple readonly
+	// clients can coexist with each other and with one exclusive
+	// client. Use case: monitor a long-running build from your
+	// phone while you type on the laptop, or watch a colleague
+	// working from across the office.
+	AttachModeReadonly = "readonly"
+)
+
 // Error codes for AttachAck.Err per § 7.3.
 const (
 	AttachErrUnknownSession      = "unknown_session"
@@ -127,40 +153,34 @@ type Attach struct {
 	AckSeq    uint64 `cbor:"ack"`
 	Rows      uint16 `cbor:"rows"`
 	Cols      uint16 `cbor:"cols"`
+	// Mode is the requested attach role: "exclusive" (default) or
+	// "readonly". Empty/missing → "exclusive" for backward compat
+	// with v0 clients (iOS pre-multi-attach, mtctl pre-Tier 3.5).
+	// Unknown values are treated as "exclusive" — same compat
+	// posture; the server doesn't fail closed on a future mode it
+	// doesn't recognise.
+	Mode string `cbor:"mode,omitempty"`
 }
 
 // AttachAck is the server's response to Attach.
 //
-// Reserved-for-future-use CBOR map keys (NOT to be used by other
-// fields; the StrictDecMode ignores unknowns, so adding these later
-// is forward-compatible):
-//
-//	"mode"  - string. "exclusive" (default, current behaviour:
-//	          the new attach displaces any prior client) or
-//	          "shared" (multiple clients receive the same output
-//	          stream; future read-only watcher / pair-programming
-//	          mode). Ship today's clients without the field; old
-//	          clients ignoring it on the wire is intentional.
-//	"peers" - []string. Hex SessionIDs of other clients currently
-//	          attached to this session. Useful for the iOS picker
-//	          to render an "also attached: <name>" hint before the
-//	          user displaces them. Empty when this is the only
-//	          attach.
-//
-// Add fields here when the multi-attach work lands; the IPC
-// `SessionInfo.AttachedNow bool` already flags "someone is here"
-// at picker-list time, but a per-attach snapshot needs the AttachAck
-// extension to be useful.
+// `Mode` echoes the resolved role — clients can confirm the
+// daemon honoured their request (or fell back to exclusive on an
+// unknown value). `Peers` is the snapshot of co-attached clients'
+// modes ("exclusive", "readonly") at the moment of this attach;
+// useful for the picker UI ("also attached: 1 readonly").
 type AttachAck struct {
-	T         string `cbor:"t"`
-	V         uint32 `cbor:"v"`
-	OK        bool   `cbor:"ok"`
-	SessionID []byte `cbor:"sid,omitempty"`
-	Start     uint64 `cbor:"start,omitempty"`
-	BufSeq    uint64 `cbor:"buf_seq,omitempty"`
-	Trunc     bool   `cbor:"trunc,omitempty"`
-	Err       string `cbor:"err,omitempty"`
-	Msg       string `cbor:"msg,omitempty"`
+	T         string   `cbor:"t"`
+	V         uint32   `cbor:"v"`
+	OK        bool     `cbor:"ok"`
+	SessionID []byte   `cbor:"sid,omitempty"`
+	Start     uint64   `cbor:"start,omitempty"`
+	BufSeq    uint64   `cbor:"buf_seq,omitempty"`
+	Trunc     bool     `cbor:"trunc,omitempty"`
+	Mode      string   `cbor:"mode,omitempty"`
+	Peers     []string `cbor:"peers,omitempty"`
+	Err       string   `cbor:"err,omitempty"`
+	Msg       string   `cbor:"msg,omitempty"`
 }
 
 // Ack reports the highest output sequence number the client has

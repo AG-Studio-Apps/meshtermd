@@ -216,7 +216,7 @@ func TestAcquireDisplacesPriorAttach(t *testing.T) {
 	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
 	parent := context.Background()
 
-	first, gen1, err := s.Acquire(parent)
+	first, gen1, err := s.Acquire(parent, AttachExclusive)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +227,7 @@ func TestAcquireDisplacesPriorAttach(t *testing.T) {
 		t.Error("first attach context cancelled prematurely")
 	}
 
-	second, gen2, err := s.Acquire(parent)
+	second, gen2, err := s.Acquire(parent, AttachExclusive)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,8 +250,8 @@ func TestReleaseDoesNotClearWhenDisplaced(t *testing.T) {
 	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
 	parent := context.Background()
 
-	_, gen1, _ := s.Acquire(parent)
-	second, _, _ := s.Acquire(parent)
+	_, gen1, _ := s.Acquire(parent, AttachExclusive)
+	second, _, _ := s.Acquire(parent, AttachExclusive)
 	// Old attach calls Release after seeing its ctx cancelled. With
 	// the generation counter, this no-ops cleanly.
 	s.Release(gen1)
@@ -271,16 +271,127 @@ func TestReleaseStaleGenerationIsNoOp(t *testing.T) {
 	pty := newFakePTY()
 	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
 	parent, cancel := context.WithCancel(context.Background())
-	_, gen1, _ := s.Acquire(parent)
-	_, gen2, _ := s.Acquire(parent)
+	_, gen1, _ := s.Acquire(parent, AttachExclusive)
+	_, gen2, _ := s.Acquire(parent, AttachExclusive)
 	cancel() // cancel the shared parent — both ctxs now have Err()
 	// First's Release with the OLD gen must not clear gen2's slot.
 	s.Release(gen1)
 	// Inspect: activeCancel must still be set (a third Acquire
 	// should still trigger displacement).
-	_, gen3, _ := s.Acquire(context.Background())
+	_, gen3, _ := s.Acquire(context.Background(), AttachExclusive)
 	if gen3 == gen2 {
 		t.Error("third Acquire didn't increment generation; second's cancel was prematurely cleared")
+	}
+}
+
+// TestAcquireReadonlyDoesNotDisplace: a readonly attach must not
+// cancel any existing client (exclusive or readonly). Multiple
+// readonly + one exclusive should coexist.
+func TestAcquireReadonlyDoesNotDisplace(t *testing.T) {
+	t.Parallel()
+	id, _ := NewSessionID()
+	pty := newFakePTY()
+	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
+	defer s.Close()
+
+	exclCtx, exclGen, err := s.Acquire(context.Background(), AttachExclusive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roCtx, roGen, err := s.Acquire(context.Background(), AttachReadonly)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Neither should be cancelled.
+	if exclCtx.Err() != nil {
+		t.Error("exclusive context cancelled by readonly Acquire")
+	}
+	if roCtx.Err() != nil {
+		t.Error("readonly context cancelled at acquire time")
+	}
+	// PeerModes(roGen) should report the exclusive client.
+	peers := s.PeerModes(roGen)
+	if len(peers) != 1 || peers[0] != "exclusive" {
+		t.Errorf("readonly's peers = %v, want [exclusive]", peers)
+	}
+	// PeerModes(exclGen) should report the readonly.
+	peers2 := s.PeerModes(exclGen)
+	if len(peers2) != 1 || peers2[0] != "readonly" {
+		t.Errorf("exclusive's peers = %v, want [readonly]", peers2)
+	}
+}
+
+// TestAcquireExclusiveDisplacesPriorExclusive: a new exclusive
+// attach must cancel any prior exclusive client but leave readonly
+// clients alone.
+func TestAcquireExclusiveDisplacesPriorExclusive(t *testing.T) {
+	t.Parallel()
+	id, _ := NewSessionID()
+	pty := newFakePTY()
+	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
+	defer s.Close()
+
+	first, _, _ := s.Acquire(context.Background(), AttachExclusive)
+	roCtx, _, _ := s.Acquire(context.Background(), AttachReadonly)
+
+	// Now displace the exclusive.
+	second, _, _ := s.Acquire(context.Background(), AttachExclusive)
+
+	// First (displaced exclusive) must be cancelled.
+	select {
+	case <-first.Done():
+		// good
+	case <-time.After(100 * time.Millisecond):
+		t.Error("displaced exclusive context not cancelled within 100ms")
+	}
+	// Readonly must still be alive.
+	if roCtx.Err() != nil {
+		t.Error("readonly context cancelled by exclusive replacement")
+	}
+	// Second exclusive must be alive.
+	if second.Err() != nil {
+		t.Error("new exclusive context already cancelled")
+	}
+}
+
+// TestAcquireMultipleReadonlyCoexist: readonly clients accumulate.
+// Two readonly Acquire calls leave both alive.
+func TestAcquireMultipleReadonlyCoexist(t *testing.T) {
+	t.Parallel()
+	id, _ := NewSessionID()
+	pty := newFakePTY()
+	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
+	defer s.Close()
+
+	a, genA, _ := s.Acquire(context.Background(), AttachReadonly)
+	b, _, _ := s.Acquire(context.Background(), AttachReadonly)
+	if a.Err() != nil || b.Err() != nil {
+		t.Error("readonly Acquire cancelled a peer")
+	}
+	if peers := s.PeerModes(genA); len(peers) != 1 || peers[0] != "readonly" {
+		t.Errorf("PeerModes after 2 readonly = %v", peers)
+	}
+}
+
+// TestReleaseRemovesSpecificClient: Release(gen) must affect only
+// the matching client; others stay attached.
+func TestReleaseRemovesSpecificClient(t *testing.T) {
+	t.Parallel()
+	id, _ := NewSessionID()
+	pty := newFakePTY()
+	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
+	defer s.Close()
+
+	_, genA, _ := s.Acquire(context.Background(), AttachReadonly)
+	_, genB, _ := s.Acquire(context.Background(), AttachReadonly)
+	s.Release(genA)
+	// Release(genA) should leave B in place.
+	if !s.IsAttached() {
+		t.Error("IsAttached() false after only one Release of two readonly clients")
+	}
+	if peers := s.PeerModes(genB); len(peers) != 0 {
+		t.Errorf("PeerModes(B) after Release(A) = %v, want []", peers)
 	}
 }
 
@@ -312,7 +423,7 @@ func TestCloseCancelsActiveAttach(t *testing.T) {
 	id, _ := NewSessionID()
 	pty := newFakePTY()
 	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
-	ctx, _, _ := s.Acquire(context.Background())
+	ctx, _, _ := s.Acquire(context.Background(), AttachExclusive)
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}

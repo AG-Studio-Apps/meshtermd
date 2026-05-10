@@ -190,9 +190,17 @@ A maximum frame length of 64 KiB is enforced. Exceeding it is a fatal protocol v
   "sid": h'…',                     // session_id (16 bytes), must match bootstrap
   "ack": 0,                        // last_ack_seq; 0 for fresh attach
   "rows": 24,                      // initial PTY rows
-  "cols": 80                       // initial PTY cols
+  "cols": 80,                      // initial PTY cols
+  "mode": "exclusive"              // optional: "exclusive" (default) or "readonly"
 }
 ```
+
+**Attach modes** (the `mode` field):
+
+- `"exclusive"` (default; missing/empty/unknown values map here): the client receives output, sends stdin, and owns the PTY size via Resize. A new exclusive Attach **displaces** any prior exclusive client — the daemon cancels the displaced client's stream context and the client sees its connection close cleanly. Existing readonly clients are unaffected by exclusive turnover.
+- `"readonly"`: the client receives output only. Stdin frames from a readonly client are silently dropped by the daemon (NOT a protocol violation — a misbehaving keystroke shouldn't tear the connection down). Resize frames are also dropped: the exclusive client owns the geometry. Multiple readonly clients can coexist with each other AND with one exclusive client.
+
+The pre-`mode` field client posture is preserved exactly: an Attach with no `mode` field is treated as exclusive, identical to v0 behaviour.
 
 ### 7.3 `AttachAck` (server → client, response to Attach)
 
@@ -204,13 +212,17 @@ A maximum frame length of 64 KiB is enforced. Exceeding it is a fatal protocol v
   "sid": h'…',                     // confirmed session_id
   "start": 12345,                  // first seq number we'll send on Stdout (replay starts here)
   "buf_seq": 12345,                // current head of the output ring buffer (== start unless replay overflowed)
-  "trunc": false                   // true iff the requested ack point is older than the buffer's tail (replay was truncated)
+  "trunc": false,                  // true iff the requested ack point is older than the buffer's tail (replay was truncated)
+  "mode": "exclusive",             // the role the daemon resolved (echoes Attach.mode; "exclusive" if unrecognised)
+  "peers": ["readonly"]            // modes of OTHER clients currently attached, excluding this one. Empty when sole attach.
 }
 ```
 
 If `ok = false`, body contains `"err": "<short_code>"` and `"msg": "<human_msg>"`. Codes: `unknown_session`, `bad_token`, `version_unsupported`, `capacity`, `replaced` (another client attached).
 
 If `trunc = true`, the client should display a one-line "[…some output lost during disconnect…]" indicator before rendering the replayed bytes.
+
+`peers` is a snapshot; a client of either mode can attach or detach milliseconds later. Useful for the iOS picker / mtctl status line ("also attached: 1 readonly") but not load-bearing for any protocol invariant.
 
 ### 7.4 `Ack` (client → server, periodic)
 

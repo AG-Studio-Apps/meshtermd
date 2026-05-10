@@ -28,13 +28,15 @@ remote sessions over SSH and (optionally) attaches to them as your
 local terminal. Same binary distribution; same release artifacts.
 
 ```
-mtctl --host me@dev-box list                    # what's alive on the daemon
-mtctl --host me@dev-box new --name dev          # create without attaching
-mtctl --host me@dev-box attach dev              # land in the same shell
-                                                # your iPhone is using
+mtctl --host me@dev-box list                       # what's alive on the daemon
+mtctl --host me@dev-box new --name dev             # create without attaching
+mtctl --host me@dev-box attach dev                 # land in the same shell
+                                                   # your iPhone is using
+mtctl --host me@dev-box attach dev --mode readonly # watch over someone's
+                                                   # shoulder; can't type
 mtctl --host me@dev-box rename dev staging
 mtctl --host me@dev-box kill staging
-mtctl --host me@dev-box status                  # daemon snapshot
+mtctl --host me@dev-box status                     # daemon snapshot
 ```
 
 In an attached session, type `~.` on a fresh line to detach (mosh /

@@ -103,11 +103,19 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 		return
 	}
 
-	// Acquire the session — displaces any prior attach, whose
-	// pumps will observe attachCtx.Done() and unwind. The gen
-	// handle is what we pass to Release so a displaced re-entry
-	// doesn't clobber the new owner (audit F4).
-	attachCtx, attachGen, err := sess.Acquire(ctx)
+	// Resolve the requested attach mode. Empty / unknown → exclusive
+	// (back-compat with v0 clients that don't set the field).
+	attachMode := session.AttachExclusive
+	if att.Mode == protocol.AttachModeReadonly {
+		attachMode = session.AttachReadonly
+	}
+
+	// Acquire the session — exclusive displaces any prior exclusive
+	// (whose pumps observe attachCtx.Done() and unwind), readonly
+	// just adds to the live-clients slice. Either way, gen is what
+	// we pass to Release on exit so a displaced re-entry doesn't
+	// clobber the new owner (audit F4).
+	attachCtx, attachGen, err := sess.Acquire(ctx, attachMode)
 	if err != nil {
 		_ = sendAttachAck(ctrl, protocol.AttachAck{
 			V:   1,
@@ -118,7 +126,13 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 	}
 	defer sess.Release(attachGen)
 
-	if att.Rows > 0 && att.Cols > 0 {
+	// Only the exclusive client owns the PTY size. Readonly clients'
+	// Rows/Cols on the Attach are the dimensions of THEIR local
+	// terminal — they observe whatever the exclusive client is
+	// driving, even if mismatched. Honouring readonly resize would
+	// fight the exclusive client's geometry and cause SIGWINCH
+	// thrashing.
+	if attachMode == session.AttachExclusive && att.Rows > 0 && att.Cols > 0 {
 		_ = sess.Resize(att.Rows, att.Cols)
 	}
 
@@ -145,6 +159,10 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 		return protocol.WriteTaggedFrame(ctrl, t, body)
 	}
 
+	resolvedMode := protocol.AttachModeExclusive
+	if attachMode == session.AttachReadonly {
+		resolvedMode = protocol.AttachModeReadonly
+	}
 	ackBody, err := protocol.MarshalAttachAck(protocol.AttachAck{
 		V:         1,
 		OK:        true,
@@ -152,6 +170,8 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 		Start:     start,
 		BufSeq:    head,
 		Trunc:     trunc,
+		Mode:      resolvedMode,
+		Peers:     sess.PeerModes(attachGen),
 	})
 	if err != nil {
 		log.WarnContext(ctx, "marshal AttachAck", "err", err)
@@ -185,7 +205,7 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 	go func() {
 		defer wg.Done()
 		defer pumpsCancel()
-		if err := readPump(pumpsCtx, sess, ctrl, writeFrame); err != nil &&
+		if err := readPump(pumpsCtx, sess, ctrl, writeFrame, attachMode); err != nil &&
 			!errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
 			log.DebugContext(pumpsCtx, "read pump exit", "err", err)
 		}

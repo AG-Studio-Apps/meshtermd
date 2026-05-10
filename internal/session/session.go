@@ -13,6 +13,54 @@ import (
 // SessionIDLen is the byte length of a session identifier.
 const SessionIDLen = 16
 
+// AttachMode is the role a client takes when attaching. The wire
+// representation is a lowercase string on the Attach control frame
+// (see `protocol.AttachModeExclusive` / `AttachModeReadonly`); we
+// keep an internal Go-typed mirror so the session code doesn't
+// depend on the protocol package directly.
+type AttachMode int
+
+const (
+	// AttachExclusive is the default attach mode. The client
+	// receives output, sends stdin, and owns the PTY size via
+	// Resize. A new exclusive attach displaces any prior exclusive
+	// attach (existing readonly attaches are unaffected). This is
+	// the only mode pre-multi-attach clients can request, and the
+	// only mode where stdin actually reaches the shell.
+	AttachExclusive AttachMode = iota
+
+	// AttachReadonly is the watcher mode. Receives output, doesn't
+	// send stdin or Resize (the daemon drops them on the protocol
+	// boundary so a misbehaving keystroke can't tear the
+	// connection down). Any number of readonly clients can coexist
+	// with each other and with a single exclusive client.
+	AttachReadonly
+)
+
+// String returns the wire form of an AttachMode for logging /
+// AttachAck.Mode echo. Mirrors protocol.AttachMode* constants.
+func (m AttachMode) String() string {
+	switch m {
+	case AttachReadonly:
+		return "readonly"
+	default:
+		return "exclusive"
+	}
+}
+
+// sessionClient is the per-attach state stored inside a Session
+// while a client is connected. The cancel func is the goroutine-
+// local context-cancellation hook the daemon uses to evict a
+// client (e.g. when an exclusive replacement displaces the prior
+// exclusive). gen is the monotonic identity used by Release to
+// distinguish "this is me, removing myself" from "I was already
+// kicked out" — see the activeGen rationale on Session.
+type sessionClient struct {
+	gen    uint64
+	mode   AttachMode
+	cancel context.CancelFunc
+}
+
 // SessionID is a 16-byte random identifier for a Session, generated at
 // session creation. The ID confers no authority on its own — see
 // docs/SECURITY.md threat E.
@@ -98,20 +146,23 @@ type Session struct {
 	// active attach). Drives the registry's idle-GC.
 	lastActiveAt time.Time
 
-	// activeCancel cancels the goroutine of the currently-attached
-	// client (if any). When a second client attaches, we cancel the
-	// first to give the new one exclusive ownership. nil means no
-	// active attach.
-	activeCancel context.CancelFunc
+	// clients is the set of currently-attached clients. There is at
+	// most one client whose mode is exclusive; any number whose
+	// mode is readonly may coexist with it AND with each other.
+	// Pre-multi-attach this was a single (cancel, gen) slot; the
+	// slice form generalises to read-only watchers (Tier 1
+	// shared-attach) and tmux-style co-equal pair-programming
+	// (Tier 2 — protocol headroom is reserved, semantics deferred).
+	clients []sessionClient
 
-	// activeGen is incremented on every Acquire. Callers that
-	// successfully acquire receive their generation; Release(gen)
-	// only clears the slot when gen matches activeGen, so a
-	// displaced caller calling Release after the new owner has
-	// taken over does NOT stomp the new owner's state. This is
-	// audit F4's recommended replacement for the previous
-	// ctx-error-as-identity heuristic.
-	activeGen uint64
+	// nextGen monotonically counts attach calls. Each successful
+	// Acquire returns a fresh value; Release(gen) only removes the
+	// matching client. Audit F4 (v0.0.2 review) — this replaces
+	// the ctx-error-as-identity heuristic with a proper monotonic
+	// generation counter so a displaced client calling Release
+	// after the new owner has taken over does NOT stomp the new
+	// owner's state.
+	nextGen uint64
 
 	// suppressNextRedraw is set by Resize when the kernel actually
 	// fires SIGWINCH at the child shell. The Pump loop checks this
@@ -199,15 +250,15 @@ func (s *Session) LastActiveAt() time.Time {
 	return s.lastActiveAt
 }
 
-// IsAttached reports whether a client is currently attached to this
-// session. Used by ListSessions to surface the AttachedNow flag in
-// the picker. Note that the underlying activeCancel slot can transit
-// between two attaches with no externally-visible window; this is a
-// snapshot, not a mutex-fenced guarantee.
+// IsAttached reports whether at least one client is currently
+// attached to this session, regardless of mode. Used by
+// ListSessions to surface the AttachedNow flag in the picker.
+// This is a snapshot — clients can come and go between this read
+// and the caller observing the result.
 func (s *Session) IsAttached() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.activeCancel != nil
+	return len(s.clients) > 0
 }
 
 // IdleTimeout returns the per-session GC timeout configured at
@@ -306,51 +357,111 @@ func (s *Session) WindowSize() (rows, cols uint16) {
 	return s.rows, s.cols
 }
 
-// Acquire claims this session for a new attach. If another client is
-// currently attached, its context is cancelled; that goroutine should
-// observe ctx.Done() and exit with reason "replaced". Returns a
-// derived context the new attacher should use; cancelling that
-// context (e.g., via Release or via the registry GC'ing the session)
-// terminates the new attach.
-func (s *Session) Acquire(parent context.Context) (context.Context, uint64, error) {
+// Acquire claims this session for a new attach with the given mode.
+//
+// Semantics:
+//
+//   - mode = AttachExclusive: any prior exclusive client is
+//     displaced (its context cancelled, goroutine should observe
+//     ctx.Done() and exit with reason "replaced"). Existing
+//     readonly clients are unaffected — they keep observing.
+//   - mode = AttachReadonly: never displaces anyone. Coexists with
+//     a current exclusive client and with other readonly clients.
+//
+// Returns a derived context the new attacher should use; cancelling
+// that context (e.g., via Release or via the registry GC'ing the
+// session) terminates the new attach. `gen` is the unique identity
+// of THIS attach — the caller must pass it to Release later.
+func (s *Session) Acquire(parent context.Context, mode AttachMode) (context.Context, uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return nil, 0, ErrSessionClosed
 	}
-	if s.activeCancel != nil {
-		// Displace the existing attach.
-		s.activeCancel()
+	if mode == AttachExclusive {
+		// Displace any current exclusive client. We collect the
+		// cancel funcs first, drop the displaced entries from the
+		// slice, then call cancels OUTSIDE the lock so the
+		// displaced goroutines' Release call doesn't deadlock on
+		// our mu.
+		kept := s.clients[:0]
+		var doomed []context.CancelFunc
+		for _, c := range s.clients {
+			if c.mode == AttachExclusive {
+				doomed = append(doomed, c.cancel)
+				continue
+			}
+			kept = append(kept, c)
+		}
+		s.clients = kept
+		// Defer cancels until after we drop the lock.
+		defer func() {
+			for _, c := range doomed {
+				c()
+			}
+		}()
 	}
-	s.activeGen++
+	s.nextGen++
+	gen := s.nextGen
 	ctx, cancel := context.WithCancel(parent)
-	s.activeCancel = cancel
+	s.clients = append(s.clients, sessionClient{
+		gen:    gen,
+		mode:   mode,
+		cancel: cancel,
+	})
 	s.lastActiveAt = time.Now()
-	return ctx, s.activeGen, nil
+	return ctx, gen, nil
 }
 
 // Release is called by an attached client when its goroutine exits.
-// The caller passes the `gen` they received from Acquire; Release
-// clears the active-attach slot only if gen matches the current
-// active generation.
-//
-// A mismatch means we've been displaced and the new owner's slot
-// must NOT be cleared. The previous implementation used ctx.Err()
-// as identity, which gave the wrong answer when the parent ctx was
-// independently cancelled (e.g., daemon-wide shutdown) — see audit
-// finding F4.
-//
-// Idempotent: calling Release twice with the same gen, or with a
-// stale gen, is a no-op.
+// Removes the client identified by `gen` from the active-clients
+// slice. Idempotent — a stale gen (we were already displaced and
+// removed) is a no-op, so a displaced caller calling Release after
+// the new owner has taken over does NOT stomp the new owner's
+// state.
 func (s *Session) Release(gen uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if gen != s.activeGen {
-		return
+	for i, c := range s.clients {
+		if c.gen == gen {
+			s.clients = append(s.clients[:i], s.clients[i+1:]...)
+			return
+		}
 	}
-	if s.activeCancel != nil {
-		s.activeCancel = nil
+}
+
+// HasExclusiveStdinWriter reports whether at least one currently-
+// attached client is in AttachExclusive mode. Used by readonly-
+// pump validation paths that want to log "exclusive client should
+// have written this stdin, not the readonly attempting it" — but
+// the pumps don't currently need to assert that, so this method is
+// reserved for future telemetry.
+func (s *Session) HasExclusiveStdinWriter() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, c := range s.clients {
+		if c.mode == AttachExclusive {
+			return true
+		}
 	}
+	return false
+}
+
+// PeerModes returns a snapshot of attached clients' modes excluding
+// the caller's gen. Used to populate `AttachAck.Peers` so a
+// freshly-attaching client can render a "also attached: 1
+// readonly" hint without needing a separate IPC roundtrip.
+func (s *Session) PeerModes(excludingGen uint64) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.clients))
+	for _, c := range s.clients {
+		if c.gen == excludingGen {
+			continue
+		}
+		out = append(out, c.mode.String())
+	}
+	return out
 }
 
 // Touch refreshes the activity timestamp without changing any other
@@ -380,8 +491,8 @@ func (s *Session) Closed() bool {
 }
 
 // Close terminates the PTY (which sends SIGHUP to the child),
-// cancels any active attach, and marks the session unusable. Safe to
-// call multiple times; subsequent calls return nil.
+// cancels every attached client, and marks the session unusable.
+// Safe to call multiple times; subsequent calls return nil.
 func (s *Session) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -390,12 +501,18 @@ func (s *Session) Close() error {
 	}
 	s.closed = true
 	pty := s.pty
-	cancel := s.activeCancel
-	s.activeCancel = nil
+	// Snapshot cancel funcs and clear the slice — we'll fire them
+	// outside the lock so a goroutine's Release-on-exit doesn't
+	// deadlock on us.
+	cancels := make([]context.CancelFunc, 0, len(s.clients))
+	for _, c := range s.clients {
+		cancels = append(cancels, c.cancel)
+	}
+	s.clients = nil
 	s.mu.Unlock()
 
-	if cancel != nil {
-		cancel()
+	for _, c := range cancels {
+		c()
 	}
 	if pty != nil {
 		return pty.Close()

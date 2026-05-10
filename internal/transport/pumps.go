@@ -63,15 +63,21 @@ func outputPump(ctx context.Context, sess *session.Session, s *quic.Stream, writ
 // readPump reads tagged frames from the single bidi stream and
 // dispatches by type:
 //
-//   - FrameTypeStdin: raw payload streams into the session's PTY.
+//   - FrameTypeStdin: raw payload streams into the session's PTY,
+//     UNLESS the attach is readonly — in which case stdin is
+//     silently discarded. We don't tear the connection down on a
+//     readonly stdin frame because a misbehaving keystroke
+//     shouldn't kick the client off the session.
 //   - FrameTypeControl: CBOR-decoded; Ack/Resize/Ping/Goodbye are
 //     handled via handleControlFrame (with control-side writes
-//     going through the same `write` writer).
+//     going through the same `write` writer). Resize is also
+//     dropped for readonly attaches — the exclusive client owns
+//     the PTY size.
 //
 // quic-go's Read does NOT abort on context cancel; without an
 // explicit CancelRead a stuck Read would pin this goroutine until
 // QUIC's idle timeout. We watch ctx in a sidecar (audit F11).
-func readPump(ctx context.Context, sess *session.Session, s *quic.Stream, write frameWriter) error {
+func readPump(ctx context.Context, sess *session.Session, s *quic.Stream, write frameWriter, mode session.AttachMode) error {
 	cancelOnDone(ctx, func() { s.CancelRead(0) })
 	for {
 		if err := ctx.Err(); err != nil {
@@ -86,13 +92,16 @@ func readPump(ctx context.Context, sess *session.Session, s *quic.Stream, write 
 		}
 		switch frameType {
 		case protocol.FrameTypeStdin:
+			if mode == session.AttachReadonly {
+				continue // silently drop; readonly clients can't drive the shell
+			}
 			if len(body) > 0 {
 				if _, werr := sess.WriteStdin(body); werr != nil {
 					return werr
 				}
 			}
 		case protocol.FrameTypeControl:
-			if err := handleControlFrame(sess, body, write); err != nil {
+			if err := handleControlFrame(sess, body, write, mode); err != nil {
 				return err
 			}
 		default:
@@ -114,7 +123,7 @@ func readPump(ctx context.Context, sess *session.Session, s *quic.Stream, write 
 // the ring buffer below the ack point yet (the buffer's FIFO drop
 // policy already bounds memory). Future versions may use Ack to
 // keep the buffer larger when network is healthy and clients keep up.
-func handleControlFrame(sess *session.Session, body []byte, write frameWriter) error {
+func handleControlFrame(sess *session.Session, body []byte, write frameWriter, mode session.AttachMode) error {
 	t, err := protocol.PeekType(body)
 	if err != nil {
 		return err
@@ -124,6 +133,12 @@ func handleControlFrame(sess *session.Session, body []byte, write frameWriter) e
 		// v0: informational only.
 		return nil
 	case protocol.TypeResize:
+		// Readonly clients can't change PTY size — the exclusive
+		// client owns geometry. Drop silently rather than tearing
+		// the connection down.
+		if mode == session.AttachReadonly {
+			return nil
+		}
 		var m protocol.Resize
 		if err := protocol.StrictDecMode.Unmarshal(body, &m); err != nil {
 			return nil // skip malformed; don't tear the connection down

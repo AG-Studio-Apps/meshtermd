@@ -39,6 +39,10 @@ func runAttach(args []string) int {
 	createName := fs.String("name", "", "with `attach new`, the name to give the fresh session (else daemon synthesises)")
 	idleTimeout := fs.Duration("idle-timeout", 0, "per-session idle timeout for a fresh spawn (0 = daemon default)")
 	shell := fs.String("shell", "", "with `attach new`, override the remote $SHELL")
+	mode := fs.String("mode", "exclusive",
+		"attach mode. 'exclusive' (default) sends stdin and owns PTY size — displaces any prior exclusive client. "+
+			"'readonly' is a watcher: receives output only, can't type, can't resize. Multiple readonly clients can "+
+			"coexist with each other and with one exclusive client.")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: mtctl attach [flags] <id-or-name|new>\n\n")
 		fs.PrintDefaults()
@@ -56,14 +60,24 @@ func runAttach(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return exitConfig
 	}
+	resolvedMode := protocol.AttachModeExclusive
+	switch *mode {
+	case "exclusive", "":
+		resolvedMode = protocol.AttachModeExclusive
+	case "readonly", "watch", "ro":
+		resolvedMode = protocol.AttachModeReadonly
+	default:
+		fmt.Fprintf(os.Stderr, "mtctl attach: unknown --mode %q (want exclusive or readonly)\n", *mode)
+		return exitConfig
+	}
 
 	// Hand off to a function with proper defer-restore so any panic
 	// or early-return path still puts the terminal back to cooked
 	// mode. attachRun returns an exit code.
-	return attachRun(target, selector, *createName, *shell, *idleTimeout, *timeout)
+	return attachRun(target, selector, *createName, *shell, resolvedMode, *idleTimeout, *timeout)
 }
 
-func attachRun(target, selector, createName, shell string, idleTimeout, deadline time.Duration) int {
+func attachRun(target, selector, createName, shell, mode string, idleTimeout, deadline time.Duration) int {
 	// Phase 1: SSH bootstrap. Translate the selector into the right
 	// `meshtermd connect` flags and capture the MTRM_QUIC line.
 	bootstrap, err := bootstrapForAttach(target, selector, createName, shell, idleTimeout, deadline)
@@ -112,6 +126,7 @@ func attachRun(target, selector, createName, shell string, idleTimeout, deadline
 		AckSeq:    0, // mtctl always starts fresh: no in-memory ack state
 		Rows:      rows,
 		Cols:      cols,
+		Mode:      mode,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mtctl attach: marshal Attach: %v\n", err)
@@ -146,6 +161,16 @@ func attachRun(target, selector, createName, shell string, idleTimeout, deadline
 		fmt.Fprintf(os.Stderr, "mtctl attach: daemon rejected: %s: %s\n", ack.Err, ack.Msg)
 		return exitRemote
 	}
+	// One-line status to stderr so the user sees who else is on
+	// the session and what mode they ended up with. Goes to stderr
+	// so it doesn't interfere with the replayed shell output on
+	// stdout.
+	if len(ack.Peers) > 0 {
+		fmt.Fprintf(os.Stderr, "[mtctl: attached %s; %d other client(s): %s]\r\n",
+			ack.Mode, len(ack.Peers), strings.Join(ack.Peers, ", "))
+	} else if mode == protocol.AttachModeReadonly {
+		fmt.Fprintf(os.Stderr, "[mtctl: attached readonly; no other clients]\r\n")
+	}
 
 	// Phase 4: spin pumps. Each pump exits via `done`; the run loop
 	// waits for the first exit, then tears the rest down.
@@ -163,9 +188,18 @@ func attachRun(target, selector, createName, shell string, idleTimeout, deadline
 
 	done := make(chan error, 4)
 
+	readonly := mode == protocol.AttachModeReadonly
+
 	go runStdoutPump(pCtx, stream, writeFrame, done)
-	go runStdinPump(pCtx, stream, writeFrame, done)
-	go runSigwinchPump(pCtx, ts, writeFrame, done)
+	// Stdin pump runs even in readonly so the `~.` detach chord
+	// still works — the watcher consumes bytes locally and just
+	// doesn't forward them when readonly is set. SIGWINCH is
+	// pointless in readonly (daemon drops Resize frames anyway, and
+	// the exclusive client owns the size we observe), so skip it.
+	go runStdinPump(pCtx, stream, writeFrame, readonly, done)
+	if !readonly {
+		go runSigwinchPump(pCtx, ts, writeFrame, done)
+	}
 
 	// Block on the first pump to bail out (clean disconnect, EOF
 	// from server, read error, or user typing ~.).
@@ -287,8 +321,11 @@ func runStdoutPump(ctx context.Context, stream *quic.Stream, write frameWriter, 
 
 // runStdinPump reads from os.Stdin in raw mode, watches for the
 // `~.` detach chord, and forwards everything else as
-// FrameTypeStdin tagged frames.
-func runStdinPump(ctx context.Context, stream *quic.Stream, write frameWriter, done chan<- error) {
+// FrameTypeStdin tagged frames. When `readonly` is set, forwarded
+// bytes are dropped on the floor — the watcher still runs so the
+// detach chord works, but the user's keystrokes don't reach the
+// remote shell.
+func runStdinPump(ctx context.Context, stream *quic.Stream, write frameWriter, readonly bool, done chan<- error) {
 	_ = stream // we only ever write; the stream is held by `write`
 	watcher := newEscapeWatcher()
 	buf := make([]byte, 4*1024)
@@ -299,7 +336,7 @@ func runStdinPump(ctx context.Context, stream *quic.Stream, write frameWriter, d
 		n, err := os.Stdin.Read(buf)
 		if n > 0 {
 			forwarded, detach := watcher.process(buf[:n])
-			if len(forwarded) > 0 {
+			if !readonly && len(forwarded) > 0 {
 				if werr := write(protocol.FrameTypeStdin, forwarded); werr != nil {
 					done <- fmt.Errorf("send stdin: %w", werr)
 					return

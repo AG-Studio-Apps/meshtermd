@@ -6,6 +6,7 @@ require (
 	github.com/creack/pty v1.1.24
 	github.com/fxamacker/cbor/v2 v2.9.2
 	github.com/quic-go/quic-go v0.59.0
+	golang.org/x/term v0.43.0
 )
 
 require (

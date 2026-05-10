@@ -49,6 +49,8 @@ func main() {
 		os.Exit(runNew(args))
 	case "status":
 		os.Exit(runStatus(args))
+	case "attach":
+		os.Exit(runAttach(args))
 	case "help", "--help", "-h":
 		usage(os.Stdout)
 	default:
@@ -68,6 +70,7 @@ Subcommands:
   list               enumerate sessions on the remote daemon
   status             print the remote daemon's operational snapshot
   new                create a new named session (does not attach)
+  attach             attach to a session as your local terminal
   kill               reap a session by id or name
   rename             rename a session
 
@@ -75,8 +78,9 @@ Common flags (any subcommand):
   --host user@host   SSH target running meshtermd. Default: $MTCTL_HOST.
                      Falls back to ~/.config/mtctl/host if neither is set.
 
-Tier 1 release — management only. Use the meshTerm iOS app or a
-future Tier 3 build for terminal attach.
+In an attached session, type ~. on a fresh line to detach (mosh /
+ssh convention). The remote shell stays alive on the daemon; pick
+it up from any other client.
 
 Run 'mtctl <subcommand> --help' for subcommand-specific flags.
 `, build.Version)

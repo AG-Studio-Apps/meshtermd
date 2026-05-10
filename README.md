@@ -24,19 +24,31 @@ Pre-1.0. The wire protocol is not yet stable. Do not depend on this for anything
 ## Companion CLI: `mtctl`
 
 `mtctl` is the laptop/desktop counterpart to the iOS app — manages
-remote sessions over SSH. Same binary distribution; same release
-artifacts. Tier 1 today: `list`, `status`, `new`, `kill`, `rename`.
-Terminal attach is future work.
+remote sessions over SSH and (optionally) attaches to them as your
+local terminal. Same binary distribution; same release artifacts.
 
 ```
-mtctl --host me@dev-box list
-mtctl --host me@dev-box new --name dev
+mtctl --host me@dev-box list                    # what's alive on the daemon
+mtctl --host me@dev-box new --name dev          # create without attaching
+mtctl --host me@dev-box attach dev              # land in the same shell
+                                                # your iPhone is using
 mtctl --host me@dev-box rename dev staging
 mtctl --host me@dev-box kill staging
+mtctl --host me@dev-box status                  # daemon snapshot
 ```
+
+In an attached session, type `~.` on a fresh line to detach (mosh /
+ssh convention). The remote shell stays alive on the daemon; pick
+it up from any other client.
 
 Set `MTCTL_HOST` once per shell or write the target into
 `~/.config/mtctl/host` to omit `--host`.
+
+Auth is plain SSH — we shell out to the system `ssh` binary, so
+your existing `~/.ssh/config`, ssh-agent, and keys work
+transparently. The QUIC connection that carries the attached
+terminal is cert-pinned to the fingerprint received over SSH (same
+trust hop the iOS app uses).
 
 The transport-layer security is TLS 1.3 (provided by Go's standard library inside `quic-go`); we add cert pinning bootstrapped over SSH. There is no application-layer cryptography in this codebase.
 

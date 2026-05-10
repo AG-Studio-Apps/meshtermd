@@ -174,6 +174,57 @@ func TestQueryFilterEchoedDAResponseIsPassedThrough(t *testing.T) {
 	}
 }
 
+func TestQueryFilterOSCColorQueryStripped(t *testing.T) {
+	// SwiftTerm fires OSC 10/11/12 on init to discover the
+	// terminal's default fg/bg/cursor colours. The shell echoes the
+	// response when there's no app reading stdin → buffer pollution.
+	// Strip queries silently; apps fall back to TERM-derived
+	// defaults (fine for interactive shell use).
+	for _, query := range []string{
+		"\x1b]10;?\x07",          // default foreground (BEL terminator)
+		"\x1b]11;?\x07",          // default background
+		"\x1b]12;?\x07",          // cursor colour
+		"\x1b]4;0;?\x07",         // palette index 0
+		"\x1b]10;?\x1b\\",        // ST terminator instead of BEL
+	} {
+		f := NewQueryFilter(nil)
+		got := f.Process([]byte("X" + query + "Y"))
+		if string(got) != "XY" {
+			t.Errorf("OSC query %q not stripped: got %q", query, got)
+		}
+	}
+}
+
+func TestQueryFilterOSCColorSetPassesThrough(t *testing.T) {
+	// OSC SETs (no `?`) configure the terminal — they don't elicit
+	// responses, so they should pass through unchanged.
+	f := NewQueryFilter(nil)
+	for _, set := range []string{
+		"\x1b]10;#ffaa00\x07",
+		"\x1b]11;rgb:00/00/00\x07",
+		"\x1b]2;window title\x07", // OSC 2 — set window title
+	} {
+		got := f.Process([]byte(set))
+		if string(got) != set {
+			t.Errorf("OSC SET %q got mangled: %q", set, got)
+		}
+	}
+}
+
+func TestQueryFilterPartialOSCAcrossReads(t *testing.T) {
+	// OSC sequence split across two PTY reads should be held in
+	// pending and re-evaluated on the next chunk.
+	f := NewQueryFilter(nil)
+	got1 := f.Process([]byte("a\x1b]10;"))
+	if string(got1) != "a" {
+		t.Errorf("first chunk: got %q", got1)
+	}
+	got2 := f.Process([]byte("?\x07b"))
+	if string(got2) != "b" {
+		t.Errorf("OSC completed across reads not stripped: got %q", got2)
+	}
+}
+
 func TestQueryFilterNonQueryCSIPassesThrough(t *testing.T) {
 	// CSI sequences with finals other than c/n should be untouched.
 	f := NewQueryFilter(nil)

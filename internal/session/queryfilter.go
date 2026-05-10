@@ -78,16 +78,28 @@ func (q *QueryFilter) Process(chunk []byte) []byte {
 			continue
 		}
 
-		// `\x1b` start. Look for a CSI introducer (`[`).
-		// Anything else (e.g., `\x1b]` for OSC, `\x1bP` for DCS, or
-		// a bare ESC keystroke) we pass through — those aren't query
-		// shapes we handle, and the rare ones that do elicit
-		// responses (OSC 4 / 10 / 11 colour queries) are fielded by
-		// the iOS-side replay gate as a defence-in-depth.
+		// `\x1b` start. We handle two introducers:
+		//   `\x1b[` — CSI (DA, DSR, CPR, …)
+		//   `\x1b]` — OSC (palette / fg / bg / cursor colour queries)
+		// Other escapes (DCS `\x1bP`, plain ESC keystrokes, etc.)
+		// pass through.
 		if idx+1 >= len(chunk) {
-			// ESC at end of chunk; might be a partial CSI start.
+			// ESC at end of chunk; might be a partial introducer.
 			q.pending = chunk[idx:]
 			return out
+		}
+		if chunk[idx+1] == 0x5D /* ] */ {
+			consumed, oscOut, isQuery := q.processOSC(chunk[idx:])
+			if consumed == 0 {
+				// Need more bytes — partial OSC (no terminator yet).
+				q.pending = chunk[idx:]
+				return out
+			}
+			if !isQuery {
+				out = append(out, oscOut...)
+			}
+			idx += consumed
+			continue
 		}
 		if chunk[idx+1] != 0x5B /* [ */ {
 			out = append(out, chunk[idx])
@@ -212,6 +224,77 @@ func (q *QueryFilter) matchQuery(seq []byte) ([]byte, bool) {
 	// Anything else: pass through. Includes cursor-forward
 	// (`\x1b[<n>c`), colour codes, mode sets, etc.
 	return nil, false
+}
+
+// processOSC scans `data` starting with `\x1b]` for an OSC sequence.
+// Returns:
+//   - consumed: bytes consumed (0 if no terminator yet — caller
+//     should buffer in pending and retry)
+//   - body: the full OSC sequence bytes (only set when consumed > 0
+//     and isQuery is false — caller forwards these to the buffer)
+//   - isQuery: true when the OSC contains a `?` value placeholder,
+//     i.e. it's a query like `\x1b]10;?\x07` asking the terminal
+//     to report its default foreground colour. We strip these
+//     because the iOS-side terminal would otherwise auto-respond
+//     and pollute the shell with the response bytes. We don't
+//     synthesise replies because the daemon doesn't track terminal
+//     palette state — apps that need real colour values fall back
+//     to the TERM env var's terminfo entries.
+//
+// OSC grammar: `\x1b ] <params> <terminator>`
+// where terminator is BEL (0x07) or ST (0x1b 0x5c). We accept both.
+//
+// Strip-on-query coverage:
+//   * `\x1b]4;<n>;?` — palette colour query
+//   * `\x1b]10;?`    — default fg query
+//   * `\x1b]11;?`    — default bg query
+//   * `\x1b]12;?`    — cursor colour query
+//   * `\x1b]17;?`    — highlight bg query (rarer)
+// ... and any other OSC with a `?` value placeholder. The `?` test
+// is what distinguishes a query from a SET (`\x1b]10;#ff0000\x07`
+// which sets the colour and elicits no response — passes through).
+func (q *QueryFilter) processOSC(data []byte) (consumed int, body []byte, isQuery bool) {
+	// Scan from after `\x1b]` (data[2]) to find the terminator.
+	idx := 2
+	for idx < len(data) {
+		if data[idx] == 0x07 /* BEL */ {
+			body = data[:idx+1]
+			return idx + 1, body, oscBodyIsQuery(body)
+		}
+		if data[idx] == 0x1B /* ESC */ {
+			// ST = ESC \\
+			if idx+1 < len(data) && data[idx+1] == 0x5C /* \\ */ {
+				body = data[:idx+2]
+				return idx + 2, body, oscBodyIsQuery(body)
+			}
+			// ESC followed by something else — terminator not yet
+			// complete. Need more bytes.
+			return 0, nil, false
+		}
+		idx++
+	}
+	// No terminator in the chunk — partial OSC.
+	return 0, nil, false
+}
+
+// oscBodyIsQuery reports whether the OSC sequence is a value query
+// — distinguished from a SET — by the presence of `?` in the
+// parameter portion (between the ` ] ` introducer and the
+// terminator). Sets use literal values; queries use `?` as the
+// placeholder. The check is pessimistic: any `?` in the body is
+// treated as a query, which catches all real query shapes and
+// occasionally over-strips a SET that includes a literal `?` in a
+// label, which is harmless.
+func oscBodyIsQuery(body []byte) bool {
+	// Skip the `\x1b]` introducer; the trailing terminator (BEL or
+	// ST) doesn't contain `?`, so a single byte scan over the body
+	// is sufficient.
+	for _, byte_ := range body[2:] {
+		if byte_ == '?' {
+			return true
+		}
+	}
+	return false
 }
 
 func isDigit(byte_ byte) bool {

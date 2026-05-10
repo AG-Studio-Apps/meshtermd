@@ -174,6 +174,46 @@ func TestQueryFilterEchoedDAResponseIsPassedThrough(t *testing.T) {
 	}
 }
 
+func TestQueryFilterWindowManipulationQueriesStripped(t *testing.T) {
+	// xterm window-manipulation queries — SwiftTerm fires these
+	// at view init to discover terminal size + decoration state.
+	// All elicit responses (`\x1b[<n>;<rows>;<cols>t` etc.) which
+	// pollute the buffer when the shell echoes them.
+	for _, query := range []string{
+		"\x1b[11t",   // window state (iconified?)
+		"\x1b[13t",   // window position
+		"\x1b[14t",   // window pixel size
+		"\x1b[18t",   // text-area size in chars
+		"\x1b[19t",   // screen size in chars
+		"\x1b[20t",   // icon name
+		"\x1b[21t",   // window title
+	} {
+		f := NewQueryFilter(nil)
+		got := f.Process([]byte("X" + query + "Y"))
+		if string(got) != "XY" {
+			t.Errorf("window query %q not stripped: got %q", query, got)
+		}
+	}
+}
+
+func TestQueryFilterWindowManipulationSetsPassThrough(t *testing.T) {
+	// Window-SET commands (Ps in 1..10, multi-param) configure the
+	// terminal — they don't elicit responses, so they pass through.
+	f := NewQueryFilter(nil)
+	for _, set := range []string{
+		"\x1b[1t",          // de-iconify
+		"\x1b[2t",          // iconify
+		"\x1b[5t",          // raise window
+		"\x1b[8;24;80t",    // resize text area to 24×80
+		"\x1b[3;100;200t",  // move window to 100,200
+	} {
+		got := f.Process([]byte(set))
+		if string(got) != set {
+			t.Errorf("window SET %q got mangled: %q", set, got)
+		}
+	}
+}
+
 func TestQueryFilterOSCColorQueryStripped(t *testing.T) {
 	// SwiftTerm fires OSC 10/11/12 on init to discover the
 	// terminal's default fg/bg/cursor colours. The shell echoes the

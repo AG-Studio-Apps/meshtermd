@@ -219,6 +219,21 @@ func (q *QueryFilter) matchQuery(seq []byte) ([]byte, bool) {
 			// time out, but that's vastly rarer than the DA case.
 			return nil, true
 		}
+	case 't':
+		// xterm window-manipulation. The single-param queries
+		// (Ps ≥ 11) elicit responses; SwiftTerm fires several at
+		// view init to discover its own size and decoration state.
+		// Strip without responding — these are display metadata
+		// the shell doesn't need, and faking values risks confusing
+		// apps that legitimately use the response. Window-set
+		// commands (Ps in 1..10, Ps;Ps;Ps...) pass through.
+		switch params {
+		case "11", "13", "13;0", "13;2",
+			"14", "14;0", "14;2",
+			"15", "16", "18", "19",
+			"20", "21", "22", "23":
+			return nil, true
+		}
 	}
 
 	// Anything else: pass through. Includes cursor-forward

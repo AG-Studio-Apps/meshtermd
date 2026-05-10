@@ -182,6 +182,26 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 		return
 	}
 
+	// Structured attach event — operators tailing the daemon's
+	// stderr can see who's coming and going, and a multi-attach
+	// debugging session can pivot on session_id + mode + peer
+	// counts without grepping through free-text log lines.
+	log.InfoContext(ctx, "session.attach",
+		"session", sess.ID().String(),
+		"name", sess.Name(),
+		"mode", resolvedMode,
+		"gen", attachGen,
+		"peers", len(sess.PeerModes(attachGen)),
+		"replay_start", start,
+		"replay_truncated", trunc,
+	)
+	defer log.InfoContext(ctx, "session.detach",
+		"session", sess.ID().String(),
+		"name", sess.Name(),
+		"mode", resolvedMode,
+		"gen", attachGen,
+	)
+
 	pumpsCtx, pumpsCancel := context.WithCancel(attachCtx)
 	defer pumpsCancel()
 

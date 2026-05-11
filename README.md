@@ -27,6 +27,8 @@ Pre-1.0. The wire protocol is not yet stable. Do not depend on this for anything
 remote sessions over SSH and (optionally) attaches to them as your
 local terminal. Same binary distribution; same release artifacts.
 
+Full install + usage guide: [`docs/mtctl.md`](docs/mtctl.md).
+
 ```
 mtctl --host me@dev-box list                       # what's alive on the daemon
 mtctl --host me@dev-box new --name dev             # create without attaching

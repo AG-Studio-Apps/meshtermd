@@ -53,6 +53,10 @@ func main() {
 		os.Exit(runSessionInfo(args))
 	case "attach":
 		os.Exit(runAttach(args))
+	case "update":
+		os.Exit(runUpdate(args))
+	case "uninstall":
+		os.Exit(runUninstall(args))
 	case "help", "--help", "-h":
 		usage(os.Stdout)
 	default:
@@ -76,6 +80,8 @@ Subcommands:
   attach             attach to a session as your local terminal
   kill               reap a session by id or name
   rename             rename a session
+  update             check for / apply a signed self-update from GitHub Releases
+  uninstall          remove the mtctl binary
 
 Common flags (any subcommand):
   --host user@host   SSH target running meshtermd. Default: $MTCTL_HOST.

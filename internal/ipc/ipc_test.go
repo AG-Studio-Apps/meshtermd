@@ -202,3 +202,64 @@ func TestCloseRemovesSocket(t *testing.T) {
 		t.Error("socket file still present after Close")
 	}
 }
+
+// blockingHandler holds Allocate inside the handler until the test
+// signals via release. Used to pin an in-flight handler so the
+// overflow path can be exercised deterministically.
+type blockingHandler struct {
+	echoHandler
+	enter   chan struct{}
+	release chan struct{}
+}
+
+func (h *blockingHandler) HandleAllocate(ctx context.Context, req AllocateRequest) AllocateResponse {
+	h.enter <- struct{}{}
+	<-h.release
+	return h.echoHandler.HandleAllocate(ctx, req)
+}
+
+func TestServeRejectsOverCapConnections(t *testing.T) {
+	t.Parallel()
+	h := &blockingHandler{
+		enter:   make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	dir := tempDirWith0700(t)
+	socket := filepath.Join(dir, "meshtermd.sock")
+	srv, err := NewServer(socket, h, WithMaxConcurrent(1))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	go srv.Serve(context.Background())
+	time.Sleep(20 * time.Millisecond)
+
+	c := NewClient(socket, 0)
+
+	// First connection: fire-and-forget so it sticks in the handler.
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		_, _ = c.Allocate(context.Background(), AllocateRequest{SessionID: "first"})
+	}()
+
+	// Wait for the first request to actually enter the handler. At
+	// this point the inflight slot is taken (cap = 1).
+	select {
+	case <-h.enter:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first handler never entered")
+	}
+
+	// Second connection should be rejected. The server closes the
+	// unix conn immediately; the client's ReadFrame surfaces an
+	// error rather than a typed response.
+	_, err = c.Allocate(context.Background(), AllocateRequest{SessionID: "second"})
+	if err == nil {
+		t.Error("second request succeeded; expected over-cap rejection")
+	}
+
+	// Release the first handler and let it complete.
+	close(h.release)
+	<-firstDone
+}

@@ -35,6 +35,35 @@ type Server struct {
 	listener *net.UnixListener
 	handler  Handler
 	socket   string
+	// inflight bounds the number of concurrent in-flight handler
+	// goroutines. The socket is uid-0600 so only the daemon's own
+	// user can connect, but a buggy local process (or a deliberate
+	// fork-bomb) could still open enough connections to spawn
+	// goroutines faster than the handler returns. The semaphore
+	// caps that; overflow connections are closed immediately.
+	inflight chan struct{}
+}
+
+// MaxConcurrentIPCHandlers caps how many in-flight IPC handlers may
+// run at once. The IPC socket is local-uid-only and each handler
+// completes in microseconds in steady state, so a small cap is fine.
+// Sized lower than the QUIC server's 64 because IPC has no public
+// surface to defend.
+const MaxConcurrentIPCHandlers = 32
+
+// ServerOption customises NewServer. Use the With* helpers; the type
+// itself is opaque so we can add fields without breaking callers.
+type ServerOption func(*serverOptions)
+
+type serverOptions struct {
+	maxConcurrent int
+}
+
+// WithMaxConcurrent overrides the default in-flight handler cap. Used
+// by tests to make overflow easy to trigger; production callers should
+// leave it at the default.
+func WithMaxConcurrent(n int) ServerOption {
+	return func(o *serverOptions) { o.maxConcurrent = n }
 }
 
 // NewServer creates a Server bound to the given Unix socket path.
@@ -47,9 +76,16 @@ type Server struct {
 // world-writable parent (e.g., a misconfigured XDG_RUNTIME_DIR)
 // would let another local user race-create the socket and
 // intercept `meshtermd connect` IPC.
-func NewServer(socketPath string, handler Handler) (*Server, error) {
+func NewServer(socketPath string, handler Handler, opts ...ServerOption) (*Server, error) {
 	if handler == nil {
 		return nil, errors.New("ipc: NewServer requires a Handler")
+	}
+	cfg := serverOptions{maxConcurrent: MaxConcurrentIPCHandlers}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	if cfg.maxConcurrent <= 0 {
+		cfg.maxConcurrent = MaxConcurrentIPCHandlers
 	}
 	parent := filepath.Dir(socketPath)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
@@ -82,7 +118,12 @@ func NewServer(socketPath string, handler Handler) (*Server, error) {
 		_ = os.Remove(socketPath)
 		return nil, fmt.Errorf("chmod socket: %w", err)
 	}
-	return &Server{listener: ln, handler: handler, socket: socketPath}, nil
+	return &Server{
+		listener: ln,
+		handler:  handler,
+		socket:   socketPath,
+		inflight: make(chan struct{}, cfg.maxConcurrent),
+	}, nil
 }
 
 // verifyParentDir asserts that the directory `path` is owned by the
@@ -137,11 +178,20 @@ func (s *Server) Serve(ctx context.Context) error {
 			}
 			return fmt.Errorf("accept: %w", err)
 		}
-		wg.Add(1)
-		go func(c *net.UnixConn) {
-			defer wg.Done()
-			s.handle(ctx, c)
-		}(conn)
+		// Bound concurrent handlers. Unix sockets have no application-
+		// level close-with-reason, so over-cap peers just see their
+		// connection drop — the client surfaces a ReadFrame error.
+		select {
+		case s.inflight <- struct{}{}:
+			wg.Add(1)
+			go func(c *net.UnixConn) {
+				defer wg.Done()
+				defer func() { <-s.inflight }()
+				s.handle(ctx, c)
+			}(conn)
+		default:
+			_ = conn.Close()
+		}
 	}
 }
 

@@ -1,4 +1,4 @@
-package main
+package release
 
 import "testing"
 
@@ -13,18 +13,18 @@ func TestParseSemver(t *testing.T) {
 		{"v1.2.3-rc1", [3]int{1, 2, 3}, true},
 		{"v0.1.1-3-gabc1234", [3]int{0, 1, 1}, true}, // git describe form
 		{"v0.0.0-dev", [3]int{0, 0, 0}, true},
-		{"v0.1", [3]int{}, false},     // missing patch
-		{"abc", [3]int{}, false},      // garbage
-		{"v-1.0.0", [3]int{}, false},  // negative major
+		{"v0.1", [3]int{}, false},    // missing patch
+		{"abc", [3]int{}, false},     // garbage
+		{"v-1.0.0", [3]int{}, false}, // negative major
 	}
 	for _, c := range cases {
-		got, ok := parseSemver(c.in)
+		got, ok := ParseSemver(c.in)
 		if ok != c.ok {
-			t.Errorf("parseSemver(%q) ok = %v, want %v", c.in, ok, c.ok)
+			t.Errorf("ParseSemver(%q) ok = %v, want %v", c.in, ok, c.ok)
 			continue
 		}
 		if ok && got != c.want {
-			t.Errorf("parseSemver(%q) = %v, want %v", c.in, got, c.want)
+			t.Errorf("ParseSemver(%q) = %v, want %v", c.in, got, c.want)
 		}
 	}
 }
@@ -45,13 +45,13 @@ func TestCompareSemver(t *testing.T) {
 		{"garbage", "v0.1.0", 0, false},     // unparseable
 	}
 	for _, c := range cases {
-		got, ok := compareSemver(c.a, c.b)
+		got, ok := CompareSemver(c.a, c.b)
 		if ok != c.ok {
-			t.Errorf("compareSemver(%q,%q) ok = %v, want %v", c.a, c.b, ok, c.ok)
+			t.Errorf("CompareSemver(%q,%q) ok = %v, want %v", c.a, c.b, ok, c.ok)
 			continue
 		}
 		if ok && got != c.want {
-			t.Errorf("compareSemver(%q,%q) = %d, want %d", c.a, c.b, got, c.want)
+			t.Errorf("CompareSemver(%q,%q) = %d, want %d", c.a, c.b, got, c.want)
 		}
 	}
 }
@@ -70,8 +70,8 @@ func TestVersionsMatchTreatsDevAndTagAsEqual(t *testing.T) {
 		{"v0.1.1", "v0.2.0", false},
 	}
 	for _, c := range cases {
-		if got := versionsMatch(c.current, c.target); got != c.want {
-			t.Errorf("versionsMatch(%q,%q) = %v, want %v",
+		if got := VersionsMatch(c.current, c.target); got != c.want {
+			t.Errorf("VersionsMatch(%q,%q) = %v, want %v",
 				c.current, c.target, got, c.want)
 		}
 	}

@@ -28,7 +28,11 @@ jobs:
       - name: Generate SHA256SUMS
         working-directory: dist
         run: |
-          sha256sum meshtermd-* > SHA256SUMS
+          # Hash both meshtermd-* (the daemon) and mtctl-* (the laptop
+          # CLI). The single signed SHA256SUMS covers everything, so
+          # iOS's verify path picks up mtctl integrity for free once
+          # it learns the new asset filenames.
+          sha256sum meshtermd-* mtctl-* > SHA256SUMS
           cat SHA256SUMS
 
       # Optional minisign signing. Only fires if the MINISIGN_KEY
@@ -88,10 +92,13 @@ jobs:
           {
             echo "## meshtermd ${tag}"
             echo
-            echo "Server-side helper for the meshTerm iOS app. See "
-            echo "https://github.com/AG-Studio-Apps/meshtermd for the wire spec and security notes."
+            echo "Server-side daemon and laptop CLI for the meshTerm iOS app."
+            echo "See https://github.com/AG-Studio-Apps/meshtermd for the wire spec and security notes."
             echo
             echo "### Binaries"
+            echo
+            echo "- \`meshtermd-*\` — the daemon. Runs on the host serving Roam sessions."
+            echo "- \`mtctl-*\` — the laptop CLI. Attaches to remote daemons over SSH+QUIC."
             echo
             echo "Verify with the published \`SHA256SUMS\` and (if available) its \`.minisig\`."
             echo "The minisign public key is in \`docs/release-public-key.txt\` of this repo."
@@ -109,6 +116,7 @@ jobs:
           body_path: release-notes.md
           files: |
             dist/meshtermd-*
+            dist/mtctl-*
             dist/SHA256SUMS
             dist/SHA256SUMS.minisig
           fail_on_unmatched_files: false  # minisig is optional

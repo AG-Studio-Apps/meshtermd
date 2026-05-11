@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -77,7 +76,7 @@ func runUpdate(args []string) int {
 	fmt.Printf("current:    %s\n", current)
 	fmt.Printf("available:  %s\n", target)
 
-	if versionsMatch(current, target) {
+	if release.VersionsMatch(current, target) {
 		fmt.Println("✓ already on this version")
 		return 0
 	}
@@ -87,7 +86,7 @@ func runUpdate(args []string) int {
 	// still valid (it was signed at the time) — so without this check
 	// a flipped GitHub "latest" pointer, a malicious mirror, or a
 	// typoed `--tag` could downgrade us into a known-bad build.
-	cmp, ok := compareSemver(target, current)
+	cmp, ok := release.CompareSemver(target, current)
 	if ok && cmp < 0 && !*allowDowngrade {
 		fmt.Fprintf(os.Stderr,
 			"update: refusing to downgrade %s → %s. "+
@@ -204,77 +203,6 @@ func performUpdate(ctx context.Context, fetcher *release.Fetcher, tag string) in
 	return 0
 }
 
-// versionsMatch returns true if the current `build.Version` and a
-// remote tag refer to the same version. The build stamp is whatever
-// `git describe --tags --dirty --always` printed at build time (e.g.
-// "v0.1.1", "v0.1.1-3-gabc1234", or "v0.1.1-dirty"); the tag is a
-// clean "vMAJ.MIN.PATCH". We compare on the leading version prefix
-// so a dirty / post-tag build cleanly matches its base tag.
-func versionsMatch(current, target string) bool {
-	c, ok1 := parseSemver(current)
-	t, ok2 := parseSemver(target)
-	if !ok1 || !ok2 {
-		// Unparseable on one side — fall back to string equality
-		// of the trimmed forms so dev builds vs tagged builds
-		// still report "up to date" when they refer to the same
-		// underlying version.
-		return baseTag(current) == baseTag(target)
-	}
-	return c == t
-}
-
-// compareSemver returns (-1, 0, +1) comparing a vs b on their
-// MAJOR.MINOR.PATCH triplets, or (0, false) if either side doesn't
-// parse. Anything after the first '-' (pre-release / metadata) is
-// IGNORED for ordering — a "vX.Y.Z-rc1" is treated as equal to
-// "vX.Y.Z" here. That's a deliberate coarse rule: we don't want to
-// rank rc1 vs rc2 vs rc3, and our release pipeline only signs final
-// tags. Anti-rollback only kicks in on a strict ordering, so coarse-
-// equality is the conservative side.
-func compareSemver(a, b string) (int, bool) {
-	av, ok1 := parseSemver(a)
-	bv, ok2 := parseSemver(b)
-	if !ok1 || !ok2 {
-		return 0, false
-	}
-	for i := 0; i < 3; i++ {
-		switch {
-		case av[i] < bv[i]:
-			return -1, true
-		case av[i] > bv[i]:
-			return +1, true
-		}
-	}
-	return 0, true
-}
-
-// parseSemver extracts MAJOR.MINOR.PATCH ints from a version string
-// of the form "vMAJOR.MINOR.PATCH" (with optional "v" prefix and
-// optional "-suffix"). Returns the triplet plus an ok flag; ok is
-// false if any field doesn't parse as a non-negative integer.
-func parseSemver(s string) ([3]int, bool) {
-	base := baseTag(s)
-	parts := strings.SplitN(base, ".", 4)
-	if len(parts) < 3 {
-		return [3]int{}, false
-	}
-	out := [3]int{}
-	for i := 0; i < 3; i++ {
-		n, err := strconv.Atoi(parts[i])
-		if err != nil || n < 0 {
-			return [3]int{}, false
-		}
-		out[i] = n
-	}
-	return out, true
-}
-
-// baseTag strips a leading "v" and a trailing "-anything" so we get
-// the bare "X.Y.Z" form.
-func baseTag(s string) string {
-	s = strings.TrimPrefix(s, "v")
-	if i := strings.Index(s, "-"); i != -1 {
-		s = s[:i]
-	}
-	return s
-}
+// Version comparison helpers moved to internal/release/version.go so
+// mtctl's update path can share them. See release.VersionsMatch and
+// release.CompareSemver.

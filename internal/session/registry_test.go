@@ -169,7 +169,7 @@ func TestSweepSkipsAttachedSession(t *testing.T) {
 	// Attach a client. Acquire bumps lastActiveAt once; we then
 	// wait past the idle window so a *detached* session would be
 	// reaped. The Release defer ensures cleanup even on test fail.
-	_, gen, err := s.Acquire(context.Background(), AttachModeExclusive)
+	_, gen, err := s.Acquire(context.Background(), AttachExclusive)
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}

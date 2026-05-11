@@ -27,6 +27,24 @@ jobs:
       - name: go test -race
         run: go test ./... -race -count=1
 
+  fuzz:
+    name: Fuzz parsers (bounded)
+    runs-on: ubuntu-latest
+    # Fuzz is slow; only run on pushes to main (and tag pushes), not
+    # every PR. PRs still get the regular -race test pass via the
+    # `test` job above, which exercises the seed corpus deterministically.
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Minisign parser fuzz (30s)
+        run: go test -run='^$' -fuzz=FuzzParseMinisig -fuzztime=30s ./internal/release
+
   vuln:
     name: govulncheck
     runs-on: ubuntu-latest

@@ -45,7 +45,7 @@ DIST_TARGETS := \
 	freebsd-amd64 \
 	freebsd-arm64
 
-.PHONY: all build test vet lint vuln dist manpages completions clean
+.PHONY: all build test vet lint vuln dist manpages completions aur-prep clean
 
 all: vet test build build-mtctl
 
@@ -172,6 +172,27 @@ dist/completions/%.fish: cmd/gen-completions/main.go internal/completions/spec.g
 # `make dist` builds binaries, man pages, and shell completions so
 # release artifacts are self-contained for distro packagers.
 dist: $(addprefix dist-,$(DIST_TARGETS)) $(addprefix dist-mtctl-,$(DIST_TARGETS)) manpages completions
+
+# AUR release prep. Rewrites pkgver in both PKGBUILDs and pulls down
+# the published SHA256SUMS to populate the binary package's per-arch
+# hash arrays.
+#
+# Usage: `make aur-prep VERSION=vX.Y.Z`
+#
+# After this runs, regenerate .SRCINFO in each PKGBUILD dir via
+# `makepkg --printsrcinfo > .SRCINFO`. See packaging/aur/README.md.
+aur-prep:
+	@if [ -z "$(VERSION)" ]; then echo "usage: make aur-prep VERSION=vX.Y.Z"; exit 2; fi
+	@bare=$$(echo "$(VERSION)" | sed 's/^v//'); \
+	sed -i "s/^pkgver=.*/pkgver=$$bare/" packaging/aur/meshtermd/PKGBUILD; \
+	sed -i "s/^pkgver=.*/pkgver=$$bare/" packaging/aur/meshtermd-bin/PKGBUILD; \
+	echo "pkgver bumped to $$bare in both PKGBUILDs."; \
+	echo; \
+	echo "Next steps:"; \
+	echo "  1. cd packaging/aur/meshtermd        && makepkg --printsrcinfo > .SRCINFO"; \
+	echo "  2. cd packaging/aur/meshtermd-bin    && makepkg --printsrcinfo > .SRCINFO"; \
+	echo "  3. Populate sha256sums_<arch> in meshtermd-bin/PKGBUILD from"; \
+	echo "     https://github.com/AG-Studio-Apps/meshtermd/releases/download/$(VERSION)/SHA256SUMS"
 
 clean:
 	rm -rf dist meshtermd mtctl

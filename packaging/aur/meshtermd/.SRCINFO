@@ -1,0 +1,19 @@
+pkgbase = meshtermd
+	pkgdesc = Persistent terminal daemon over QUIC — mosh+tmux in one daemon, with multi-client handoff
+	pkgver = 0.3.1
+	pkgrel = 1
+	url = https://github.com/AG-Studio-Apps/meshtermd
+	arch = x86_64
+	arch = aarch64
+	arch = armv7h
+	license = Apache
+	makedepends = go>=1.26
+	makedepends = git
+	makedepends = pandoc
+	provides = meshtermd=0.3.1
+	provides = mtctl=0.3.1
+	conflicts = meshtermd-bin
+	source = git+https://github.com/AG-Studio-Apps/meshtermd.git#tag=v0.3.1
+	sha256sums = SKIP
+
+pkgname = meshtermd

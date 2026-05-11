@@ -72,6 +72,10 @@ func runUpdate(args []string) int {
 	if !strings.HasPrefix(target, "v") {
 		target = "v" + target
 	}
+	if err := release.ValidateTag(target); err != nil {
+		fmt.Fprintf(os.Stderr, "update: %v\n", err)
+		return 2
+	}
 
 	fmt.Printf("current:    %s\n", current)
 	fmt.Printf("available:  %s\n", target)

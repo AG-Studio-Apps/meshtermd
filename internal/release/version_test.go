@@ -1,6 +1,9 @@
 package release
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseSemver(t *testing.T) {
 	cases := []struct {
@@ -52,6 +55,50 @@ func TestCompareSemver(t *testing.T) {
 		}
 		if ok && got != c.want {
 			t.Errorf("CompareSemver(%q,%q) = %d, want %d", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+func TestValidateTag(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool // want valid?
+	}{
+		// Happy path.
+		{"v0.1.1", true},
+		{"v0.3.0", true},
+		{"v1.2.3", true},
+		{"v10.20.30", true},
+		{"v1.0.0-rc1", true},
+		{"v1.0.0-alpha.2", true},
+		{"v1.0.0-beta-3", true},
+
+		// Audit traversal / injection cases.
+		{"v1.0/../../etc/passwd", false},
+		{"v1.0.0/../../etc/passwd", false},
+		{"v1.0.0;rm -rf /", false},
+		{"v1.0.0 v1.0.0", false},
+		{"v1.0.0\nv1.0.0", false},
+		{"v1.0.0\x00", false},
+
+		// Shape mismatches.
+		{"", false},
+		{"v1.0", false},
+		{"1.0.0", false},                              // missing 'v'
+		{"v1.0.0+meta", false},                        // build metadata rejected
+		{"v01.0.0", true},                             // leading zero is permissive — semver allows it via regex
+		{"V1.0.0", false},                             // uppercase V
+		{"vX.Y.Z", false},                             // non-numeric
+		{"v1.0.0-", false},                            // dangling dash
+		{"v1.0.0-pre release", false},                 // space
+		{strings.Repeat("v1.0.0-aa", 10) + "aa", false}, // > 64 chars
+	}
+	for _, c := range cases {
+		err := ValidateTag(c.in)
+		got := err == nil
+		if got != c.want {
+			t.Errorf("ValidateTag(%q) = ok:%v (err=%v), want ok:%v",
+				c.in, got, err, c.want)
 		}
 	}
 }

@@ -12,6 +12,43 @@ import (
 	"testing"
 )
 
+func TestAssetURLEscapesPathSegments(t *testing.T) {
+	f := NewFetcher(WithReleaseBase("https://example.test/dl"))
+	cases := []struct {
+		tag, file, want string
+	}{
+		{
+			tag:  "v0.3.1",
+			file: "meshtermd-linux-amd64",
+			want: "https://example.test/dl/v0.3.1/meshtermd-linux-amd64",
+		},
+		{
+			// Defence-in-depth: even if a future caller skips
+			// ValidateTag, traversal cannot escape its segment.
+			tag:  "v1.0.0/../../etc/passwd",
+			file: "meshtermd-linux-amd64",
+			want: "https://example.test/dl/v1.0.0%2F..%2F..%2Fetc%2Fpasswd/meshtermd-linux-amd64",
+		},
+		{
+			tag:  "v0.3.1",
+			file: "SHA256SUMS.minisig",
+			want: "https://example.test/dl/v0.3.1/SHA256SUMS.minisig",
+		},
+		{
+			tag:  "v0.3.1",
+			file: "../etc/passwd",
+			want: "https://example.test/dl/v0.3.1/..%2Fetc%2Fpasswd",
+		},
+	}
+	for _, c := range cases {
+		got := f.AssetURL(c.tag, c.file)
+		if got != c.want {
+			t.Errorf("AssetURL(%q,%q)\n  got:  %s\n  want: %s",
+				c.tag, c.file, got, c.want)
+		}
+	}
+}
+
 func TestLookupChecksumStandardFormat(t *testing.T) {
 	body := []byte(`
 057771c44688fbbc076832205f5aa5b26901da58e306dd3f8c3a7f1a9b1c5d72  meshtermd-darwin-amd64

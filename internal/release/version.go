@@ -1,9 +1,46 @@
 package release
 
 import (
+	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
+
+// tagPattern is the only shape we accept for a release tag. Anchored
+// at both ends, no shell metacharacters, no slashes or path-traversal
+// sequences. Optional pre-release suffix matches things like "-rc1",
+// "-alpha.2", "-beta". Build metadata (`+meta`) is deliberately
+// rejected — we don't use it, and accepting `+` would force us to
+// reason about URL-encoding behaviour in fetcher.AssetURL.
+var tagPattern = regexp.MustCompile(`^v\d+\.\d+\.\d+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$`)
+
+// MaxTagLength caps the total length of an accepted tag. 64 is well
+// above any plausible semver string and far below any URL-length
+// problem; rejecting earlier means a path-traversal payload can't
+// even reach the regex engine.
+const MaxTagLength = 64
+
+// ValidateTag returns nil iff `tag` is shaped like a release tag we
+// would publish. Used at the boundary in `meshtermd update` /
+// `mtctl update` to reject `--tag` values (or surprising responses
+// from the GitHub API) before they're interpolated into asset URLs.
+//
+// Closes one of the LOW-severity audit gaps from the 2026-05-11
+// review: before this guard, a tag like "v1.0/../../etc/passwd"
+// would have been passed straight into fmt.Sprintf in AssetURL.
+func ValidateTag(tag string) error {
+	if tag == "" {
+		return fmt.Errorf("empty tag")
+	}
+	if len(tag) > MaxTagLength {
+		return fmt.Errorf("tag exceeds %d characters", MaxTagLength)
+	}
+	if !tagPattern.MatchString(tag) {
+		return fmt.Errorf("tag %q does not match vMAJOR.MINOR.PATCH[-suffix]", tag)
+	}
+	return nil
+}
 
 // VersionsMatch returns true if `current` and `target` refer to the
 // same version. The build stamp is whatever `git describe --tags

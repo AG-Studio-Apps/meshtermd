@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -115,8 +116,14 @@ func (f *Fetcher) LatestTag(ctx context.Context) (string, time.Time, error) {
 // AssetURL constructs the download URL for one asset of a release.
 // Filename should be one of the platform asset names (e.g.
 // "meshtermd-linux-amd64").
+//
+// Both `tag` and `filename` are URL-path-escaped. Callers in the
+// update path validate `tag` against ValidateTag upstream, so the
+// escape here is defence-in-depth — if a future caller skips
+// validation, a traversal payload still can't escape its path
+// segments.
 func (f *Fetcher) AssetURL(tag, filename string) string {
-	return fmt.Sprintf("%s/%s/%s", f.releaseBase, tag, filename)
+	return fmt.Sprintf("%s/%s/%s", f.releaseBase, url.PathEscape(tag), url.PathEscape(filename))
 }
 
 // FetchSmall returns the entire body of an asset in memory. Use for

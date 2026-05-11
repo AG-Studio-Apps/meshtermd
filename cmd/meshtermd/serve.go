@@ -91,11 +91,18 @@ func runServe(args []string) int {
 	return 0
 }
 
-// defaultSocketPath returns $XDG_RUNTIME_DIR/meshtermd.sock when
-// XDG_RUNTIME_DIR is set, falling back to the cert state dir.
-// XDG_RUNTIME_DIR is the conventional location for unix sockets
-// because systemd auto-cleans it on logout; the data dir is a
-// reasonable fallback for distros that don't set it.
+// defaultSocketPath is the path `meshtermd serve` binds to when the
+// operator didn't pass --socket explicitly. Prefers
+// $XDG_RUNTIME_DIR/meshtermd.sock (systemd auto-cleans it on logout)
+// and falls back to the cert state dir for distros that don't set
+// XDG_RUNTIME_DIR.
+//
+// Note: client subcommands (status, list, kill, etc.) use
+// `discoverClientSocketPath` instead, which tries BOTH locations and
+// picks the one with a live socket. That's what lets the same iOS-
+// installed daemon be reachable from an SSH exec (no XDG_RUNTIME_DIR)
+// and a local desktop terminal (XDG_RUNTIME_DIR set by the session
+// manager).
 func defaultSocketPath() string {
 	if rd := os.Getenv("XDG_RUNTIME_DIR"); rd != "" {
 		return filepath.Join(rd, "meshtermd.sock")
@@ -107,6 +114,46 @@ func defaultSocketPath() string {
 		// error than this (e.g., bind permission), but we don't
 		// want to crash on startup just because os.UserHomeDir is
 		// unhappy.
+		return "meshtermd.sock"
+	}
+	return filepath.Join(dataDir, "meshtermd.sock")
+}
+
+// discoverClientSocketPath finds the unix socket of a running daemon
+// for client subcommands (status, list, kill, rename, connect,
+// session-info). It tries both conventional locations in priority
+// order and returns the first one whose socket file exists.
+//
+// Priority:
+//  1. $XDG_RUNTIME_DIR/meshtermd.sock  (if XDG_RUNTIME_DIR is set)
+//  2. $HOME/.local/share/meshtermd/meshtermd.sock
+//
+// Returns the second path as a final fallback even if no socket
+// exists at either, so the caller's "daemon not running at <path>"
+// message points at the conventional persistent location instead of
+// an XDG path that may not exist.
+//
+// Existence-only check (os.Stat); doesn't dial. A stale socket file
+// from a crashed daemon would still satisfy this — but the subsequent
+// ipc.Client connect attempt surfaces that cleanly as ECONNREFUSED.
+func discoverClientSocketPath() string {
+	persistent := persistentSocketPath()
+	if rd := os.Getenv("XDG_RUNTIME_DIR"); rd != "" {
+		runtime := filepath.Join(rd, "meshtermd.sock")
+		if _, err := os.Stat(runtime); err == nil {
+			return runtime
+		}
+		// XDG path empty — fall through to persistent.
+	}
+	return persistent
+}
+
+// persistentSocketPath returns the conventional persistent socket
+// path ($HOME/.local/share/meshtermd/meshtermd.sock) — the location
+// the iOS auto-installer pins via the systemd unit's --socket arg.
+func persistentSocketPath() string {
+	dataDir, err := cert.DefaultDir()
+	if err != nil {
 		return "meshtermd.sock"
 	}
 	return filepath.Join(dataDir, "meshtermd.sock")

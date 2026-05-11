@@ -39,7 +39,7 @@ func runList(args []string) int {
 
 	socketPath := *socket
 	if socketPath == "" {
-		socketPath = defaultSocketPath()
+		socketPath = discoverClientSocketPath()
 	}
 
 	client := ipc.NewClient(socketPath, *timeout)

@@ -50,7 +50,7 @@ func runConnect(args []string) int {
 
 	socketPath := *socket
 	if socketPath == "" {
-		socketPath = defaultSocketPath()
+		socketPath = discoverClientSocketPath()
 	}
 
 	if *rows > 65535 || *cols > 65535 {

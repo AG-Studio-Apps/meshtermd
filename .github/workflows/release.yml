@@ -22,6 +22,9 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Install pandoc
+        run: sudo apt-get update && sudo apt-get install -y pandoc
+
       - name: Build all targets
         run: make dist
 
@@ -119,4 +122,6 @@ jobs:
             dist/mtctl-*
             dist/SHA256SUMS
             dist/SHA256SUMS.minisig
+            dist/man/meshtermd.8
+            dist/man/mtctl.1
           fail_on_unmatched_files: false  # minisig is optional

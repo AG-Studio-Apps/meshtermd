@@ -50,6 +50,10 @@ func main() {
 		os.Exit(runSessionInfo(args))
 	case "status":
 		os.Exit(runStatus(args))
+	case "update":
+		os.Exit(runUpdate(args))
+	case "uninstall":
+		os.Exit(runUninstall(args))
 	case "help", "--help", "-h":
 		usage(os.Stdout)
 	default:
@@ -73,6 +77,8 @@ Subcommands:
   kill               reap a session by id or name
   rename             change a session's user-visible name (PTY + buffer unaffected)
   status             print the daemon's operational snapshot (--json for tooling)
+  update             check for / apply a signed self-update from GitHub Releases
+  uninstall          remove the daemon, supervisor unit, and (optionally) state
 
 Run 'meshtermd <subcommand> --help' for subcommand-specific flags.
 `, build.Version)

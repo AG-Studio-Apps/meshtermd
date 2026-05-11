@@ -45,7 +45,7 @@ DIST_TARGETS := \
 	freebsd-amd64 \
 	freebsd-arm64
 
-.PHONY: all build test vet lint vuln dist manpages clean
+.PHONY: all build test vet lint vuln dist manpages completions clean
 
 all: vet test build build-mtctl
 
@@ -148,9 +148,30 @@ dist/man/meshtermd.8: docs/man/meshtermd.8.md
 	@mkdir -p dist/man
 	pandoc -s -t man $< -o $@
 
-# `make dist` builds binaries and man pages so release artifacts are
-# self-contained for distro packagers.
-dist: $(addprefix dist-,$(DIST_TARGETS)) $(addprefix dist-mtctl-,$(DIST_TARGETS)) manpages
+# Shell completions. Generated from internal/completions/spec.go via
+# cmd/gen-completions. One file per (shell, binary) pair; the
+# Homebrew formula and AUR PKGBUILDs install these to the canonical
+# locations for each shell.
+COMPLETION_BINS   := mtctl meshtermd
+COMPLETION_SHELLS := bash zsh fish
+
+completions: $(foreach bin,$(COMPLETION_BINS),$(foreach sh,$(COMPLETION_SHELLS),dist/completions/$(bin).$(sh)))
+
+dist/completions/%.bash: cmd/gen-completions/main.go internal/completions/spec.go
+	@mkdir -p dist/completions
+	$(GO) run ./cmd/gen-completions -shell bash -binary $* > $@
+
+dist/completions/%.zsh: cmd/gen-completions/main.go internal/completions/spec.go
+	@mkdir -p dist/completions
+	$(GO) run ./cmd/gen-completions -shell zsh -binary $* > $@
+
+dist/completions/%.fish: cmd/gen-completions/main.go internal/completions/spec.go
+	@mkdir -p dist/completions
+	$(GO) run ./cmd/gen-completions -shell fish -binary $* > $@
+
+# `make dist` builds binaries, man pages, and shell completions so
+# release artifacts are self-contained for distro packagers.
+dist: $(addprefix dist-,$(DIST_TARGETS)) $(addprefix dist-mtctl-,$(DIST_TARGETS)) manpages completions
 
 clean:
 	rm -rf dist meshtermd mtctl

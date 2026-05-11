@@ -124,4 +124,10 @@ jobs:
             dist/SHA256SUMS.minisig
             dist/man/meshtermd.8
             dist/man/mtctl.1
+            dist/completions/mtctl.bash
+            dist/completions/mtctl.zsh
+            dist/completions/mtctl.fish
+            dist/completions/meshtermd.bash
+            dist/completions/meshtermd.zsh
+            dist/completions/meshtermd.fish
           fail_on_unmatched_files: false  # minisig is optional

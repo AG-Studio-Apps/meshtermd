@@ -68,6 +68,16 @@ func runServe(args []string) int {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// Write our PID to a file next to the IPC socket so the uninstall
+	// and update commands can SIGTERM us exactly, instead of relying
+	// on a `pkill -f` substring match against the argv (which catches
+	// editors / shells / scripts with "meshtermd serve" anywhere in
+	// their command line). Best-effort: if the write fails the daemon
+	// keeps running, and the fallback pkill path still works.
+	pidPath := pidFilePath(socketPath)
+	_ = writePidFile(pidPath)
+	defer func() { _ = os.Remove(pidPath) }()
+
 	// Print one-line status to stdout so a parent process / wrapper
 	// script can confirm we're up. Diagnostics go via the slog
 	// handler on stderr.
@@ -112,3 +122,20 @@ func (*nopWriter) Write(p []byte) (int, error) { return len(p), nil } //nolint:u
 
 // Reserved for future flag integration: a bigger idle timeout knob.
 var _ = (1 * time.Second) //nolint:unused
+
+// pidFilePath returns the conventional pid-file path: a sibling of
+// the IPC socket so any caller who can resolve the socket can also
+// resolve the pid file. Uninstall + update use it to SIGTERM the
+// running daemon exactly, instead of pkill -f against argv.
+func pidFilePath(socketPath string) string {
+	return filepath.Join(filepath.Dir(socketPath), "meshtermd.pid")
+}
+
+// writePidFile writes the current process's pid to `path` as a
+// single decimal line. Mode 0o600 — same trust level as the IPC
+// socket. Best-effort: caller should ignore failures (a missing
+// pidfile makes uninstall fall back to pkill, which still works).
+func writePidFile(path string) error {
+	pid := []byte(fmt.Sprintf("%d\n", os.Getpid()))
+	return os.WriteFile(path, pid, 0o600)
+}

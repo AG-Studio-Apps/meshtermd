@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -27,10 +28,52 @@ func (n *nohup) Name() string { return "nohup" }
 func (n *nohup) Available(ctx context.Context) bool { return true }
 
 func (n *nohup) Stop(ctx context.Context) error {
+	// Try the pidfile first (exact PID, no collateral damage).
+	// Fall back to `pkill -x meshtermd` (exact basename match) so a
+	// kill -9'd daemon that left a stale pidfile still gets cleaned
+	// up. We intentionally do NOT use `pkill -f 'meshtermd serve'`
+	// — that catches editors / scripts with "meshtermd serve" in
+	// their argv.
+	if pidfileKill() {
+		return nil
+	}
 	uid := strconv.Itoa(os.Getuid())
-	// pkill returns 1 when nothing matched; that's fine.
-	_ = exec.CommandContext(ctx, "pkill", "-u", uid, "-f", "meshtermd serve").Run()
+	_ = exec.CommandContext(ctx, "pkill", "-u", uid, "-x", "meshtermd").Run()
 	return nil
+}
+
+// pidfileKill mirrors signaledFromPidFile in cmd/meshtermd/lifecycle.go
+// but is duplicated here so the svcmgr package doesn't pull the cmd
+// package as a dep. Returns true if a SIGTERM was sent.
+func pidfileKill() bool {
+	candidates := []string{}
+	if rd := os.Getenv("XDG_RUNTIME_DIR"); rd != "" {
+		candidates = append(candidates, rd+"/meshtermd.pid")
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, home+"/.local/share/meshtermd/meshtermd.pid")
+	}
+	for _, path := range candidates {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil || pid <= 0 {
+			continue
+		}
+		proc, err := os.FindProcess(pid)
+		if err != nil {
+			continue
+		}
+		if err := proc.Signal(syscall.SIGTERM); err != nil {
+			_ = os.Remove(path)
+			continue
+		}
+		_ = os.Remove(path)
+		return true
+	}
+	return false
 }
 
 func (n *nohup) Start(ctx context.Context, binPath string) error {

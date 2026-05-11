@@ -27,7 +27,20 @@ type Server struct {
 	listener *quic.Listener
 	udpConn  *net.UDPConn
 	handler  Handler
+	// inflight bounds the number of concurrent in-flight handler
+	// goroutines. Unbounded accept-into-goroutine lets an attacker
+	// against a publicly-bound listener allocate per-conn state
+	// faster than HandshakeIdleTimeout reaps it. The semaphore
+	// caps that; over-capacity peers get a clean CONNECTION_CLOSE
+	// from quic.CloseWithError rather than holding our state.
+	inflight chan struct{}
 }
+
+// MaxConcurrentHandlers caps how many connections may be inside
+// HandleConnection at once. Sized for "a few simultaneous iOS clients
+// per host" with headroom for foreground/background reconnect bursts.
+// On a busy multi-user box this can be raised via Config.MaxConcurrent.
+const MaxConcurrentHandlers = 64
 
 // Handler processes one accepted QUIC connection. The implementation
 // is responsible for opening control / stdin / stdout streams in the
@@ -68,6 +81,12 @@ type Config struct {
 
 	// Handler processes accepted connections. Required.
 	Handler Handler
+
+	// MaxConcurrent caps the number of connections inside
+	// HandleConnection at once. Excess accepts are closed with a
+	// CONNECTION_CLOSE before the handler runs. Default
+	// MaxConcurrentHandlers.
+	MaxConcurrent int
 }
 
 // New constructs a Server. The QUIC listener starts immediately; call
@@ -159,10 +178,16 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("quic.Listen: %w", err)
 	}
 
+	maxConcurrent := cfg.MaxConcurrent
+	if maxConcurrent <= 0 {
+		maxConcurrent = MaxConcurrentHandlers
+	}
+
 	return &Server{
 		listener: listener,
 		udpConn:  udpConn,
 		handler:  cfg.Handler,
+		inflight: make(chan struct{}, maxConcurrent),
 	}, nil
 }
 
@@ -192,7 +217,26 @@ func (s *Server) Serve(ctx context.Context) error {
 			// errors here.
 			return fmt.Errorf("quic accept: %w", err)
 		}
-		go s.handler.HandleConnection(ctx, conn)
+		// Bound concurrent handlers — a public listener can be
+		// reached by anyone on the network, and the handshake itself
+		// allocates per-conn state in quic-go. Without this cap a
+		// flood of half-open connections can drive memory + goroutine
+		// growth faster than HandshakeIdleTimeout reaps them.
+		select {
+		case s.inflight <- struct{}{}:
+			go func() {
+				defer func() { <-s.inflight }()
+				s.handler.HandleConnection(ctx, conn)
+			}()
+		default:
+			// At capacity: shed load with a server-busy signal.
+			// 0x10F = arbitrary application error code; we don't
+			// surface it to peers anywhere else. quic-go will send
+			// a CONNECTION_CLOSE and tear down the QUIC state, so
+			// the peer learns to back off and we don't accumulate
+			// load.
+			_ = conn.CloseWithError(0x10F, "server busy")
+		}
 	}
 }
 

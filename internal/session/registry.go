@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"sync"
@@ -367,20 +368,42 @@ func (r *Registry) IssueAttachToken(sessionID SessionID) (AttachToken, error) {
 // the caller's subsequent attach work succeeds — single-use is
 // single-use. Returns ErrAttachTokenInvalid on any failure (unknown,
 // expired, or session gone).
+//
+// Lookup is done as a linear scan with `subtle.ConstantTimeCompare`
+// rather than `map[t]` index, so the wall-clock time of a verify
+// doesn't leak which (if any) entry matched. With 128 bits of token
+// entropy and a pending-token count bounded by IssueAttachToken
+// rate × AttachTokenTTL (≤ a few in practice), the linear scan is
+// negligible — and it removes a class of theoretical timing
+// side-channel concerns called out in SECURITY.md's audit checklist.
 func (r *Registry) ConsumeAttachToken(t AttachToken) (*Session, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	pending, ok := r.tokens[t]
-	if !ok {
+	// Constant-time scan. We collect the matched key (if any) so the
+	// delete + expiry / session-existence checks happen after the
+	// scan completes, keeping the timing of the comparison loop
+	// independent of which entry matched.
+	var matchedKey AttachToken
+	var matchedPending pendingAttach
+	found := 0
+	for k, p := range r.tokens {
+		eq := subtle.ConstantTimeCompare(k[:], t[:])
+		if eq == 1 {
+			matchedKey = k
+			matchedPending = p
+			found = 1
+		}
+	}
+	if found == 0 {
 		return nil, ErrAttachTokenInvalid
 	}
-	delete(r.tokens, t)
+	delete(r.tokens, matchedKey)
 
-	if time.Now().After(pending.expiresAt) {
+	if time.Now().After(matchedPending.expiresAt) {
 		return nil, ErrAttachTokenInvalid
 	}
-	s, ok := r.sessions[pending.sessionID]
+	s, ok := r.sessions[matchedPending.sessionID]
 	if !ok {
 		return nil, ErrAttachTokenInvalid
 	}
@@ -429,6 +452,15 @@ func (r *Registry) Sweep() int {
 
 	r.mu.Lock()
 	for id, s := range r.sessions {
+		// Never reap a session with attached clients. lastActiveAt
+		// is bumped by stdout traffic + stdin + resize, but not by
+		// "client is connected, shell is idle at the prompt". A
+		// connected-but-silent attach is by definition not idle from
+		// the user's POV; closing it out from under them would yank
+		// their shell after IdleTimeout for no good reason.
+		if s.hasAttachedClientsForGC() {
+			continue
+		}
 		// Per-session timeout takes precedence; zero means
 		// "inherit the registry default", set at NewSession time.
 		timeout := s.idleTimeoutForGC()
@@ -516,4 +548,19 @@ func (s *Session) idleTimeoutForGC() time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.idleTimeout
+}
+
+// hasAttachedClientsForGC reports whether the session currently has
+// any attached clients (Roam or otherwise). The GC sweep uses this to
+// avoid reaping a session that's actively attached but happens to be
+// silent (e.g. a shell sitting at the prompt with no output for the
+// idle window). Without this check, an iOS user idle on a long-lived
+// shell would lose the session out from under them after IdleTimeout.
+//
+// Package-private + lock-internal mirrors the other GC accessors so
+// the registry sweep doesn't have to know about Session's mu.
+func (s *Session) hasAttachedClientsForGC() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.clients) > 0
 }

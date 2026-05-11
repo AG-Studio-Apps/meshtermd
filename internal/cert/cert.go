@@ -37,6 +37,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -119,6 +120,17 @@ func (m *Manager) LoadOrGenerate() (tls.Certificate, Fingerprint, error) {
 
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return tls.Certificate{}, Fingerprint{}, fmt.Errorf("create state dir: %w", err)
+	}
+	// MkdirAll won't tighten a pre-existing dir's permissions, and
+	// a 0755 dir lets a same-uid attacker plant a symlink at our
+	// temp-file rename target. Mirror the IPC parent-dir audit (F5)
+	// here: force the mode to 0o700 explicitly, then verify uid +
+	// no group/other bits before we write a key into it.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return tls.Certificate{}, Fingerprint{}, fmt.Errorf("tighten state dir perms: %w", err)
+	}
+	if err := verifyStateDir(dir); err != nil {
+		return tls.Certificate{}, Fingerprint{}, fmt.Errorf("state dir: %w", err)
 	}
 
 	certPath := filepath.Join(dir, "cert.pem")
@@ -274,4 +286,35 @@ func writeFileAtomic(path string, data []byte, mode fs.FileMode) error {
 		return err
 	}
 	return os.Rename(tmpPath, path)
+}
+
+// verifyStateDir mirrors the IPC server's parent-dir audit (F5):
+// the directory must be a regular dir, owned by the calling uid, and
+// have no group/other permission bits. This prevents a same-uid
+// attacker (or a user who copied their home over with rsync default
+// flags) from leaving the cert + private key in a directory another
+// process can read or that allows symlink races against the
+// rename-temp-file pattern in writeFileAtomic.
+func verifyStateDir(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", path)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		// Non-POSIX FS (cifs, fuse without stat, etc.) — we can't
+		// confirm ownership, so refuse rather than ship the key
+		// into something we can't reason about.
+		return fmt.Errorf("cannot inspect ownership of %s", path)
+	}
+	if int(stat.Uid) != os.Getuid() {
+		return fmt.Errorf("%s owned by uid %d; expected %d", path, stat.Uid, os.Getuid())
+	}
+	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+		return fmt.Errorf("%s has loose permissions %o; expected <= 0700", path, mode)
+	}
+	return nil
 }

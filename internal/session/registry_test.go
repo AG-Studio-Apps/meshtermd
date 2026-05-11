@@ -151,6 +151,40 @@ func TestSweepHonoursPerSessionIdleTimeout(t *testing.T) {
 	}
 }
 
+// TestSweepSkipsAttachedSession verifies the fix for the audit
+// finding "Idle-GC reaps active-but-silent sessions". A session with
+// an attached client whose shell is idle (no stdout for the timeout
+// window) used to be reaped, yanking the user's shell. Sweep must
+// now skip sessions with len(clients) > 0.
+func TestSweepSkipsAttachedSession(t *testing.T) {
+	t.Parallel()
+	// 20ms idle timeout, no other sessions to consider.
+	r := NewRegistry(0, 20*time.Millisecond, time.Hour, 0)
+
+	s := mustNewSession(t)
+	if err := r.Add(s); err != nil {
+		t.Fatal(err)
+	}
+
+	// Attach a client. Acquire bumps lastActiveAt once; we then
+	// wait past the idle window so a *detached* session would be
+	// reaped. The Release defer ensures cleanup even on test fail.
+	_, gen, err := s.Acquire(context.Background(), AttachModeExclusive)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer s.Release(gen)
+
+	time.Sleep(40 * time.Millisecond)
+
+	if reaped := r.Sweep(); reaped != 0 {
+		t.Errorf("Sweep reaped %d attached session(s); want 0", reaped)
+	}
+	if _, err := r.Lookup(s.ID()); err != nil {
+		t.Errorf("attached session was incorrectly reaped: %v", err)
+	}
+}
+
 // TestResolveIdleTimeout exercises the precedence rules:
 // client-zero falls back to registry default, client>ceiling clamps
 // to ceiling, and zero ceiling means no clamp.

@@ -218,7 +218,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 // looks up an existing session or creates a new one (spawning a
 // PTY), then issues an attach token and returns the bootstrap line
 // fields.
+// Per-field size caps on IPC inputs. Same-uid trust model says the
+// caller is friendly; these are defense-in-depth against a buggy or
+// compromised local helper that could otherwise feed unbounded
+// strings into our registry maps + log lines.
+const (
+	maxNameLen      = 256        // Session.Name; echoed in every list response + every log line.
+	maxShellLen     = 4 * 1024   // Path to a shell binary; longer than this is pathological.
+	maxExecJoinLen  = 16 * 1024  // Total bytes across all Exec[] joined by spaces.
+	maxExecArgCount = 128        // Cap individual element count too — argv length is finite in practice.
+)
+
 func (d *Daemon) HandleAllocate(ctx context.Context, req ipc.AllocateRequest) ipc.AllocateResponse {
+	if msg := validateAllocateBounds(req); msg != "" {
+		return ipc.AllocateResponse{Ok: false, Err: ipc.ErrBadRequest, Msg: msg}
+	}
 	sess, err := d.lookupOrCreateSession(req)
 	if err != nil {
 		// lookupOrCreateSession returns the response-shaped error
@@ -307,6 +321,10 @@ func (d *Daemon) HandleRenameSession(ctx context.Context, req ipc.RenameSessionR
 	}
 	if req.NewName == "" {
 		return ipc.RenameSessionResponse{Ok: false, Err: ipc.ErrBadRequest, Msg: "new name required"}
+	}
+	if len(req.NewName) > maxNameLen {
+		return ipc.RenameSessionResponse{Ok: false, Err: ipc.ErrBadRequest,
+			Msg: fmt.Sprintf("new name exceeds %d bytes", maxNameLen)}
 	}
 
 	// Resolve selector → SessionID.
@@ -529,4 +547,31 @@ func errResponse(err error) ipc.AllocateResponse {
 		return ipc.AllocateResponse{Ok: false, Err: ae.Code, Msg: ae.Msg}
 	}
 	return ipc.AllocateResponse{Ok: false, Err: ipc.ErrInternal, Msg: err.Error()}
+}
+
+// validateAllocateBounds checks the request's string fields against
+// the per-field size caps. Returns "" if all good, otherwise a
+// caller-facing error message.
+//
+// CBOR's StrictDecMode already bounds total frame size + array/map
+// fanout, but a single string field can still consume the full
+// per-frame budget. These caps are the inner second line of defence.
+func validateAllocateBounds(req ipc.AllocateRequest) string {
+	if len(req.Name) > maxNameLen {
+		return fmt.Sprintf("name exceeds %d bytes", maxNameLen)
+	}
+	if len(req.Shell) > maxShellLen {
+		return fmt.Sprintf("shell path exceeds %d bytes", maxShellLen)
+	}
+	if len(req.Exec) > maxExecArgCount {
+		return fmt.Sprintf("exec has %d args; max is %d", len(req.Exec), maxExecArgCount)
+	}
+	joined := 0
+	for _, a := range req.Exec {
+		joined += len(a) + 1 // +1 approximates a separator
+		if joined > maxExecJoinLen {
+			return fmt.Sprintf("exec args total exceed %d bytes", maxExecJoinLen)
+		}
+	}
+	return ""
 }

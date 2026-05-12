@@ -55,6 +55,19 @@ type Conn struct {
 	readBuf  bytes.Buffer
 	readErr  error // set once; never cleared
 
+	// Per-byte seq tracking from the new FrameStdout envelope:
+	//   - lastDeliveredSeq is the seq just past the last byte appended
+	//     to readBuf. Used to compute the consumed-through value the
+	//     caller passes to Ack().
+	//   - pendingGapBytes is incremented when a FrameStdout arrives
+	//     with StdoutFlagTruncBefore set; the consumer reads it via
+	//     ConsumeTrunc() between Reads and bumps its own session ring
+	//     headSeq accordingly.
+	seqMu            sync.Mutex
+	lastDeliveredSeq uint64
+	pendingGapBytes  uint64
+	seqValid         bool // false until the first FrameStdout arrives
+
 	// Echo state cache. last echo_state body[0] received from sidecar;
 	// EchoEnabled() reads under echoMu.
 	echoMu      sync.Mutex
@@ -218,9 +231,11 @@ func (c *Conn) writeFrame(t ptysidecar.FrameType, body []byte) error {
 }
 
 // runFrameReader is the sole consumer of incoming frames. Demuxes
-// FrameStdout → readBuf, FrameEchoState → echoVal, FrameChildExit
-// → translates to io.EOF on the read side. Returns on any socket
-// read error (clean EOF or otherwise), setting readErr appropriately.
+// FrameStdout → readBuf (parsing the seq-prefixed envelope; Trunc
+// flag accumulates in pendingGapBytes), FrameEchoState → echoVal,
+// FrameChildExit → translates to io.EOF on the read side. Returns
+// on any socket read error (clean EOF or otherwise), setting
+// readErr appropriately.
 func (c *Conn) runFrameReader() {
 	defer close(c.readerDone)
 	for {
@@ -231,7 +246,12 @@ func (c *Conn) runFrameReader() {
 		}
 		switch t {
 		case ptysidecar.FrameStdout:
-			c.appendOutput(body)
+			firstSeq, flags, payload, derr := ptysidecar.DecodeStdoutBody(body)
+			if derr != nil {
+				c.logger.Warn("ptyclient.bad_stdout_body", "err", derr.Error(), "session", c.sessionID)
+				continue
+			}
+			c.handleStdout(firstSeq, flags, payload)
 		case ptysidecar.FrameEchoState:
 			if len(body) == 1 {
 				c.storeEcho(body[0])
@@ -248,6 +268,75 @@ func (c *Conn) runFrameReader() {
 			c.logger.Warn("ptyclient.unknown_frame_type", "type", uint8(t), "session", c.sessionID)
 		}
 	}
+}
+
+// handleStdout records the gap-before signal (if any) and appends
+// the payload to readBuf, advancing lastDeliveredSeq.
+func (c *Conn) handleStdout(firstSeq uint64, flags byte, payload []byte) {
+	c.seqMu.Lock()
+	if flags&ptysidecar.StdoutFlagTruncBefore != 0 {
+		// The dropped span is [previousLastDeliveredSeq, firstSeq).
+		// Until we've received any byte, previousLastDeliveredSeq is
+		// unknown — use firstSeq alone as the gap-marker boundary;
+		// the daemon already knows how many bytes it asked for vs got
+		// back via its FrameResume(from_seq) → firstSeq diff.
+		if c.seqValid {
+			c.pendingGapBytes += firstSeq - c.lastDeliveredSeq
+		}
+	}
+	if len(payload) > 0 {
+		c.lastDeliveredSeq = firstSeq + uint64(len(payload))
+		c.seqValid = true
+	} else if !c.seqValid {
+		c.lastDeliveredSeq = firstSeq
+		c.seqValid = true
+	}
+	c.seqMu.Unlock()
+
+	if len(payload) > 0 {
+		c.appendOutput(payload)
+	}
+}
+
+// ConsumeTrunc returns the number of bytes silently dropped since
+// the last call (and resets the counter). The Pump goroutine reads
+// this between Read calls and advances the daemon's session ring via
+// RingBuffer.AdvanceWithGap so iOS's existing AttachAck.trunc fires
+// on next attach. Returns 0 when no gap has accumulated.
+func (c *Conn) ConsumeTrunc() uint64 {
+	c.seqMu.Lock()
+	defer c.seqMu.Unlock()
+	gap := c.pendingGapBytes
+	c.pendingGapBytes = 0
+	return gap
+}
+
+// LastDeliveredSeq returns the sidecar-side seq just past the last
+// byte delivered to readBuf. Callers use this as the watermark for
+// Ack(seq); we ack what we've durably committed to our session ring,
+// which is bounded above by lastDeliveredSeq.
+func (c *Conn) LastDeliveredSeq() uint64 {
+	c.seqMu.Lock()
+	defer c.seqMu.Unlock()
+	return c.lastDeliveredSeq
+}
+
+// SendResume emits a FrameResume(from_seq) to the sidecar. Called by
+// Discover on reattach so the sidecar's drainer rewinds (or fast-
+// forwards) to where the daemon's persisted ring left off. Best
+// effort: a write error means the conn is gone and the caller will
+// see ErrSidecarGone on the next Read.
+func (c *Conn) SendResume(fromSeq uint64) error {
+	return c.writeFrame(ptysidecar.FrameResume, ptysidecar.EncodeSeq(fromSeq))
+}
+
+// Ack tells the sidecar it can free bytes whose seq is < consumedSeq.
+// Called by Pump after a buf.Write — coalesced via the Pump's own
+// 64 KiB / 200 ms thresholds (see internal/session/session.go). Best
+// effort: a write error is logged silently; the daemon's next
+// reconnect will resend an Ack anyway via the persisted lcs.
+func (c *Conn) Ack(consumedSeq uint64) error {
+	return c.writeFrame(ptysidecar.FrameAck, ptysidecar.EncodeSeq(consumedSeq))
 }
 
 // maybeSurfaceBusy upgrades a child_exit with the EBUSY signal

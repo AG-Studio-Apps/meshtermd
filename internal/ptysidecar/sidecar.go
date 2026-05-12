@@ -367,6 +367,13 @@ func (s *supervisor) run(connCh <-chan net.Conn) exitReason {
 				continue
 			}
 			disarmGrace()
+			// Synchronously peek at the connection's first frame with
+			// a short deadline. If it's a FrameResume, apply it before
+			// the drainer goroutine spins up — that way the first
+			// FrameStdout's firstSeq matches what the daemon asked for.
+			// Other frame types are dispatched inline once and then
+			// the regular pumps take over.
+			peekResumeOrDispatch(c, s.master, s.ring, s.log)
 			s.log.Info("sidecar.client_attached")
 			active = startClientPumps(c, s.master, s.ring, s.log)
 			// Eager drain so the reconnecting daemon doesn't wait for
@@ -391,6 +398,11 @@ func (s *supervisor) run(connCh <-chan net.Conn) exitReason {
 		case <-activeDone:
 			s.log.Info("sidecar.client_detached", "ring_dropped_bytes", s.ring.Dropped())
 			active = nil
+			// Reset the ring's read cursor to the un-acked tail. A new
+			// daemon that attaches without sending FrameResume gets
+			// the full un-acked region replayed by default; one that
+			// does send FrameResume will SeekRead over this anyway.
+			s.ring.SeekRead(s.ring.TailOutSeq())
 			if exitInfo != nil {
 				return exitChildGone
 			}
@@ -440,18 +452,43 @@ func (cp *clientPumps) writeFrame(t FrameType, body []byte) error {
 	return WriteFrame(cp.conn, t, body)
 }
 
-// drainRing pulls everything currently in the ring and sends it as
-// FrameStdout frames. Returns silently on conn write errors — the
-// reader goroutine will pick up the close on its next read.
+// drainRing pulls everything available from the ring's read cursor
+// and sends it as FrameStdout frames using the seq-prefixed body
+// envelope. Each frame's first_byte_seq is the seq of payload[0];
+// the Trunc flag is set when bytes were silently dropped between
+// drains (the daemon advances its session-ring headSeq past the
+// gap so iOS's existing AttachAck.trunc semantics fire).
+//
+// readOutSeq advances by every byte copied out; tailOutSeq is NOT
+// touched here — bytes remain in the ring until the daemon acks via
+// FrameAck. Returns silently on conn write errors — the reader
+// goroutine picks up the close on its next read.
 func (cp *clientPumps) drainRing(ring *Ring) {
 	const chunk = 16 * 1024
 	buf := make([]byte, chunk)
 	for {
-		n := ring.Drain(buf)
-		if n == 0 {
+		n, firstSeq, gapBefore := ring.DrainWithSeq(buf)
+		if n == 0 && gapBefore == 0 {
 			return
 		}
-		if err := cp.writeFrame(FrameStdout, buf[:n]); err != nil {
+		var flags byte
+		if gapBefore > 0 {
+			flags |= StdoutFlagTruncBefore
+			// firstSeq from DrainWithSeq is the seq of the first byte
+			// in `buf`; the gap bytes were at seqs
+			// [firstSeq − gapBefore, firstSeq). The daemon advances
+			// its session ring by `gapBefore` zero-payload bytes
+			// before consuming the payload.
+		}
+		var payload []byte
+		if n > 0 {
+			payload = buf[:n]
+		}
+		if err := cp.writeFrame(FrameStdout, EncodeStdoutBody(firstSeq, flags, payload)); err != nil {
+			return
+		}
+		if n == 0 {
+			// Pure gap frame; no payload to keep draining.
 			return
 		}
 	}
@@ -499,6 +536,25 @@ func startClientPumps(conn net.Conn, master *os.File, ring *Ring, log *slog.Logg
 				_ = cpty.Setsize(master, &cpty.Winsize{Rows: rows, Cols: cols})
 			case FrameQueryEcho:
 				_ = cp.writeFrame(FrameEchoState, []byte{readEchoState(master)})
+			case FrameAck:
+				seq, derr := DecodeSeq(body)
+				if derr != nil {
+					log.Warn("sidecar.bad_ack_body", "err", derr.Error())
+					continue
+				}
+				ring.AdvanceTailTo(seq)
+			case FrameResume:
+				// Resume mid-stream is supported (the daemon might
+				// reconnect a second time without dropping the
+				// existing socket — unusual, but legal). Apply via
+				// SeekRead; the drainer picks up the new cursor on
+				// its next iteration.
+				seq, derr := DecodeSeq(body)
+				if derr != nil {
+					log.Warn("sidecar.bad_resume_body", "err", derr.Error())
+					continue
+				}
+				ring.SeekRead(seq)
 			case FrameDieNow:
 				if !dieNowFired {
 					dieNowFired = true
@@ -529,6 +585,56 @@ func startClientPumps(conn net.Conn, master *os.File, ring *Ring, log *slog.Logg
 	}()
 
 	return cp
+}
+
+// peekResumeOrDispatch reads up to one frame from `conn` with a 50 ms
+// deadline. If it's a FrameResume, apply via ring.SeekRead so the
+// drainer's first FrameStdout honors the daemon's request seq. If
+// it's any other frame, dispatch it once inline (so the daemon
+// doesn't lose data on misorder). On timeout / read error this is a
+// no-op — the drainer proceeds from the ring's current read cursor.
+func peekResumeOrDispatch(conn net.Conn, master *os.File, ring *Ring, log *slog.Logger) {
+	_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+	t, body, err := ReadFrame(conn)
+	if err != nil {
+		return
+	}
+	switch t {
+	case FrameResume:
+		seq, derr := DecodeSeq(body)
+		if derr != nil {
+			log.Warn("sidecar.bad_resume_body", "err", derr.Error())
+			return
+		}
+		newRead, gap := ring.SeekRead(seq)
+		if gap > 0 {
+			log.Info("sidecar.resume_with_gap", "requested", seq, "served_from", newRead, "gap", gap)
+		}
+	case FrameStdin:
+		_, _ = master.Write(body)
+	case FrameResize:
+		if rows, cols, derr := DecodeResize(body); derr == nil {
+			_ = cpty.Setsize(master, &cpty.Winsize{Rows: rows, Cols: cols})
+		}
+	case FrameAck:
+		if seq, derr := DecodeSeq(body); derr == nil {
+			ring.AdvanceTailTo(seq)
+		}
+	case FrameQueryEcho:
+		// Best-effort: write back echo state inline. Slightly
+		// duplicative with the post-pump reader path, but the
+		// alternative is a queued reply, which buys nothing.
+		_ = WriteFrame(conn, FrameEchoState, []byte{readEchoState(master)})
+	case FrameDieNow:
+		// die_now on the first frame is unusual but legal — let
+		// startClientPumps' reader pick it up by returning the
+		// frame... actually we've already consumed it. Drop into a
+		// sentinel by closing the conn so the supervisor sees done.
+		_ = conn.Close()
+	default:
+		log.Warn("sidecar.unknown_first_frame", "type", uint8(t))
+	}
 }
 
 // readEchoState issues a tcgetattr on the PTY master and reports the

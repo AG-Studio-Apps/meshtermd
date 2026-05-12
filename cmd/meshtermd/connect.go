@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AG-Studio-Apps/meshtermd/internal/build"
 	"github.com/AG-Studio-Apps/meshtermd/internal/ipc"
 )
 
@@ -110,5 +111,19 @@ func runConnect(args []string) int {
 	//   MTRM_QUIC <version> <port> <session_id> <cert_fp> <attach_token>\n
 	fmt.Printf("MTRM_QUIC 1 %d %s %s %s\n",
 		resp.Port, resp.SessionID, resp.CertFP, resp.AttachToken)
+
+	// Emit the daemon version on a second line so the iOS client (or
+	// mtctl, or anything else parsing connect's stdout) can compare
+	// the installed daemon to the version it pins. Forward-compat:
+	// older daemons don't emit this; clients treat absence as "version
+	// unknown" and skip the update banner. iOS uses this to surface
+	// a "Daemon update available" affordance per host without an
+	// extra SSH round-trip.
+	//
+	// Format is deliberately simple — one space, raw build.Version
+	// (typically `vX.Y.Z` or `vX.Y.Z-dirty` for dev builds; the
+	// client strips any suffix before semver comparison).
+	fmt.Printf("MTRM_DAEMON_VERSION %s\n", build.Version)
+
 	return connectExitOK
 }

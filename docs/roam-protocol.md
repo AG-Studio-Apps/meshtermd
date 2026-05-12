@@ -106,6 +106,21 @@ Fields are space-separated ASCII. No quoting, no escaping (none of these fields 
 
 The line is terminated by a single `\n`. The client MUST validate every field before opening QUIC.
 
+#### Daemon version (optional, additive)
+
+`meshtermd connect` v0.4.0+ emits a second line on stdout immediately after the bootstrap line:
+
+```
+MTRM_DAEMON_VERSION v0.4.0\n
+```
+
+| Field | Format | Meaning |
+|---|---|---|
+| `MTRM_DAEMON_VERSION` | literal | sentinel string |
+| `<version>` | raw `build.Version` | typically `vX.Y.Z`; dev builds may have a `-dirty` / `-N-gSHA` suffix |
+
+Forward-compat: clients MAY parse this line to surface a "daemon update available" affordance. Older daemons that don't emit it MUST be tolerated by absence — treat as version-unknown and skip the badge. Clients MUST NOT depend on this line for connect-success; the `MTRM_QUIC` line above is the only bootstrap-load-bearing output.
+
 ### 4.3 Stderr
 
 `meshtermd connect` may emit human-readable diagnostics on stderr. Stderr is for humans; the client SHOULD treat any stderr output as informational unless exit code is non-zero.

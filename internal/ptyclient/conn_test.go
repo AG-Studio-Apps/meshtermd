@@ -29,7 +29,8 @@ func pipePair(t *testing.T) (*Conn, net.Conn) {
 func TestConnReadDeliversStdoutFrame(t *testing.T) {
 	conn, sidecar := pipePair(t)
 	go func() {
-		_ = ptysidecar.WriteFrame(sidecar, ptysidecar.FrameStdout, []byte("hello world"))
+		_ = ptysidecar.WriteFrame(sidecar, ptysidecar.FrameStdout,
+			ptysidecar.EncodeStdoutBody(0, 0, []byte("hello world")))
 	}()
 	buf := make([]byte, 32)
 	n, err := conn.Read(buf)
@@ -39,12 +40,16 @@ func TestConnReadDeliversStdoutFrame(t *testing.T) {
 	if string(buf[:n]) != "hello world" {
 		t.Errorf("got %q, want %q", buf[:n], "hello world")
 	}
+	if conn.LastDeliveredSeq() != uint64(len("hello world")) {
+		t.Errorf("LastDeliveredSeq: want %d, got %d", len("hello world"), conn.LastDeliveredSeq())
+	}
 }
 
 func TestConnReadEOFOnChildExit(t *testing.T) {
 	conn, sidecar := pipePair(t)
 	go func() {
-		_ = ptysidecar.WriteFrame(sidecar, ptysidecar.FrameStdout, []byte("partial"))
+		_ = ptysidecar.WriteFrame(sidecar, ptysidecar.FrameStdout,
+			ptysidecar.EncodeStdoutBody(0, 0, []byte("partial")))
 		_ = ptysidecar.WriteFrame(sidecar, ptysidecar.FrameChildExit, ptysidecar.EncodeChildExit(42, 0))
 	}()
 	// First read returns the buffered bytes.
@@ -205,6 +210,94 @@ func TestConnEBUSYChildExitSurfacesAsBusy(t *testing.T) {
 	_, err := conn.Read(buf)
 	if !errors.Is(err, ErrSidecarBusy) {
 		t.Errorf("expected ErrSidecarBusy on EBUSY child_exit, got %v", err)
+	}
+}
+
+func TestConnTruncFlagSurfacesViaConsumeTrunc(t *testing.T) {
+	conn, sidecar := pipePair(t)
+	// Sidecar emits two frames: first establishes the read cursor at
+	// seq 10, second has Trunc flag with firstSeq=20 (so 10 bytes of
+	// gap between them).
+	go func() {
+		_ = ptysidecar.WriteFrame(sidecar, ptysidecar.FrameStdout,
+			ptysidecar.EncodeStdoutBody(10, 0, []byte("aaaaaaaaaa"))) // seqs 10..20
+		_ = ptysidecar.WriteFrame(sidecar, ptysidecar.FrameStdout,
+			ptysidecar.EncodeStdoutBody(30, ptysidecar.StdoutFlagTruncBefore, []byte("bbbbbbbbbb"))) // seqs 30..40, 10-byte gap
+	}()
+	buf := make([]byte, 32)
+	// First read drains all in-flight bytes.
+	deadline := time.Now().Add(2 * time.Second)
+	var got []byte
+	for time.Now().Before(deadline) && len(got) < 20 {
+		n, err := conn.Read(buf)
+		if err != nil && err != io.EOF {
+			t.Fatalf("Read err: %v", err)
+		}
+		got = append(got, buf[:n]...)
+	}
+	if string(got) != "aaaaaaaaaabbbbbbbbbb" {
+		t.Errorf("payload concatenation: got %q", got)
+	}
+	if gap := conn.ConsumeTrunc(); gap != 10 {
+		t.Errorf("ConsumeTrunc: want 10, got %d", gap)
+	}
+	if gap := conn.ConsumeTrunc(); gap != 0 {
+		t.Errorf("second ConsumeTrunc should return 0 after reset, got %d", gap)
+	}
+	if conn.LastDeliveredSeq() != 40 {
+		t.Errorf("LastDeliveredSeq: want 40, got %d", conn.LastDeliveredSeq())
+	}
+}
+
+func TestConnSendResumeEncodesFrameResume(t *testing.T) {
+	conn, sidecar := pipePair(t)
+	done := make(chan struct{})
+	var got struct {
+		typ  ptysidecar.FrameType
+		body []byte
+	}
+	go func() {
+		defer close(done)
+		t, body, _ := ptysidecar.ReadFrame(sidecar)
+		got.typ = t
+		got.body = body
+	}()
+	if err := conn.SendResume(12345); err != nil {
+		t.Fatalf("SendResume: %v", err)
+	}
+	<-done
+	if got.typ != ptysidecar.FrameResume {
+		t.Errorf("typ: got 0x%02x, want FrameResume", got.typ)
+	}
+	seq, err := ptysidecar.DecodeSeq(got.body)
+	if err != nil || seq != 12345 {
+		t.Errorf("body decode: seq=%d err=%v", seq, err)
+	}
+}
+
+func TestConnAckEncodesFrameAck(t *testing.T) {
+	conn, sidecar := pipePair(t)
+	done := make(chan struct{})
+	var got struct {
+		typ  ptysidecar.FrameType
+		body []byte
+	}
+	go func() {
+		defer close(done)
+		t, body, _ := ptysidecar.ReadFrame(sidecar)
+		got.typ = t
+		got.body = body
+	}()
+	if err := conn.Ack(99999); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	<-done
+	if got.typ != ptysidecar.FrameAck {
+		t.Errorf("typ: got 0x%02x, want FrameAck", got.typ)
+	}
+	seq, err := ptysidecar.DecodeSeq(got.body)
+	if err != nil || seq != 99999 {
+		t.Errorf("body decode: seq=%d err=%v", seq, err)
 	}
 }
 

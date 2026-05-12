@@ -72,6 +72,23 @@ real scrollback through every disconnect.
     address, session count, idle-timeout config, attach-token pool
     size, certificate fingerprint).
 
+**session-search** [**\-\-json**] [**\-\-max** *N*] [**\-\-anchored**] *id-or-name* *regex*
+:   Regex-grep a session's scrollback ring buffer. The pattern is Go
+    RE2 source; **\-\-anchored** wraps it in `(?m:…)` so `^`/`$` match
+    physical newlines in retained bytes (the truncated start of the
+    ring is NOT treated as `^`). **\-\-max** caps result count
+    (default 100; 0 = daemon default of 10,000). The daemon-side ring
+    buffer is byte-addressed, so seq offsets in the result reference
+    monotonic positions usable with the protocol-level replay path.
+
+**doctor** [**\-\-json**]
+:   Compile a diagnostic report combining live daemon health (via
+    Status IPC), the detected supervisor backend, on-disk unit /
+    plist inspection (including the load-bearing `KillMode=process`
+    check for v0.6+), and `loginctl` linger status on Linux. Exit 0
+    on a clean report, 1 if any warning surfaced. The `--json` shape
+    is consumed by **mtctl**(1) and the iOS app.
+
 **kill** *id-or-name*
 :   Reap a session by hex SessionID or by user-visible Name. Supports
     glob patterns and **\-\-all**.

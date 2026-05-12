@@ -153,6 +153,29 @@ func (c *Client) KillSession(ctx context.Context, idOrName string) (KillSessionR
 	return DecodeKillSessionResponse(body)
 }
 
+// SessionSearch scans the named session's scrollback ring for regex
+// matches. Sel uses the same id-or-name resolution as KillSession.
+// Pattern is raw Go RE2 source — the daemon compiles it under a
+// size cap. Anchored=true wraps with (?m:…) so ^/$ match physical
+// newlines. MaxMatches=0 → daemon default (10,000).
+func (c *Client) SessionSearch(ctx context.Context, req SessionSearchRequest) (SessionSearchResponse, error) {
+	req.T = TypeSessionSearch
+	conn, err := c.dial(ctx)
+	if err != nil {
+		return SessionSearchResponse{}, err
+	}
+	defer conn.Close()
+
+	if err := EncodeRequest(conn, req); err != nil {
+		return SessionSearchResponse{}, fmt.Errorf("send: %w", err)
+	}
+	body, err := ReadFrame(conn)
+	if err != nil {
+		return SessionSearchResponse{}, fmt.Errorf("recv: %w", err)
+	}
+	return DecodeSessionSearchResponse(body)
+}
+
 func (c *Client) dial(ctx context.Context) (net.Conn, error) {
 	deadline, ok := ctx.Deadline()
 	if !ok {

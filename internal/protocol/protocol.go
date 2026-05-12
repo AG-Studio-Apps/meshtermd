@@ -143,6 +143,16 @@ const (
 	// phone while you type on the laptop, or watch a colleague
 	// working from across the office.
 	AttachModeReadonly = "readonly"
+
+	// AttachModePassive: the invisible-tap mode. Like readonly —
+	// receives output, stdin/resize frames dropped — but the daemon
+	// does NOT surface passive attachers in `SessionInfo.AttachedModes`
+	// or `AttachAck.Peers`. Other clients see the session as if no
+	// passive watcher were present. Use case: `mtctl tail <session>`
+	// for observing a build's output without claiming an attach slot
+	// that other tools would render to the user. Hard-capped at 8
+	// concurrent passive attachers per session.
+	AttachModePassive = "passive"
 )
 
 // Error codes for AttachAck.Err per § 7.3.

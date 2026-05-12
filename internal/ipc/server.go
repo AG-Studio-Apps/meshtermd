@@ -26,6 +26,7 @@ type Handler interface {
 	HandleKillSession(ctx context.Context, req KillSessionRequest) KillSessionResponse
 	HandleRenameSession(ctx context.Context, req RenameSessionRequest) RenameSessionResponse
 	HandleStatus(ctx context.Context, req StatusRequest) StatusResponse
+	HandleSessionSearch(ctx context.Context, req SessionSearchRequest) SessionSearchResponse
 }
 
 // Server listens on a Unix socket and dispatches incoming requests
@@ -295,6 +296,18 @@ func (s *Server) handle(ctx context.Context, conn *net.UnixConn) {
 		}
 		resp := s.handler.HandleStatus(ctx, req)
 		resp.T = TypeStatus
+		_ = EncodeResponse(conn, resp)
+	case TypeSessionSearch:
+		req, err := DecodeSessionSearchRequest(body)
+		if err != nil {
+			_ = EncodeResponse(conn, SessionSearchResponse{
+				T: TypeSessionSearch, Ok: false,
+				Err: ErrBadRequest, Msg: err.Error(),
+			})
+			return
+		}
+		resp := s.handler.HandleSessionSearch(ctx, req)
+		resp.T = TypeSessionSearch
 		_ = EncodeResponse(conn, resp)
 	default:
 		_ = EncodeResponse(conn, AllocateResponse{

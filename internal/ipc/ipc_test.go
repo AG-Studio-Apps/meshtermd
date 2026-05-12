@@ -54,6 +54,10 @@ func (h *echoHandler) HandleStatus(ctx context.Context, _ StatusRequest) StatusR
 	return StatusResponse{Ok: true, Version: "test", SessionCount: 0, MaxSessions: 100}
 }
 
+func (h *echoHandler) HandleSessionSearch(_ context.Context, _ SessionSearchRequest) SessionSearchResponse {
+	return SessionSearchResponse{Ok: true}
+}
+
 func startServer(t *testing.T, h Handler) (*Server, string) {
 	t.Helper()
 	dir := tempDirWith0700(t)

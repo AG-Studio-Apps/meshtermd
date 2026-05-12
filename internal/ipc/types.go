@@ -24,6 +24,7 @@ const (
 	TypeKillSession   = "KillSession"
 	TypeRenameSession = "RenameSession"
 	TypeStatus        = "Status"
+	TypeSessionSearch = "SessionSearch"
 )
 
 // AllocateRequest reserves an attach for the named session (or
@@ -243,6 +244,47 @@ type PingRequest struct {
 type PingResponse struct {
 	T     string `cbor:"t"`
 	Nonce uint64 `cbor:"n"`
+}
+
+// SessionSearchRequest scans the named session's scrollback ring for
+// regex matches. Sel follows the same id-or-name resolution as
+// KillSession. Pattern is the raw Go regexp/RE2 source; the daemon
+// compiles it. Anchored=true wraps the pattern with (?m) so ^/$
+// match at physical newlines in the retained bytes (the truncated
+// ring start is NOT treated as ^). MaxMatches caps result count;
+// 0 → daemon default (10,000).
+type SessionSearchRequest struct {
+	T          string `cbor:"t"`
+	Sel        string `cbor:"sel"`
+	Pattern    string `cbor:"pat"`
+	MaxMatches int    `cbor:"max,omitempty"`
+	Anchored   bool   `cbor:"anc,omitempty"`
+}
+
+// SearchMatchInfo is one row in a SessionSearchResponse. Byte offsets
+// are in the buffer's monotonic seq space, so the caller can ReadSince
+// for surrounding context if more than the immediate line is wanted.
+// LineNum is 0-based within the retained scrollback (not absolute
+// across session history — the ring can't know lines that have aged
+// out). JSON tags match the wire shape `meshtermd session-search
+// --json` emits for tooling consumers.
+type SearchMatchInfo struct {
+	StartSeq uint64 `cbor:"ss" json:"start_seq"`
+	EndSeq   uint64 `cbor:"es" json:"end_seq"`
+	Line     string `cbor:"l"  json:"line"`
+	LineNum  int    `cbor:"n"  json:"line_num"`
+}
+
+// SessionSearchResponse carries the regex hits. Ok=false on bad
+// pattern, unknown session, or internal error; Matches is empty in
+// that case. An empty Matches with Ok=true means "valid request, no
+// matches found."
+type SessionSearchResponse struct {
+	T       string            `cbor:"t" json:"-"`
+	Ok      bool              `cbor:"ok" json:"ok"`
+	Matches []SearchMatchInfo `cbor:"m,omitempty" json:"matches,omitempty"`
+	Err     string            `cbor:"err,omitempty" json:"err,omitempty"`
+	Msg     string            `cbor:"msg,omitempty" json:"msg,omitempty"`
 }
 
 // Error codes used in AllocateResponse.Err. Wire-stable strings.

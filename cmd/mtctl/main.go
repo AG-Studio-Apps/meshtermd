@@ -47,6 +47,12 @@ func main() {
 		os.Exit(runNew(args))
 	case "status":
 		os.Exit(runStatus(args))
+	case "search":
+		os.Exit(runSearch(args))
+	case "doctor":
+		os.Exit(runDoctor(args))
+	case "tail":
+		os.Exit(runTail(args))
 	case "session-info":
 		os.Exit(runSessionInfo(args))
 	case "attach":
@@ -76,6 +82,9 @@ Subcommands:
   list               enumerate sessions on the remote daemon
   session-info       print one session's detail (attach state, geometry, idle)
   status             print the remote daemon's operational snapshot
+  search             regex-grep a session's scrollback ring
+  doctor             diagnose remote daemon / supervisor / unit-file / linger health
+  tail               passive-attach a session's live output (no input, no replay)
   new                create a new named session (does not attach)
   attach             attach to a session as your local terminal
   kill               reap a session by id or name

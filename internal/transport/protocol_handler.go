@@ -119,8 +119,11 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 	// Resolve the requested attach mode. Empty / unknown → exclusive
 	// (back-compat with v0 clients that don't set the field).
 	attachMode := session.AttachExclusive
-	if att.Mode == protocol.AttachModeReadonly {
+	switch att.Mode {
+	case protocol.AttachModeReadonly:
 		attachMode = session.AttachReadonly
+	case protocol.AttachModePassive:
+		attachMode = session.AttachPassive
 	}
 
 	// Lazy-spawn the PTY for sessions hydrated by LoadPersisted. The
@@ -147,9 +150,13 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 	// clobber the new owner (audit F4).
 	attachCtx, attachGen, err := sess.Acquire(ctx, attachMode)
 	if err != nil {
+		ackErr := protocol.AttachErrUnknownSession
+		if errors.Is(err, session.ErrPassiveCapacity) {
+			ackErr = protocol.AttachErrCapacity
+		}
 		_ = sendAttachAck(ctrl, protocol.AttachAck{
 			V:   1,
-			Err: protocol.AttachErrUnknownSession,
+			Err: ackErr,
 			Msg: err.Error(),
 		})
 		return
@@ -190,8 +197,11 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 	}
 
 	resolvedMode := protocol.AttachModeExclusive
-	if attachMode == session.AttachReadonly {
+	switch attachMode {
+	case session.AttachReadonly:
 		resolvedMode = protocol.AttachModeReadonly
+	case session.AttachPassive:
+		resolvedMode = protocol.AttachModePassive
 	}
 	ackBody, err := protocol.MarshalAttachAck(protocol.AttachAck{
 		V:         1,

@@ -242,6 +242,38 @@ func DecodeStatusResponse(body []byte) (StatusResponse, error) {
 	return resp, nil
 }
 
+// DecodeSessionSearchRequest decodes a frame body as a SessionSearchRequest.
+func DecodeSessionSearchRequest(body []byte) (SessionSearchRequest, error) {
+	t, err := PeekType(body)
+	if err != nil {
+		return SessionSearchRequest{}, err
+	}
+	if t != TypeSessionSearch {
+		return SessionSearchRequest{}, fmt.Errorf("expected SessionSearch frame, got %q", t)
+	}
+	var req SessionSearchRequest
+	if err := protocol.StrictDecMode.Unmarshal(body, &req); err != nil {
+		return SessionSearchRequest{}, err
+	}
+	return req, nil
+}
+
+// DecodeSessionSearchResponse mirrors DecodeSessionSearchRequest.
+func DecodeSessionSearchResponse(body []byte) (SessionSearchResponse, error) {
+	t, err := PeekType(body)
+	if err != nil {
+		return SessionSearchResponse{}, err
+	}
+	if t != TypeSessionSearch {
+		return SessionSearchResponse{}, fmt.Errorf("expected SessionSearch response, got %q", t)
+	}
+	var resp SessionSearchResponse
+	if err := protocol.StrictDecMode.Unmarshal(body, &resp); err != nil {
+		return SessionSearchResponse{}, err
+	}
+	return resp, nil
+}
+
 func cborMarshal(v any) ([]byte, error) {
 	em, err := cbor.CTAP2EncOptions().EncMode()
 	if err != nil {

@@ -109,6 +109,9 @@ func (s *systemdUser) unitPath() string {
 	return homePath(".config", "systemd", "user", "meshtermd.service")
 }
 
+// UnitPath exposes the unit-file location for the doctor command.
+func (s *systemdUser) UnitPath() string { return s.unitPath() }
+
 func userRuntimeDir() string {
 	if v := os.Getenv("XDG_RUNTIME_DIR"); v != "" {
 		return v

@@ -374,6 +374,150 @@ func TestAcquireMultipleReadonlyCoexist(t *testing.T) {
 	}
 }
 
+// TestAcquirePassiveDoesNotDisplace: a new passive Acquire must
+// neither cancel exclusive nor readonly co-attachers. Passive is the
+// invisible-tap mode.
+func TestAcquirePassiveDoesNotDisplace(t *testing.T) {
+	t.Parallel()
+	id, _ := NewSessionID()
+	pty := newFakePTY()
+	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
+	defer s.Close()
+
+	exclCtx, _, _ := s.Acquire(context.Background(), AttachExclusive)
+	roCtx, _, _ := s.Acquire(context.Background(), AttachReadonly)
+	passCtx, _, err := s.Acquire(context.Background(), AttachPassive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exclCtx.Err() != nil {
+		t.Error("exclusive cancelled by passive Acquire")
+	}
+	if roCtx.Err() != nil {
+		t.Error("readonly cancelled by passive Acquire")
+	}
+	if passCtx.Err() != nil {
+		t.Error("passive context cancelled at acquire time")
+	}
+}
+
+// TestAcquirePassiveInvisibleInAttachedModes: passive attachers must
+// NOT appear in AttachedModes() or PeerModes(). The whole point of
+// the mode is that other clients can't see the tap.
+func TestAcquirePassiveInvisibleInAttachedModes(t *testing.T) {
+	t.Parallel()
+	id, _ := NewSessionID()
+	pty := newFakePTY()
+	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
+	defer s.Close()
+
+	_, exclGen, _ := s.Acquire(context.Background(), AttachExclusive)
+	_, _, _ = s.Acquire(context.Background(), AttachPassive)
+	_, _, _ = s.Acquire(context.Background(), AttachPassive)
+
+	modes := s.AttachedModes()
+	if len(modes) != 1 || modes[0] != "exclusive" {
+		t.Errorf("AttachedModes with 2 passive + 1 exclusive = %v, want [exclusive]", modes)
+	}
+	peers := s.PeerModes(exclGen)
+	if len(peers) != 0 {
+		t.Errorf("PeerModes(exclusive) sees passive: %v, want []", peers)
+	}
+}
+
+// TestAcquirePassiveCapEnforced: MaxPassivePerSession concurrent
+// passive attaches succeed; the next one returns ErrPassiveCapacity.
+func TestAcquirePassiveCapEnforced(t *testing.T) {
+	t.Parallel()
+	id, _ := NewSessionID()
+	pty := newFakePTY()
+	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
+	defer s.Close()
+
+	gens := make([]uint64, 0, MaxPassivePerSession)
+	for i := 0; i < MaxPassivePerSession; i++ {
+		_, g, err := s.Acquire(context.Background(), AttachPassive)
+		if err != nil {
+			t.Fatalf("passive #%d unexpectedly failed: %v", i, err)
+		}
+		gens = append(gens, g)
+	}
+	_, _, err := s.Acquire(context.Background(), AttachPassive)
+	if !errors.Is(err, ErrPassiveCapacity) {
+		t.Errorf("passive overflow err = %v, want ErrPassiveCapacity", err)
+	}
+	// Releasing one should free up a slot.
+	s.Release(gens[0])
+	_, _, err = s.Acquire(context.Background(), AttachPassive)
+	if err != nil {
+		t.Errorf("passive after release unexpectedly failed: %v", err)
+	}
+}
+
+// TestExclusiveDoesNotDisplacePassive: replacing the exclusive client
+// must leave passive watchers intact (they're invisible by design;
+// turnover invisibility cuts both ways).
+func TestExclusiveDoesNotDisplacePassive(t *testing.T) {
+	t.Parallel()
+	id, _ := NewSessionID()
+	pty := newFakePTY()
+	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
+	defer s.Close()
+
+	_, _, _ = s.Acquire(context.Background(), AttachExclusive)
+	passCtx, _, _ := s.Acquire(context.Background(), AttachPassive)
+	// Displace the exclusive.
+	_, _, _ = s.Acquire(context.Background(), AttachExclusive)
+	// Passive must still be alive.
+	if passCtx.Err() != nil {
+		t.Error("passive context cancelled by exclusive turnover")
+	}
+}
+
+// TestReleasePassive: Release(gen) on a passive attacher must remove
+// it from the passive sibling slice without touching s.clients.
+func TestReleasePassive(t *testing.T) {
+	t.Parallel()
+	id, _ := NewSessionID()
+	pty := newFakePTY()
+	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
+	defer s.Close()
+
+	_, exclGen, _ := s.Acquire(context.Background(), AttachExclusive)
+	_, passGen, _ := s.Acquire(context.Background(), AttachPassive)
+
+	s.Release(passGen)
+
+	// Acquire another passive; the slot should be free.
+	_, _, err := s.Acquire(context.Background(), AttachPassive)
+	if err != nil {
+		t.Errorf("after Release(passive), new passive failed: %v", err)
+	}
+	// Exclusive still alive.
+	if peers := s.PeerModes(exclGen); len(peers) != 0 {
+		t.Errorf("PeerModes after Release(passive) = %v, want []", peers)
+	}
+}
+
+// TestClosePassiveContextsCancelled: Session.Close must cancel the
+// contexts of passive attachers, not just regular ones.
+func TestClosePassiveContextsCancelled(t *testing.T) {
+	t.Parallel()
+	id, _ := NewSessionID()
+	pty := newFakePTY()
+	s, _ := NewSession(id, "", pty, 24, 80, 1024, 0)
+
+	passCtx, _, _ := s.Acquire(context.Background(), AttachPassive)
+	_ = s.Close()
+
+	select {
+	case <-passCtx.Done():
+		// good
+	case <-time.After(100 * time.Millisecond):
+		t.Error("passive context not cancelled within 100ms of Close")
+	}
+}
+
 // TestReleaseRemovesSpecificClient: Release(gen) must affect only
 // the matching client; others stay attached.
 func TestReleaseRemovesSpecificClient(t *testing.T) {

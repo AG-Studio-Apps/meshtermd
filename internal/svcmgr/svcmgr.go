@@ -38,6 +38,12 @@ type Manager interface {
 	// file, plist, etc.) so future runs of Detect don't pick this
 	// manager back up. Returns nil if nothing to remove.
 	Remove(ctx context.Context) error
+	// UnitPath returns the on-disk path where this backend would
+	// store its unit / plist file, or "" for backends that don't
+	// have one (nohup). The path may not exist — callers asking
+	// "is the daemon under supervision?" should combine this with
+	// Available(ctx).
+	UnitPath() string
 }
 
 // ErrUnavailable is returned by Manager methods when the supervisor

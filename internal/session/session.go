@@ -36,7 +36,20 @@ const (
 	// connection down). Any number of readonly clients can coexist
 	// with each other and with a single exclusive client.
 	AttachReadonly
+
+	// AttachPassive is the invisible-tap mode. Like readonly —
+	// receives output, stdin/resize frames dropped — but invisible
+	// to AttachedModes / PeerModes. Capped at MaxPassivePerSession.
+	// See protocol.AttachModePassive for the wire-form rationale.
+	AttachPassive
 )
+
+// MaxPassivePerSession caps the number of concurrent passive
+// attachers per session. Resource defence; passive attaches are
+// cheap (one goroutine per stream, no PTY ownership) but unbounded
+// passive multi-attach would burn fds + goroutines on a runaway
+// `mtctl tail` loop.
+const MaxPassivePerSession = 8
 
 // String returns the wire form of an AttachMode for logging /
 // AttachAck.Mode echo. Mirrors protocol.AttachMode* constants.
@@ -44,6 +57,8 @@ func (m AttachMode) String() string {
 	switch m {
 	case AttachReadonly:
 		return "readonly"
+	case AttachPassive:
+		return "passive"
 	default:
 		return "exclusive"
 	}
@@ -178,6 +193,14 @@ type Session struct {
 	// shared-attach) and tmux-style co-equal pair-programming
 	// (Tier 2 — protocol headroom is reserved, semantics deferred).
 	clients []sessionClient
+
+	// passiveClients is the parallel slice for AttachPassive attachers.
+	// Kept separate so AttachedModes / PeerModes (which iterate only
+	// `clients`) automatically hide passive watchers — no per-call
+	// filtering needed. Capped at MaxPassivePerSession. Genshare the
+	// same nextGen counter so Release(gen) can be a single linear
+	// scan across both slices.
+	passiveClients []sessionClient
 
 	// nextGen monotonically counts attach calls. Each successful
 	// Acquire returns a fresh value; Release(gen) only removes the
@@ -521,12 +544,32 @@ func (s *Session) Acquire(parent context.Context, mode AttachMode) (context.Cont
 	if s.closed {
 		return nil, 0, ErrSessionClosed
 	}
+	if mode == AttachPassive {
+		// Passive attaches live in a sibling slice so they're
+		// invisible to AttachedModes / PeerModes by construction.
+		// Cap enforced here so the transport layer doesn't need to
+		// peek into Session internals.
+		if len(s.passiveClients) >= MaxPassivePerSession {
+			return nil, 0, ErrPassiveCapacity
+		}
+		s.nextGen++
+		gen := s.nextGen
+		ctx, cancel := context.WithCancel(parent)
+		s.passiveClients = append(s.passiveClients, sessionClient{
+			gen:    gen,
+			mode:   mode,
+			cancel: cancel,
+		})
+		s.lastActiveAt = time.Now()
+		return ctx, gen, nil
+	}
 	if mode == AttachExclusive {
 		// Displace any current exclusive client. We collect the
 		// cancel funcs first, drop the displaced entries from the
 		// slice, then call cancels OUTSIDE the lock so the
 		// displaced goroutines' Release call doesn't deadlock on
-		// our mu.
+		// our mu. Passive attachers are untouched — exclusive
+		// turnover is invisible to them.
 		kept := s.clients[:0]
 		var doomed []context.CancelFunc
 		for _, c := range s.clients {
@@ -568,6 +611,13 @@ func (s *Session) Release(gen uint64) {
 	for i, c := range s.clients {
 		if c.gen == gen {
 			s.clients = append(s.clients[:i], s.clients[i+1:]...)
+			return
+		}
+	}
+	// Passive clients live in a parallel slice; check it too.
+	for i, c := range s.passiveClients {
+		if c.gen == gen {
+			s.passiveClients = append(s.passiveClients[:i], s.passiveClients[i+1:]...)
 			return
 		}
 	}
@@ -679,11 +729,15 @@ func (s *Session) Close() error {
 	// Snapshot cancel funcs and clear the slice — we'll fire them
 	// outside the lock so a goroutine's Release-on-exit doesn't
 	// deadlock on us.
-	cancels := make([]context.CancelFunc, 0, len(s.clients))
+	cancels := make([]context.CancelFunc, 0, len(s.clients)+len(s.passiveClients))
 	for _, c := range s.clients {
 		cancels = append(cancels, c.cancel)
 	}
+	for _, c := range s.passiveClients {
+		cancels = append(cancels, c.cancel)
+	}
 	s.clients = nil
+	s.passiveClients = nil
 	s.mu.Unlock()
 
 	// Synchronously stop the flusher BEFORE closing the PTY. This
@@ -727,11 +781,15 @@ func (s *Session) Kill() error {
 	}
 	s.closed = true
 	pty := s.pty
-	cancels := make([]context.CancelFunc, 0, len(s.clients))
+	cancels := make([]context.CancelFunc, 0, len(s.clients)+len(s.passiveClients))
 	for _, c := range s.clients {
 		cancels = append(cancels, c.cancel)
 	}
+	for _, c := range s.passiveClients {
+		cancels = append(cancels, c.cancel)
+	}
 	s.clients = nil
+	s.passiveClients = nil
 	s.mu.Unlock()
 
 	s.stopFlusher()
@@ -958,3 +1016,8 @@ func (s *Session) Pump() {
 
 // ErrSessionClosed is returned by methods invoked after Close.
 var ErrSessionClosed = errors.New("session is closed")
+
+// ErrPassiveCapacity is returned by Acquire(AttachPassive) when the
+// session already has MaxPassivePerSession passive watchers. Transport
+// layer maps this to AttachAck.Err = AttachErrCapacity on the wire.
+var ErrPassiveCapacity = errors.New("session passive-attach capacity reached")

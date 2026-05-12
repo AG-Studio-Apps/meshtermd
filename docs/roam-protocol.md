@@ -490,6 +490,78 @@ must accept that any in-flight session is lost. Reattach-style
 persistence works **across QUIC drops** (network roam, app
 foreground/background, force-quit), not across daemon process death.
 
+## 14b. v0.6.2 wire additions (backwards-compat)
+
+The v0.6.2 daemon release added the following without bumping the
+ALPN. Older clients ignore the new constants and types; older
+daemons reject the new IPC requests with `ErrBadRequest`, which
+new clients surface as "requires meshtermd v0.6.2+".
+
+### AttachModePassive
+
+`Attach.Mode = "passive"` is a third attach mode alongside
+`"exclusive"` and `"readonly"`. Semantics:
+
+- Receives `Stdout` frames identical to `readonly` clients.
+- Stdin and Resize frames from passive clients are silently dropped
+  by the daemon (same enforcement path as `readonly`).
+- **Invisible to other clients:** passive attachers do NOT appear in
+  `SessionInfo.AttachedModes` (the inventory shown to `mtctl list` /
+  `meshtermd list --json` / iOS pickers) and do NOT appear in
+  `AttachAck.Peers` reported to co-attached clients.
+- Up to `MaxPassivePerSession` (8) concurrent passive attachers per
+  session; overflow returns `AttachAck.Err = AttachErrCapacity`.
+- Passive attaches don't displace anyone; an exclusive replacement
+  doesn't kick passive watchers off.
+
+Use case: `mtctl tail <session>` — observe a session's live byte
+stream without taking an attach slot the user's other tools render.
+
+### IPC: TypeSessionSearch
+
+New IPC request/response pair on the unix socket. Older daemons
+respond with `ErrBadRequest`; clients should surface that as a
+"requires meshtermd v0.6.2+" notice.
+
+```
+SessionSearchRequest = {
+  "t":   "SessionSearch",
+  "sel": "<hex-id-or-name>",
+  "pat": "<go-re2-regex>",      // ≤ 1024 bytes
+  "max": <int>,                  // 0 = daemon default (10,000)
+  "anc": <bool>                  // true → wrap in (?m:…)
+}
+
+SearchMatchInfo = {
+  "ss": <uint64>,   // start_seq (monotonic byte position)
+  "es": <uint64>,   // end_seq
+  "l":  "<line>",   // full line containing the match
+  "n":  <int>       // 0-based line index within retained scrollback
+}
+
+SessionSearchResponse = {
+  "t":   "SessionSearch",
+  "ok":  <bool>,
+  "m":   [<SearchMatchInfo>...],  // empty when no matches
+  "err": "<error-code>",          // only when !ok
+  "msg": "<human-readable>"       // only when !ok
+}
+```
+
+Anchors (`^`, `$`) follow Go RE2 semantics: by default they match
+start-of-input / end-of-input. The `anc` flag wraps the pattern in
+a `(?m:…)` non-capturing group so `^`/`$` track physical newlines.
+The truncated start of the ring is NOT treated as `^` — the buffer's
+first retained byte may be mid-line.
+
+### Doctor command
+
+`meshtermd doctor` is a pure-local CLI subcommand on the daemon
+binary; not an IPC type. It composes the existing `Status` IPC call
+with local-host introspection (svcmgr backend, unit-file parse,
+linger via `loginctl`). The `--json` output shape is stable for iOS
++ mtctl consumption. No wire protocol changes.
+
 ## 15. Open questions for v0 → v1
 
 - Should `EchoConfirm` carry stdin_seq for client-side echo prediction synchronisation? (Currently reserved.)

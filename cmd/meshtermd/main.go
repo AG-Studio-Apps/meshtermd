@@ -50,6 +50,10 @@ func main() {
 		os.Exit(runSessionInfo(args))
 	case "status":
 		os.Exit(runStatus(args))
+	case "session-search":
+		os.Exit(runSessionSearch(args))
+	case "doctor":
+		os.Exit(runDoctor(args))
 	case "update":
 		os.Exit(runUpdate(args))
 	case "restart":
@@ -83,6 +87,8 @@ Subcommands:
   kill               reap a session by id or name
   rename             change a session's user-visible name (PTY + buffer unaffected)
   status             print the daemon's operational snapshot (--json for tooling)
+  session-search     regex-grep a session's scrollback ring (--json for tooling)
+  doctor             diagnose daemon / supervisor / unit-file / linger health (--json for tooling)
   update             check for / apply a signed self-update from GitHub Releases
   restart            cycle the daemon via the detected supervisor (sessions survive)
   uninstall          remove the daemon, supervisor unit, and (optionally) state

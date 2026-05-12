@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"regexp"
 	"sync"
 	"time"
 
@@ -373,6 +374,11 @@ const (
 	maxShellLen     = 4 * 1024   // Path to a shell binary; longer than this is pathological.
 	maxExecJoinLen  = 16 * 1024  // Total bytes across all Exec[] joined by spaces.
 	maxExecArgCount = 128        // Cap individual element count too — argv length is finite in practice.
+
+	// maxSearchPatternLen caps the regex source length on SessionSearchRequest.
+	// Go RE2 compile time is bounded but not free; a 1 KiB ceiling is well
+	// above any human-typed pattern and rules out pathological compiles.
+	maxSearchPatternLen = 1024
 )
 
 func (d *Daemon) HandleAllocate(ctx context.Context, req ipc.AllocateRequest) ipc.AllocateResponse {
@@ -528,6 +534,64 @@ func (d *Daemon) HandleKillSession(ctx context.Context, req ipc.KillSessionReque
 	d.registry.Remove(id)
 	d.logger.Info("session killed", "session", id.String(), "name", req.Sel, "by", "name")
 	return ipc.KillSessionResponse{Ok: true}
+}
+
+// HandleSessionSearch scans the named session's scrollback ring for
+// regex matches. Selector resolution mirrors HandleKillSession: parse
+// as hex SessionID first, then fall back to LookupByName.
+//
+// The regex is compiled here (not on the wire) so the daemon enforces
+// the size cap + RE2 semantics. Anchored=true wraps the pattern in a
+// (?m:…) non-capturing group so ^/$ match physical newlines without
+// disturbing any flags the caller embedded.
+func (d *Daemon) HandleSessionSearch(_ context.Context, req ipc.SessionSearchRequest) ipc.SessionSearchResponse {
+	if req.Sel == "" {
+		return ipc.SessionSearchResponse{Ok: false, Err: ipc.ErrBadRequest, Msg: "selector required"}
+	}
+	if req.Pattern == "" {
+		return ipc.SessionSearchResponse{Ok: false, Err: ipc.ErrBadRequest, Msg: "pattern required"}
+	}
+	if len(req.Pattern) > maxSearchPatternLen {
+		return ipc.SessionSearchResponse{Ok: false, Err: ipc.ErrBadRequest,
+			Msg: fmt.Sprintf("pattern exceeds %d bytes", maxSearchPatternLen)}
+	}
+
+	src := req.Pattern
+	if req.Anchored {
+		src = "(?m:" + src + ")"
+	}
+	re, err := regexp.Compile(src)
+	if err != nil {
+		return ipc.SessionSearchResponse{Ok: false, Err: ipc.ErrBadRequest,
+			Msg: "compile pattern: " + err.Error()}
+	}
+
+	sess, err := d.resolveSessionBySelector(req.Sel)
+	if err != nil {
+		return ipc.SessionSearchResponse{Ok: false, Err: ipc.ErrUnknownSession, Msg: err.Error()}
+	}
+
+	hits := sess.Buffer().Search(re, session.SearchOpts{MaxMatches: req.MaxMatches})
+	infos := make([]ipc.SearchMatchInfo, len(hits))
+	for i, h := range hits {
+		infos[i] = ipc.SearchMatchInfo{
+			StartSeq: h.StartSeq,
+			EndSeq:   h.EndSeq,
+			Line:     h.Line,
+			LineNum:  h.LineNum,
+		}
+	}
+	return ipc.SessionSearchResponse{Ok: true, Matches: infos}
+}
+
+// resolveSessionBySelector returns the session named by sel, applying
+// the id-or-name fallback used by Kill, Rename, and SessionSearch.
+// Tries hex SessionID parse first; on parse failure, looks up by name.
+func (d *Daemon) resolveSessionBySelector(sel string) (*session.Session, error) {
+	if sid, err := session.ParseSessionID(sel); err == nil {
+		return d.registry.Lookup(sid)
+	}
+	return d.registry.LookupByName(sel)
 }
 
 // lookupOrCreateSession returns the session referenced by req. The

@@ -79,3 +79,6 @@ func (l *launchd) Remove(ctx context.Context) error {
 func (l *launchd) plistPath() string {
 	return homePath("Library", "LaunchAgents", launchdLabel+".plist")
 }
+
+// UnitPath exposes the plist location for the doctor command.
+func (l *launchd) UnitPath() string { return l.plistPath() }

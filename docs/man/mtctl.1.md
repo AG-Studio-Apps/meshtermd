@@ -60,6 +60,30 @@ needs to be running on the remote host; **mtctl** is a client only.
     original session was created with. Type `~.` on a fresh line to
     detach; the remote shell stays alive on the daemon.
 
+**tail** [**\-\-host** *user@host*] [**\-\-timeout** *DUR*] *id-or-name*
+:   Passive-attach a session's live output — receives bytes only,
+    sends nothing, leaves the local terminal in cooked mode so the
+    invocation can be piped (`mtctl tail dev | grep ERROR`). Unlike
+    **attach**, **tail** does NOT create-if-missing — it refuses
+    unknown selectors so a typo can't spawn a phantom shell. The
+    passive mode is invisible to other clients (doesn't appear in
+    **list**'s `AttachedModes`). Up to 8 passive attachers per
+    session, daemon-enforced. Exit on Ctrl-C, peer close, or read
+    error.
+
+**search** [**\-\-host** *user@host*] [**\-\-json**] [**\-\-max** *N*] [**\-\-anchored**] *id-or-name* *regex*
+:   Regex-grep a session's scrollback ring. SSH-wraps **meshtermd
+    session-search**(8); see that man-page entry for pattern
+    semantics. **\-\-anchored** wraps the pattern in `(?m:…)` for
+    line-wise `^`/`$`. **\-\-max** caps result count (default 100).
+
+**doctor** [**\-\-host** *user@host*] [**\-\-json**] [**\-\-timeout** *DUR*]
+:   Diagnose the remote daemon. Runs **meshtermd doctor --json** over
+    SSH, then adds the laptop-side checks: SSH reachability
+    (implicit), mtctl-vs-daemon version skew. Exit 0 on a clean
+    report, 1 if any warning surfaced (daemon down, unit-file
+    misconfigured, linger disabled, version skew).
+
 **kill** [**\-\-host** *user@host*] *id-or-name*
 :   Reap a session by SessionID or by user-visible Name. Glob patterns
     (`*`, `?`, `[...]`) and **\-\-all** are supported.

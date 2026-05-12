@@ -92,8 +92,8 @@ func readPump(ctx context.Context, sess *session.Session, s *quic.Stream, write 
 		}
 		switch frameType {
 		case protocol.FrameTypeStdin:
-			if mode == session.AttachReadonly {
-				continue // silently drop; readonly clients can't drive the shell
+			if mode != session.AttachExclusive {
+				continue // silently drop; only exclusive clients drive the shell
 			}
 			if len(body) > 0 {
 				if _, werr := sess.WriteStdin(body); werr != nil {
@@ -133,10 +133,10 @@ func handleControlFrame(sess *session.Session, body []byte, write frameWriter, m
 		// v0: informational only.
 		return nil
 	case protocol.TypeResize:
-		// Readonly clients can't change PTY size — the exclusive
-		// client owns geometry. Drop silently rather than tearing
-		// the connection down.
-		if mode == session.AttachReadonly {
+		// Only exclusive clients change PTY size — they own
+		// geometry. Readonly and passive clients' Resize frames are
+		// dropped silently rather than tearing the connection down.
+		if mode != session.AttachExclusive {
 			return nil
 		}
 		var m protocol.Resize

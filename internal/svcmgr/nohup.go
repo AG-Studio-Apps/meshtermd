@@ -121,3 +121,6 @@ func (n *nohup) Restart(ctx context.Context, binPath string) error {
 }
 
 func (n *nohup) Remove(ctx context.Context) error { return nil }
+
+// UnitPath returns "" because nohup has no unit/plist on disk.
+func (n *nohup) UnitPath() string { return "" }

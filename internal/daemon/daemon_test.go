@@ -904,6 +904,137 @@ func TestDaemonKillSessionByID(t *testing.T) {
 	}
 }
 
+// TestDaemonSessionSearchByName covers the end-to-end IPC flow for
+// regex-grepping a session's scrollback ring. Allocates a session,
+// writes payload directly into the buffer (no shell needed), then
+// fires SessionSearch via the client and verifies matches.
+func TestDaemonSessionSearchByName(t *testing.T) {
+	t.Parallel()
+	d, c, cleanup := startDaemon(t)
+	defer cleanup()
+
+	created, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID: "new", Name: "grepme",
+		Shell: "/bin/sh", Exec: []string{"-c", "while true; do sleep 1; done"},
+	})
+	if err != nil || !created.Ok {
+		t.Fatalf("allocate: %v %s", err, created.Err)
+	}
+	sid, err := session.ParseSessionID(created.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := d.registry.Lookup(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const payload = "line one\nERROR: something broke\nline three\nERROR: again\nline five\n"
+	if _, err := sess.Buffer().Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := c.SessionSearch(context.Background(), ipc.SessionSearchRequest{
+		Sel: "grepme", Pattern: "ERROR",
+	})
+	if err != nil || !resp.Ok {
+		t.Fatalf("search: err=%v ok=%v err=%s msg=%s", err, resp.Ok, resp.Err, resp.Msg)
+	}
+	if len(resp.Matches) != 2 {
+		t.Fatalf("matches = %d, want 2 (%+v)", len(resp.Matches), resp.Matches)
+	}
+	if resp.Matches[0].Line != "ERROR: something broke" {
+		t.Errorf("matches[0].Line = %q, want %q", resp.Matches[0].Line, "ERROR: something broke")
+	}
+	if resp.Matches[1].LineNum != 3 {
+		t.Errorf("matches[1].LineNum = %d, want 3", resp.Matches[1].LineNum)
+	}
+}
+
+// TestDaemonSessionSearchAnchoredFlag verifies the --anchored wrap.
+// Without (?m), ^ERROR matches nothing because ^ is start-of-input;
+// with Anchored=true the daemon wraps in (?m:…) and ^/$ track lines.
+func TestDaemonSessionSearchAnchoredFlag(t *testing.T) {
+	t.Parallel()
+	d, c, cleanup := startDaemon(t)
+	defer cleanup()
+
+	created, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID: "new", Name: "anchored",
+		Shell: "/bin/sh", Exec: []string{"-c", "while true; do sleep 1; done"},
+	})
+	if err != nil || !created.Ok {
+		t.Fatalf("allocate: %v %s", err, created.Err)
+	}
+	sid, _ := session.ParseSessionID(created.SessionID)
+	sess, _ := d.registry.Lookup(sid)
+	_, _ = sess.Buffer().Write([]byte("first line\nERROR here\nstill ERROR\n"))
+
+	plain, err := c.SessionSearch(context.Background(), ipc.SessionSearchRequest{
+		Sel: "anchored", Pattern: "^ERROR",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plain.Matches) != 0 {
+		t.Errorf("plain ^ERROR matches = %d, want 0", len(plain.Matches))
+	}
+
+	anc, err := c.SessionSearch(context.Background(), ipc.SessionSearchRequest{
+		Sel: "anchored", Pattern: "^ERROR", Anchored: true,
+	})
+	if err != nil || !anc.Ok {
+		t.Fatalf("anchored search: %v %s", err, anc.Err)
+	}
+	if len(anc.Matches) != 1 {
+		t.Errorf("anchored ^ERROR matches = %d, want 1 (%+v)", len(anc.Matches), anc.Matches)
+	}
+}
+
+// TestDaemonSessionSearchBadPattern checks the daemon's regex compile
+// path: an invalid regex yields Ok=false / ErrBadRequest, not a crash.
+func TestDaemonSessionSearchBadPattern(t *testing.T) {
+	t.Parallel()
+	d, c, cleanup := startDaemon(t)
+	defer cleanup()
+
+	_, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID: "new", Name: "badpat",
+		Shell: "/bin/sh", Exec: []string{"-c", "while true; do sleep 1; done"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = d // unused
+
+	resp, err := c.SessionSearch(context.Background(), ipc.SessionSearchRequest{
+		Sel: "badpat", Pattern: "[unterminated",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Ok || resp.Err != ipc.ErrBadRequest {
+		t.Errorf("got Ok=%v Err=%q, want Ok=false Err=%q", resp.Ok, resp.Err, ipc.ErrBadRequest)
+	}
+}
+
+// TestDaemonSessionSearchUnknownSession verifies the id-or-name miss
+// path returns ErrUnknownSession.
+func TestDaemonSessionSearchUnknownSession(t *testing.T) {
+	t.Parallel()
+	_, c, cleanup := startDaemon(t)
+	defer cleanup()
+
+	resp, err := c.SessionSearch(context.Background(), ipc.SessionSearchRequest{
+		Sel: "does-not-exist", Pattern: "anything",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Ok || resp.Err != ipc.ErrUnknownSession {
+		t.Errorf("got Ok=%v Err=%q, want Ok=false Err=%q", resp.Ok, resp.Err, ipc.ErrUnknownSession)
+	}
+}
+
 func TestDaemonClientReportsDaemonNotRunning(t *testing.T) {
 	t.Parallel()
 	c := ipc.NewClient(filepath.Join(t.TempDir(), "no-daemon.sock"), 100*time.Millisecond)

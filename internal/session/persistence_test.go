@@ -98,6 +98,50 @@ func TestSaveToAndLoadPersistedRoundTrip(t *testing.T) {
 	}
 }
 
+// TestLastSidecarSeqRoundTrip checks that Session.lastSidecarSeq is
+// persisted to meta.cbor and restored across LoadPersisted — the
+// daemon needs this watermark to send FrameResume(from_seq) on
+// reattach without re-consuming bytes already in the daemon ring.
+func TestLastSidecarSeqRoundTrip(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	original := makePersistedSession(t, []byte("x"))
+	original.AdvanceSidecarSeq(987654321)
+	if err := original.SaveTo(dir); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+
+	reg := NewRegistry(0, time.Hour, time.Hour, 0)
+	if _, err := LoadPersisted(dir, reg, nullLogger()); err != nil {
+		t.Fatalf("LoadPersisted: %v", err)
+	}
+	restored, err := reg.Lookup(original.ID())
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if got := restored.LastSidecarSeq(); got != 987654321 {
+		t.Errorf("LastSidecarSeq round-trip: want 987654321, got %d", got)
+	}
+}
+
+// TestAdvanceSidecarSeqMonotonic verifies that AdvanceSidecarSeq is
+// a monotonic watermark — older values do not regress lastSidecarSeq.
+// The Pump's coalesced-ack flow can otherwise advance the watermark
+// out of order if a stale frame slips through.
+func TestAdvanceSidecarSeqMonotonic(t *testing.T) {
+	t.Parallel()
+	s := makePersistedSession(t, nil)
+	s.AdvanceSidecarSeq(100)
+	s.AdvanceSidecarSeq(50)
+	if got := s.LastSidecarSeq(); got != 100 {
+		t.Errorf("monotonic: regressed to %d, want 100", got)
+	}
+	s.AdvanceSidecarSeq(200)
+	if got := s.LastSidecarSeq(); got != 200 {
+		t.Errorf("advance: want 200, got %d", got)
+	}
+}
+
 // TestSaveToNoOpWhenNotPersisting verifies that calling SaveTo on a
 // session whose persist flag is false is harmless — no dir created.
 // The flusher relies on this guard so callers don't have to.

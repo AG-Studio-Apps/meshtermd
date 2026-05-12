@@ -51,6 +51,14 @@ type persistedSessionMeta struct {
 	HeadSeq       uint64 `cbor:"head_seq"`
 	WritePos      int    `cbor:"write_pos"`
 	Full          bool   `cbor:"full,omitempty"`
+
+	// LastConsumedSidecarSeq is the highest sidecar-side outSeq the
+	// daemon has durably committed to its session ring before this
+	// snapshot. On daemon startup, the discovery path sends
+	// FrameResume(LastConsumedSidecarSeq+1) to the sidecar so already-
+	// committed bytes don't get replayed (and re-numbered) into the
+	// daemon ring. Optional — pre-v0.6 sessions stored zero.
+	LastConsumedSidecarSeq uint64 `cbor:"lcs,omitempty"`
 }
 
 // SaveTo writes the session's metadata + ring-buffer bytes to a
@@ -76,19 +84,20 @@ func (s *Session) SaveTo(parentDir string) error {
 
 	s.mu.Lock()
 	meta := persistedSessionMeta{
-		FormatVersion: persistenceFormatVersion,
-		SessionID:     append([]byte(nil), s.id[:]...),
-		Name:          s.name,
-		CreatedNs:     s.created.UnixNano(),
-		LastActiveNs:  s.lastActiveAt.UnixNano(),
-		Rows:          s.rows,
-		Cols:          s.cols,
-		IdleTimeoutNs: int64(s.idleTimeout),
-		Persist:       s.persist,
-		BufCapacity:   len(bufBytes),
-		HeadSeq:       headSeq,
-		WritePos:      writePos,
-		Full:          full,
+		FormatVersion:          persistenceFormatVersion,
+		SessionID:              append([]byte(nil), s.id[:]...),
+		Name:                   s.name,
+		CreatedNs:              s.created.UnixNano(),
+		LastActiveNs:           s.lastActiveAt.UnixNano(),
+		Rows:                   s.rows,
+		Cols:                   s.cols,
+		IdleTimeoutNs:          int64(s.idleTimeout),
+		Persist:                s.persist,
+		BufCapacity:            len(bufBytes),
+		HeadSeq:                headSeq,
+		WritePos:               writePos,
+		Full:                   full,
+		LastConsumedSidecarSeq: s.lastSidecarSeq,
 	}
 	s.mu.Unlock()
 
@@ -265,6 +274,7 @@ func loadSessionFromDir(dir string, now time.Time, logger *slog.Logger) (*Sessio
 		lastActiveAt:     time.Unix(0, meta.LastActiveNs),
 		persist:          meta.Persist,
 		lastSnapshotSeq:  meta.HeadSeq,
+		lastSidecarSeq:   meta.LastConsumedSidecarSeq,
 		restoredFromDisk: true,
 	}
 	return s, nil

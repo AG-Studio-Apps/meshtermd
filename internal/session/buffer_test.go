@@ -375,3 +375,75 @@ func TestWaitForDataLoopsAfterIrrelevantNotify(t *testing.T) {
 		t.Fatal("WaitForData did not return after head advanced past target")
 	}
 }
+
+func TestAdvanceWithGapZeroIsNoOp(t *testing.T) {
+	r, err := NewRingBuffer(16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Write([]byte("hello"))
+	before := r.HeadSeq()
+	r.AdvanceWithGap(0)
+	if r.HeadSeq() != before {
+		t.Errorf("AdvanceWithGap(0) advanced head: before=%d after=%d", before, r.HeadSeq())
+	}
+}
+
+func TestAdvanceWithGapAdvancesHeadSeq(t *testing.T) {
+	r, _ := NewRingBuffer(16)
+	r.Write([]byte("abc")) // headSeq=3
+	r.AdvanceWithGap(7)    // headSeq=10
+	if r.HeadSeq() != 10 {
+		t.Errorf("HeadSeq after AdvanceWithGap(7): want 10, got %d", r.HeadSeq())
+	}
+	data, newSeq, trunc := r.ReadSince(3, 0)
+	if newSeq != 10 || trunc {
+		t.Errorf("ReadSince(3): newSeq=%d trunc=%v", newSeq, trunc)
+	}
+	if len(data) != 7 {
+		t.Errorf("ReadSince(3) data length: want 7 (gap-zeros), got %d", len(data))
+	}
+	// The gap bytes should be zeroes (not stale).
+	for i, b := range data {
+		if b != 0 {
+			t.Errorf("gap byte %d is non-zero: 0x%02x", i, b)
+			break
+		}
+	}
+}
+
+func TestAdvanceWithGapBeyondCapacityRotatesRing(t *testing.T) {
+	r, _ := NewRingBuffer(8)
+	r.Write([]byte("ABCDEFGH")) // headSeq=8, ring full
+	r.AdvanceWithGap(100)       // headSeq=108
+	if r.HeadSeq() != 108 {
+		t.Errorf("HeadSeq: want 108, got %d", r.HeadSeq())
+	}
+	_, _, trunc := r.ReadSince(5, 0)
+	if !trunc {
+		t.Error("ReadSince(5) should report truncated after huge gap")
+	}
+	r.Write([]byte("NEW"))
+	if r.HeadSeq() != 111 {
+		t.Errorf("HeadSeq after Write: want 111, got %d", r.HeadSeq())
+	}
+}
+
+func TestAdvanceWithGapWakesWaitForData(t *testing.T) {
+	r, _ := NewRingBuffer(16)
+	r.Write([]byte("a"))
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		_, _ = r.WaitForData(ctx, 1)
+		close(done)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	r.AdvanceWithGap(10)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("WaitForData was not woken by AdvanceWithGap")
+	}
+}

@@ -193,6 +193,14 @@ type Session struct {
 	// another attempt on the next tick).
 	lastSnapshotSeq uint64
 
+	// lastSidecarSeq is the highest sidecar-side outSeq the daemon
+	// has durably committed to this session's ring. Persisted in
+	// meta.cbor; consulted by the discovery path to compute the
+	// FrameResume(from_seq) the daemon sends to a reattached sidecar.
+	// Advanced by Pump on every successful buf.Write — protected by
+	// s.mu.
+	lastSidecarSeq uint64
+
 	// restoredFromDisk is true when this Session was hydrated from
 	// on-disk state at daemon startup (LoadPersisted), rather than
 	// freshly spawned. Cleared the first time a client successfully
@@ -228,6 +236,29 @@ type Session struct {
 // when this field is zero. Pass an explicit duration to give this
 // session a per-session lifetime independent of the daemon-wide
 // default.
+// LastSidecarSeq returns the highest sidecar outSeq the daemon has
+// durably committed to this session's ring. Used by the discovery
+// path to compute the FrameResume(from_seq) sent to a reattached
+// sidecar. Returns 0 for fresh sessions (no sidecar bytes consumed
+// yet) and for sessions hydrated from pre-v0.6 meta.cbor (which
+// didn't carry the lcs field).
+func (s *Session) LastSidecarSeq() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastSidecarSeq
+}
+
+// AdvanceSidecarSeq updates the watermark monotonically. No-op for
+// values older than the current. Called by Pump after a successful
+// buf.Write; coalesced via Pump's own ack thresholds.
+func (s *Session) AdvanceSidecarSeq(seq uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if seq > s.lastSidecarSeq {
+		s.lastSidecarSeq = seq
+	}
+}
+
 // SetPersist sets whether this session should be snapshotted to disk.
 // Used by the daemon when spawning a session (after resolving the
 // client-requested value against the daemon-wide default) and by

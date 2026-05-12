@@ -207,6 +207,52 @@ func (r *RingBuffer) Snapshot() (buf []byte, writePos int, headSeq uint64, full 
 	return out, r.writePos, r.headSeq, r.full
 }
 
+// AdvanceWithGap advances headSeq by n without writing any payload
+// bytes — used when the sidecar reports a Trunc-before-frame to
+// indicate bytes were silently dropped between drains. The slots
+// that conceptually represent the lost span are zeroed so a future
+// ReadSince in that range doesn't surface stale data; the wrapped
+// tail (when full) advances naturally past the gap.
+//
+// n == 0 is a no-op. n >= Capacity() rotates the whole ring to a
+// "fresh gap" state. WaitForData is woken so consumers stop waiting
+// for a head that has now advanced.
+func (r *RingBuffer) AdvanceWithGap(n uint64) {
+	if n == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	capn := len(r.buf)
+	if n >= uint64(capn) {
+		clear(r.buf)
+		r.writePos = 0
+		r.full = true
+		r.headSeq += n
+	} else {
+		remaining := int(n)
+		pos := r.writePos
+		for remaining > 0 {
+			room := capn - pos
+			if room > remaining {
+				room = remaining
+			}
+			clear(r.buf[pos : pos+room])
+			pos += room
+			if pos == capn {
+				pos = 0
+				r.full = true
+			}
+			remaining -= room
+		}
+		r.writePos = pos
+		r.headSeq += n
+	}
+	old := r.notify
+	r.notify = make(chan struct{})
+	close(old)
+}
+
 // RestoreFromSnapshot rebuilds the buffer's FIFO state from a prior
 // Snapshot. The byte slice must be exactly Capacity() long — same as
 // the buffer was allocated with — otherwise the geometry assertions

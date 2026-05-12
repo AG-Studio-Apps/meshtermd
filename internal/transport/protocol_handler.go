@@ -213,6 +213,7 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 		Mode:      resolvedMode,
 		Peers:     sess.PeerModes(attachGen),
 		Restored:  wasRestored,
+		RTTNanos:  conn.ConnectionStats().SmoothedRTT.Nanoseconds(),
 	})
 	if err != nil {
 		log.WarnContext(ctx, "marshal AttachAck", "err", err)
@@ -247,7 +248,36 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 	defer pumpsCancel()
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
+
+	// RTT notify: every 5 seconds while attached, emit an RTTNotify
+	// control frame with quic-go's smoothed-RTT estimate. Clients drive
+	// `--predict=adaptive` thresholds + `~?` info display from this.
+	// One ticker per attach — RTT can drift independently per path,
+	// and the per-client cost is one syscall + one frame every 5s.
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pumpsCtx.Done():
+				return
+			case <-ticker.C:
+				rtt := conn.ConnectionStats().SmoothedRTT.Nanoseconds()
+				if rtt <= 0 {
+					continue // handshake hasn't seeded the smoothing window yet
+				}
+				body, err := protocol.MarshalRTTNotify(protocol.RTTNotify{RTTNanos: rtt})
+				if err != nil {
+					continue
+				}
+				// Best-effort: write errors mean the connection is dying;
+				// other pumps will observe ctx.Done() shortly.
+				_ = writeFrame(protocol.FrameTypeControl, body)
+			}
+		}
+	}()
 
 	// Output pump: read from the session's ring buffer and emit
 	// FrameTypeStdout frames on the single stream.
@@ -281,9 +311,10 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 	// doesn't support tcgetattr (e.g., the pipe-backed test PTY).
 	go func() {
 		defer wg.Done()
-		sess.WatchEcho(pumpsCtx, session.DefaultEchoPollInterval, func(s session.EchoState) {
+		sess.WatchTermios(pumpsCtx, session.DefaultEchoPollInterval, func(s session.TermiosSnapshot) {
 			body, err := protocol.MarshalEchoConfirm(protocol.EchoConfirm{
-				EchoState: string(s),
+				EchoState: string(s.Echo),
+				CanonMode: s.Canon == session.EchoStateOn,
 			})
 			if err != nil {
 				return

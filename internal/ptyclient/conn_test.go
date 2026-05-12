@@ -124,12 +124,12 @@ func TestConnSetSizeEncodesResize(t *testing.T) {
 	}
 }
 
-func TestConnEchoEnabledCachesUpdates(t *testing.T) {
+func TestConnTermiosStateCachesUpdates(t *testing.T) {
 	conn, sidecar := pipePair(t)
 	// Background sidecar reader: drain every FrameQueryEcho and reply
-	// with EchoOn so the daemon's cache populates. Starts FIRST so
-	// the very first EchoEnabled call doesn't deadlock on the
-	// synchronous net.Pipe write.
+	// with [EchoOn, CanonOn] so the daemon's cache populates. Starts
+	// FIRST so the very first TermiosState call doesn't deadlock on
+	// the synchronous net.Pipe write.
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -145,7 +145,8 @@ func TestConnEchoEnabledCachesUpdates(t *testing.T) {
 			if err != nil {
 				continue
 			}
-			_ = ptysidecar.WriteFrame(sidecar, ptysidecar.FrameEchoState, []byte{ptysidecar.EchoOn})
+			_ = ptysidecar.WriteFrame(sidecar, ptysidecar.FrameEchoState,
+				[]byte{ptysidecar.EchoOn, ptysidecar.CanonOn})
 		}
 	}()
 	defer func() {
@@ -156,12 +157,57 @@ func TestConnEchoEnabledCachesUpdates(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if echo, ok := conn.EchoEnabled(); ok && echo {
+		if echo, canon, ok := conn.TermiosState(); ok && echo && canon {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("EchoEnabled did not see on=true within 2s")
+	t.Fatal("TermiosState did not see echo=on canon=on within 2s")
+}
+
+// TestConnTermiosStateLegacySidecarBodyLength1: a v0.6.x sidecar emits
+// only the echo byte (body len == 1). The v0.7+ daemon must treat
+// canon as Unknown in that case and return ok=false from TermiosState
+// (since we can't predict backspace without a definitive canon read).
+func TestConnTermiosStateLegacySidecarBodyLength1(t *testing.T) {
+	conn, sidecar := pipePair(t)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = sidecar.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+			_, _, err := ptysidecar.ReadFrame(sidecar)
+			if err != nil {
+				continue
+			}
+			// Legacy 1-byte body — only echo.
+			_ = ptysidecar.WriteFrame(sidecar, ptysidecar.FrameEchoState,
+				[]byte{ptysidecar.EchoOn})
+		}
+	}()
+	defer func() {
+		close(stop)
+		_ = sidecar.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+		<-done
+	}()
+
+	// Drive a few rounds to let the cache populate from the legacy body.
+	for i := 0; i < 5; i++ {
+		_, _, _ = conn.TermiosState()
+		time.Sleep(20 * time.Millisecond)
+	}
+	echo, canon, ok := conn.TermiosState()
+	if ok {
+		t.Errorf("ok=true with legacy 1-byte body; want false (canon unknown)")
+	}
+	_ = echo
+	_ = canon
 }
 
 func TestConnKillWritesDieNowThenCloses(t *testing.T) {

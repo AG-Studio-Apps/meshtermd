@@ -37,7 +37,7 @@ const (
 	FrameResume    FrameType = 0x06 // daemon → sidecar: [u64 from_seq] reposition read cursor
 
 	FrameStdout    FrameType = 0x10 // sidecar → daemon: [u64 first_byte_seq][u8 flags][N bytes]
-	FrameEchoState FrameType = 0x11 // sidecar → daemon: [u8 echo] 0=off 1=on 2=unknown
+	FrameEchoState FrameType = 0x11 // sidecar → daemon: [u8 echo][u8 canon?] (canon optional; 0=off 1=on 2=unknown)
 	FrameChildExit FrameType = 0x12 // sidecar → daemon: [i32 code][i32 signal]
 )
 
@@ -63,6 +63,18 @@ const (
 	EchoOff     byte = 0
 	EchoOn      byte = 1
 	EchoUnknown byte = 2
+)
+
+// CanonState wire values for FrameEchoState body[1] (v0.7.0+).
+// Same 0/1/2 mapping as EchoState. Body length ≥ 2 indicates the
+// sidecar is v0.7.0+; body length == 1 (legacy) means the daemon
+// should treat canon as Unknown. Daemons must tolerate both lengths
+// because a v0.7.0 daemon may reconnect to a sidecar spawned by an
+// older daemon during the upgrade window.
+const (
+	CanonOff     byte = 0
+	CanonOn      byte = 1
+	CanonUnknown byte = 2
 )
 
 // ErrFrameTooLarge is returned by ReadFrame when the length prefix

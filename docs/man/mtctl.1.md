@@ -52,13 +52,23 @@ needs to be running on the remote host; **mtctl** is a client only.
     for this specific session; absent means inherit the daemon
     default (typically on).
 
-**attach** [**\-\-host** *user@host*] [**\-\-mode** {*exclusive*|*readonly*}] [**\-\-persist** | **\-\-no-persist**] *id-or-name*
+**attach** [**\-\-host** *user@host*] [**\-\-mode** {*exclusive*|*readonly*}] [**\-\-predict** {*always*|*adaptive*|*never*}] [**\-\-persist** | **\-\-no-persist**] *id-or-name*
 :   Attach to a session as your local terminal. If the named session
     doesn't exist, **attach** creates it. Use **\-\-mode readonly** to
-    watch without sending input. **\-\-persist** / **\-\-no-persist**
-    apply only on fresh spawn — reattach inherits whatever the
-    original session was created with. Type `~.` on a fresh line to
-    detach; the remote shell stays alive on the daemon.
+    watch without sending input. **\-\-predict** controls predictive
+    local echo: *always* always underlines unconfirmed predictions,
+    *adaptive* (default) underlines only when smoothed RTT exceeds
+    ~80ms, *never* disables prediction entirely. **\-\-persist** /
+    **\-\-no-persist** apply only on fresh spawn — reattach inherits
+    whatever the original session was created with.
+
+    In an attached session, two escape chords are honoured on a
+    fresh line:
+
+    - `~.` — detach. Closes the QUIC connection cleanly; the remote
+      shell stays alive on the daemon.
+    - `~?` — print a one-shot info block to stderr: smoothed RTT,
+      session ID, attach mode, peer count.
 
 **tail** [**\-\-host** *user@host*] [**\-\-timeout** *DUR*] *id-or-name*
 :   Passive-attach a session's live output — receives bytes only,

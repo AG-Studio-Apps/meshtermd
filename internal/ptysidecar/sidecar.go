@@ -535,7 +535,7 @@ func startClientPumps(conn net.Conn, master *os.File, ring *Ring, log *slog.Logg
 				}
 				_ = cpty.Setsize(master, &cpty.Winsize{Rows: rows, Cols: cols})
 			case FrameQueryEcho:
-				_ = cp.writeFrame(FrameEchoState, []byte{readEchoState(master)})
+				_ = cp.writeFrame(FrameEchoState, readTermiosState(master))
 			case FrameAck:
 				seq, derr := DecodeSeq(body)
 				if derr != nil {
@@ -625,7 +625,7 @@ func peekResumeOrDispatch(conn net.Conn, master *os.File, ring *Ring, log *slog.
 		// Best-effort: write back echo state inline. Slightly
 		// duplicative with the post-pump reader path, but the
 		// alternative is a queued reply, which buys nothing.
-		_ = WriteFrame(conn, FrameEchoState, []byte{readEchoState(master)})
+		_ = WriteFrame(conn, FrameEchoState, readTermiosState(master))
 	case FrameDieNow:
 		// die_now on the first frame is unusual but legal — let
 		// startClientPumps' reader pick it up by returning the
@@ -638,7 +638,9 @@ func peekResumeOrDispatch(conn net.Conn, master *os.File, ring *Ring, log *slog.
 }
 
 // readEchoState issues a tcgetattr on the PTY master and reports the
-// slave-side ECHO flag for the wire (1=on, 0=off, 2=unknown).
+// slave-side ECHO flag for the wire (1=on, 0=off, 2=unknown). Kept
+// as a single-byte helper for any older call sites; new emits should
+// use readTermiosState which carries both ECHO + ICANON.
 func readEchoState(master *os.File) byte {
 	echo, ok := echoEnabled(master)
 	if !ok {
@@ -648,4 +650,28 @@ func readEchoState(master *os.File) byte {
 		return EchoOn
 	}
 	return EchoOff
+}
+
+// readTermiosState issues a single tcgetattr on the PTY master and
+// returns a 2-byte FrameEchoState body: [echo, canon]. v0.7.0+ wire
+// form. Daemons that decode only body[0] (v0.6.x) silently ignore
+// body[1]; daemons that decode body[1] when len == 1 should treat it
+// as CanonUnknown — see DecodeEchoStateBody.
+func readTermiosState(master *os.File) []byte {
+	echo, canon, ok := termiosFlags(master)
+	if !ok {
+		return []byte{EchoUnknown, CanonUnknown}
+	}
+	out := make([]byte, 2)
+	if echo {
+		out[0] = EchoOn
+	} else {
+		out[0] = EchoOff
+	}
+	if canon {
+		out[1] = CanonOn
+	} else {
+		out[1] = CanonOff
+	}
+	return out
 }

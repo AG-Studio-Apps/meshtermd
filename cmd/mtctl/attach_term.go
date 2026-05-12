@@ -130,13 +130,18 @@ func newEscapeWatcher() *escapeWatcher {
 }
 
 // process takes a slice of bytes read from local stdin and returns
-// the bytes that should be forwarded to the remote shell. If the
-// detach chord fires, `detach` is true and the bytes after the
-// chord (if any in this read) are dropped — the caller is about
-// to close the connection anyway.
-func (w *escapeWatcher) process(in []byte) (out []byte, detach bool) {
+// the bytes that should be forwarded to the remote shell.
+//
+//   - detach=true means the `~.` chord fired; bytes after the chord
+//     in this read are dropped (the caller is about to close the
+//     connection anyway).
+//   - info=true means the `~?` chord fired; processing continues
+//     (info is just a request for the caller to print connection
+//     metadata to stderr). Multiple `~?` in one read fold into one
+//     signal — caller debounces or doesn't, as it likes.
+func (w *escapeWatcher) process(in []byte) (out []byte, detach, info bool) {
 	if len(in) == 0 {
-		return nil, false
+		return nil, false, false
 	}
 	out = make([]byte, 0, len(in))
 	for _, b := range in {
@@ -157,7 +162,14 @@ func (w *escapeWatcher) process(in []byte) (out []byte, detach bool) {
 			case '.':
 				// Detach chord. Drop the ~ and the . — don't
 				// forward, signal upward.
-				return out, true
+				return out, true, info
+			case '?':
+				// Info chord. Drop the ~ and the ?. Caller prints a
+				// one-shot connection-info block to stderr. State
+				// resets to atLineStart since the chord was consumed
+				// without emitting anything to the remote.
+				info = true
+				w.state = escAtLineStart
 			case '~':
 				// Doubled tilde: forward one literal ~, stay in
 				// maybeEscape so a chord can still follow on the
@@ -181,7 +193,7 @@ func (w *escapeWatcher) process(in []byte) (out []byte, detach bool) {
 			}
 		}
 	}
-	return out, false
+	return out, false, info
 }
 
 // Compile-time assert that *os.File satisfies the writer the pumps

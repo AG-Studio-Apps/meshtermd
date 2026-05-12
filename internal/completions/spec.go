@@ -71,6 +71,8 @@ var Mtctl = Binary{
 		{Name: "attach", Help: "attach to a session as your local terminal",
 			Flags: []Flag{hostFlag,
 				{Long: "--mode", Help: "attach mode: exclusive (default) or readonly"},
+				{Long: "--predict", Help: "predictive local-echo mode: always / adaptive (default) / never"},
+				{Long: "--no-predict", Help: "deprecated alias for --predict=never"},
 				{Long: "--persist", Help: "opt fresh spawn into cross-restart persistence"},
 				{Long: "--no-persist", Help: "opt fresh spawn OUT of cross-restart persistence"}}},
 		{Name: "tail", Help: "passive-attach a session's live output (no input, no replay)",

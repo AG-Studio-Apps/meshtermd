@@ -71,10 +71,14 @@ type Conn struct {
 	pendingGapBytes uint64
 	seqValid        bool // false until the first FrameStdout arrives
 
-	// Echo state cache. last echo_state body[0] received from sidecar;
-	// EchoEnabled() reads under echoMu.
+	// Termios state cache. Last FrameEchoState body received from the
+	// sidecar; TermiosState() reads under echoMu. v0.7.0+ sidecars
+	// emit a 2-byte body carrying both echo + canon bits; older
+	// sidecars emit 1 byte and canon stays Unknown (the cache's
+	// initial state).
 	echoMu      sync.Mutex
 	echoVal     byte // ptysidecar.EchoOff / EchoOn / EchoUnknown
+	canonVal    byte // ptysidecar.CanonOff / CanonOn / CanonUnknown
 	echoValid   bool // false until first FrameEchoState arrives
 
 	// Child-exit metadata (captured for diagnostics; not surfaced via
@@ -110,6 +114,7 @@ func newConn(sessionID string, sock net.Conn, logger *slog.Logger) *Conn {
 		logger:     logger,
 		readerDone: make(chan struct{}),
 		echoVal:    ptysidecar.EchoUnknown,
+		canonVal:   ptysidecar.CanonUnknown,
 	}
 	c.readCond = sync.NewCond(&c.readMu)
 	go c.runFrameReader()
@@ -164,30 +169,34 @@ func (c *Conn) SetSize(rows, cols uint16) error {
 	return c.writeFrame(ptysidecar.FrameResize, ptysidecar.EncodeResize(rows, cols))
 }
 
-// EchoEnabled implements session.EchoSnooper. Sends a FrameQueryEcho
-// to the sidecar (best effort) and returns the cached value. The
-// watcher's poll interval (100 ms) is the natural pace for queries;
-// proactive pushes from the sidecar (on each FrameStdin tick) also
-// keep the cache fresh between explicit queries.
-func (c *Conn) EchoEnabled() (echo, ok bool) {
+// TermiosState implements session.TermiosSnooper. Sends a
+// FrameQueryEcho to the sidecar (best effort, the wire frame name
+// pre-dates the canon extension) and returns the cached ECHO + ICANON
+// values. The watcher's poll interval (100 ms) is the natural pace
+// for queries; the sidecar's response on the next read loop tick
+// keeps the cache fresh.
+//
+// ok=false means we don't yet have a definitive reading (first poll
+// hasn't returned, or the kernel reported an error). Either flag may
+// be "unknown" individually (encoded as 2 = CanonUnknown / EchoUnknown
+// on the wire); we only return ok=true when both echo and canon are
+// definitive — clients downgrade to client-side heuristics until both
+// arrive. A caller that wants finer granularity should re-poll.
+func (c *Conn) TermiosState() (echo, canon, ok bool) {
 	// Fire-and-forget query. Failure to send is fine — the cache
-	// remains whatever it was and the watcher gets ok=false until
-	// the sidecar pushes a fresh state via the proactive path.
+	// remains whatever it was and the next watcher tick will see the
+	// reply (or, if the socket died, keep returning ok=false).
 	_ = c.writeFrame(ptysidecar.FrameQueryEcho, nil)
 
 	c.echoMu.Lock()
 	defer c.echoMu.Unlock()
 	if !c.echoValid {
-		return false, false
+		return false, false, false
 	}
-	switch c.echoVal {
-	case ptysidecar.EchoOn:
-		return true, true
-	case ptysidecar.EchoOff:
-		return false, true
-	default:
-		return false, false
+	if c.echoVal == ptysidecar.EchoUnknown || c.canonVal == ptysidecar.CanonUnknown {
+		return false, false, false
 	}
+	return c.echoVal == ptysidecar.EchoOn, c.canonVal == ptysidecar.CanonOn, true
 }
 
 // Close shuts the socket; the sidecar sees EOF and enters its grace
@@ -262,8 +271,14 @@ func (c *Conn) runFrameReader() {
 			}
 			c.handleStdout(firstSeq, flags, payload)
 		case ptysidecar.FrameEchoState:
-			if len(body) == 1 {
-				c.storeEcho(body[0])
+			// v0.7.0+ wire: [echo, canon]. Pre-v0.7 sidecar emits just
+			// [echo]; canon stays at its Unknown initial value.
+			if len(body) >= 1 {
+				canon := byte(ptysidecar.CanonUnknown)
+				if len(body) >= 2 {
+					canon = body[1]
+				}
+				c.storeTermios(body[0], canon)
 			}
 		case ptysidecar.FrameChildExit:
 			code, sig, derr := ptysidecar.DecodeChildExit(body)
@@ -375,9 +390,10 @@ func (c *Conn) appendOutput(body []byte) {
 	c.readMu.Unlock()
 }
 
-func (c *Conn) storeEcho(val byte) {
+func (c *Conn) storeTermios(echo, canon byte) {
 	c.echoMu.Lock()
-	c.echoVal = val
+	c.echoVal = echo
+	c.canonVal = canon
 	c.echoValid = true
 	c.echoMu.Unlock()
 }

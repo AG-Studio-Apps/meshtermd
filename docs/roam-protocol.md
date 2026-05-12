@@ -562,6 +562,73 @@ with local-host introspection (svcmgr backend, unit-file parse,
 linger via `loginctl`). The `--json` output shape is stable for iOS
 + mtctl consumption. No wire protocol changes.
 
+## 14c. v0.7.0 wire additions (backwards-compat)
+
+v0.7.0 ships predictive-echo richness, latency visibility, and active
+QUIC connection migration. Wire-protocol changes are additive on the
+control stream and the AttachAck. ALPN stays `meshterm/0`; older v0.6
+clients hit `default: continue` in their control-frame dispatch and
+ignore the new types/fields.
+
+### EchoConfirm.CanonMode
+
+The `EchoConfirm` control message gains a `CanonMode bool` field
+(`cbor:"cm,omitempty"`). Reports the slave-side ICANON termios flag
+sampled in the same `tcgetattr` call as the existing ECHO bit. Clients
+use this to gate backspace + line-edit prediction independently of
+the printable-char prediction governed by `EchoState`.
+
+```
+EchoConfirm = {
+  "t":         "EchoConfirm",
+  "es":        "on" | "off" | "unknown",  // ECHO
+  "cm":        <bool>,                     // ICANON (v0.7.0+)
+  "sin":       <uint64>                    // reserved, unused
+}
+```
+
+Daemon-side: the per-attach termios watcher (one syscall per 100ms
+poll) reads both bits at once. Emit suppression on unknown-flapping
+is per-channel: an emit fires when ECHO or ICANON makes a real
+on↔off transition, with unknown-involving transitions filtered.
+The wire never carries an explicit "canon unknown" — clients default
+`CanonMode=false` when the field is absent, which is the cautious
+choice (no backspace prediction).
+
+### RTTNotify
+
+New control-stream message emitted by the daemon every ~5 seconds
+while attached. Carries quic-go's smoothed-RTT estimate so clients
+can drive `--predict=adaptive` thresholds and `~?` info displays
+without computing their own RTT.
+
+```
+RTTNotify = {
+  "t":   "RTTNotify",
+  "rtt": <int64>     // smoothed RTT in nanoseconds
+}
+```
+
+Zero values are suppressed (handshake hasn't seeded the smoothing
+window). The initial RTT also rides on the success AttachAck via a
+new `rtt` field (`cbor:"rtt,omitempty"`); clients seed their cache
+from there and update on each subsequent RTTNotify.
+
+### Active QUIC connection migration (client-driven)
+
+The client's `mtctl attach` polls `net.Interfaces()` every 2 seconds
+and triggers QUIC path migration when the local-address set changes.
+Mechanism: open a fresh UDP socket → `conn.AddPath(transport)` →
+`path.Probe(ctx)` → `path.Switch()`. The daemon requires no changes
+beyond NOT setting `DisableActiveMigration` in its `quic.Config`
+(which it doesn't — default behaviour). The attach token is
+RemoteAddr-agnostic, so the new path retains the existing session
+without re-Attach.
+
+Failure mode: probe timeout (default 5 seconds) leaves the
+connection on the prior path; the user sees a stderr notice but the
+session keeps running.
+
 ## 15. Open questions for v0 → v1
 
 - Should `EchoConfirm` carry stdin_seq for client-side echo prediction synchronisation? (Currently reserved.)

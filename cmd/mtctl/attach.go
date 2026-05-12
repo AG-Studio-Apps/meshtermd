@@ -43,10 +43,12 @@ func runAttach(args []string) int {
 		"attach mode. 'exclusive' (default) sends stdin and owns PTY size — displaces any prior exclusive client. "+
 			"'readonly' is a watcher: receives output only, can't type, can't resize. Multiple readonly clients can "+
 			"coexist with each other and with one exclusive client.")
+	predictFlag := fs.String("predict", "adaptive",
+		"predictive local echo mode. 'always' renders unconfirmed predictions with an SGR-underline preview. "+
+			"'adaptive' (default) underlines only when smoothed RTT exceeds the adaptive threshold (~80ms) — "+
+			"low-latency links render plain. 'never' disables prediction entirely (byte-by-byte wait for daemon).")
 	noPredict := fs.Bool("no-predict", false,
-		"disable predictive local echo. By default mtctl mirrors typed characters to your terminal immediately "+
-			"so typing feels instant on lossy or high-latency links; the prediction is confirmed when the daemon's "+
-			"real echo arrives. Pass --no-predict to fall back to the byte-by-byte wait-for-the-daemon experience.")
+		"deprecated alias for --predict=never. Will be removed in a future release.")
 	persist := fs.Bool("persist", false,
 		"opt this session into cross-restart persistence on fresh spawn. Mutually exclusive with --no-persist; "+
 			"when neither is set, the daemon's --persistence-default applies. Ignored when reattaching to an "+
@@ -94,13 +96,94 @@ func runAttach(args []string) int {
 		persistPtr = &v
 	}
 
+	// Reconcile --predict / --no-predict (legacy alias). --no-predict
+	// pins to "never"; if both are set, --no-predict wins (loud opt-out
+	// trumps any nuanced --predict value the user might have typed).
+	pmode := *predictFlag
+	if *noPredict {
+		pmode = predictModeNever
+	}
+	switch pmode {
+	case predictModeAlways, predictModeAdaptive, predictModeNever:
+		// ok
+	default:
+		fmt.Fprintf(os.Stderr,
+			"mtctl attach: --predict %q invalid (want always, adaptive, or never)\n", pmode)
+		return exitConfig
+	}
+
 	// Hand off to a function with proper defer-restore so any panic
 	// or early-return path still puts the terminal back to cooked
 	// mode. attachRun returns an exit code.
-	return attachRun(target, selector, *createName, *shell, resolvedMode, *idleTimeout, *timeout, *noPredict, persistPtr)
+	return attachRun(target, selector, *createName, *shell, resolvedMode, *idleTimeout, *timeout, pmode, persistPtr)
 }
 
-func attachRun(target, selector, createName, shell, mode string, idleTimeout, deadline time.Duration, noPredict bool, persist *bool) int {
+// predictMode* values for the --predict flag.
+const (
+	predictModeAlways   = "always"
+	predictModeAdaptive = "adaptive"
+	predictModeNever    = "never"
+)
+
+// adaptivePredictUnderlineRTT is the smoothed-RTT threshold above
+// which --predict=adaptive enables SGR-underline rendering of
+// unconfirmed predictions. Below the threshold, predictions render
+// plain — on low-latency links the visual cue is more distraction
+// than help.
+const adaptivePredictUnderlineRTT = 80 * time.Millisecond
+
+// fmtRTT renders a smoothed-RTT duration for the `~?` info block.
+// Sub-millisecond reads show as "<1ms"; otherwise rounded to integer
+// milliseconds. Zero (handshake hasn't seeded) shows as "—".
+func fmtRTT(d time.Duration) string {
+	if d <= 0 {
+		return "—"
+	}
+	if d < time.Millisecond {
+		return "<1ms"
+	}
+	return fmt.Sprintf("%dms", d.Milliseconds())
+}
+
+// shortSessionID hex-encodes the first 6 bytes of the session ID
+// (12 hex chars) for the `~?` info block — enough to disambiguate at
+// a glance without taking a full line of stderr. Returns "?" if
+// SessionID is empty.
+func shortSessionID(sid []byte) string {
+	if len(sid) == 0 {
+		return "?"
+	}
+	end := len(sid)
+	if end > 6 {
+		end = 6
+	}
+	const hex = "0123456789abcdef"
+	out := make([]byte, end*2)
+	for i, b := range sid[:end] {
+		out[2*i] = hex[b>>4]
+		out[2*i+1] = hex[b&0xf]
+	}
+	if len(sid) > 6 {
+		return string(out) + "…"
+	}
+	return string(out)
+}
+
+// decideUnderline maps the --predict mode + current smoothed RTT to
+// the boolean fed into PredictionEngine.SetUnderline. Kept pure for
+// testability.
+func decideUnderline(mode string, rtt time.Duration) bool {
+	switch mode {
+	case predictModeAlways:
+		return true
+	case predictModeAdaptive:
+		return rtt > adaptivePredictUnderlineRTT
+	default: // never
+		return false
+	}
+}
+
+func attachRun(target, selector, createName, shell, mode string, idleTimeout, deadline time.Duration, predictMode string, persist *bool) int {
 	// Phase 1: SSH bootstrap. Translate the selector into the right
 	// `meshtermd connect` flags and capture the MTRM_QUIC line.
 	bootstrap, err := bootstrapForAttach(target, selector, createName, shell, idleTimeout, deadline, persist)
@@ -224,23 +307,47 @@ func attachRun(target, selector, createName, shell, mode string, idleTimeout, de
 	}
 
 	predictor := NewPredictionEngine()
-	if noPredict || mode == protocol.AttachModeReadonly {
+	if predictMode == predictModeNever || mode == protocol.AttachModeReadonly {
 		// Readonly attachers don't send stdin, so there's nothing to
 		// predict. Disable so OnUserInput / OnDaemonOutput are no-ops.
 		predictor.Disable()
 	}
 
+	// Connection-state cache (RTT et al) — seeded from AttachAck,
+	// updated by the periodic RTTNotify control frame.
+	stats := &connStats{}
+	stats.SetRTT(ack.RTTNanos)
+	predictor.SetUnderline(decideUnderline(predictMode, stats.RTT()))
+
 	done := make(chan error, 4)
 
 	readonly := mode == protocol.AttachModeReadonly
 
-	go runStdoutPump(pCtx, stream, writeFrame, writeStdout, predictor, done)
+	// printInfo emits a one-shot connection-info block to stderr in
+	// response to the `~?` escape chord. Closes over the live AttachAck
+	// + stats so the values are always current. Goes to stderr (not
+	// stdout) so it doesn't pollute the shell output stream the user
+	// might be piping.
+	printInfo := func() {
+		fmt.Fprintf(os.Stderr,
+			"\r\n[mtctl: rtt=%s session=%s mode=%s peers=%d]\r\n",
+			fmtRTT(stats.RTT()), shortSessionID(ack.SessionID), ack.Mode, len(ack.Peers))
+	}
+
+	// Active QUIC connection migration: when the local interface set
+	// changes (laptop switches WiFi / cellular, VPN connects), open a
+	// fresh UDP socket and run AddPath/Probe/Switch so the existing
+	// session survives the IP rebind. Best-effort; failures stay on
+	// the prior path. Detached goroutine — exits on pCtx done.
+	go migrationLoop(pCtx, conn)
+
+	go runStdoutPump(pCtx, stream, writeFrame, writeStdout, predictor, stats, predictMode, done)
 	// Stdin pump runs even in readonly so the `~.` detach chord
 	// still works — the watcher consumes bytes locally and just
 	// doesn't forward them when readonly is set. SIGWINCH is
 	// pointless in readonly (daemon drops Resize frames anyway, and
 	// the exclusive client owns the size we observe), so skip it.
-	go runStdinPump(pCtx, stream, writeFrame, writeStdout, predictor, readonly, done)
+	go runStdinPump(pCtx, stream, writeFrame, writeStdout, predictor, readonly, printInfo, done)
 	if !readonly {
 		go runSigwinchPump(pCtx, ts, writeFrame, done)
 	}
@@ -307,7 +414,7 @@ func sshHostOnly(target string) string {
 //     Goodbye triggers a clean exit. Future Ping (server-initiated)
 //     can be answered by us — currently the daemon's Ping is on the
 //     keepalive path and we just ignore it.
-func runStdoutPump(ctx context.Context, stream *quic.Stream, write frameWriter, writeOut stdoutWriter, predictor *PredictionEngine, done chan<- error) {
+func runStdoutPump(ctx context.Context, stream *quic.Stream, write frameWriter, writeOut stdoutWriter, predictor *PredictionEngine, stats *connStats, predictMode string, done chan<- error) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -356,6 +463,38 @@ func runStdoutPump(ctx context.Context, stream *quic.Stream, write frameWriter, 
 				// none — quic-go's KeepAlivePeriod handles it).
 				// Ack: server doesn't send these to us.
 				continue
+			case protocol.TypeRTTNotify:
+				// Update the shared connection-state cache so the
+				// predictor + `~?` consumers see fresh RTT. Decode
+				// errors are tolerated for forward-compat (older
+				// daemons emit no RTTNotify; newer daemons might add
+				// extra fields).
+				var rn protocol.RTTNotify
+				if uerr := protocol.StrictDecMode.Unmarshal(body, &rn); uerr != nil {
+					continue
+				}
+				stats.SetRTT(rn.RTTNanos)
+				// Recompute adaptive-underline decision on every fresh
+				// RTT update — predictMode=always/never are stable, so
+				// this only flips state for adaptive. Cheap; no allocs.
+				predictor.SetUnderline(decideUnderline(predictMode, stats.RTT()))
+			case protocol.TypeEchoConfirm:
+				// Stage B: authoritative termios state from the daemon's
+				// per-attach watcher. EchoState=on arms predictions
+				// (overriding the client-side prompt-sniff heuristic);
+				// EchoState=off disarms. CanonMode gates backspace
+				// prediction independently of the echo flag.
+				var ec protocol.EchoConfirm
+				if uerr := protocol.StrictDecMode.Unmarshal(body, &ec); uerr != nil {
+					continue
+				}
+				switch ec.EchoState {
+				case protocol.EchoStateOn:
+					predictor.ForceArm()
+				case protocol.EchoStateOff:
+					predictor.ForceDisarm()
+				}
+				predictor.SetCanonMode(ec.CanonMode)
 			default:
 				continue
 			}
@@ -378,7 +517,7 @@ func runStdoutPump(ctx context.Context, stream *quic.Stream, write frameWriter, 
 // to stdout immediately — so typing feels instant on a high-RTT
 // link. The daemon's real echo arrives later and is reconciled by
 // the prediction engine on the stdout pump side.
-func runStdinPump(ctx context.Context, stream *quic.Stream, write frameWriter, writeOut stdoutWriter, predictor *PredictionEngine, readonly bool, done chan<- error) {
+func runStdinPump(ctx context.Context, stream *quic.Stream, write frameWriter, writeOut stdoutWriter, predictor *PredictionEngine, readonly bool, printInfo func(), done chan<- error) {
 	_ = stream // we only ever write; the stream is held by `write`
 	watcher := newEscapeWatcher()
 	buf := make([]byte, 4*1024)
@@ -388,7 +527,10 @@ func runStdinPump(ctx context.Context, stream *quic.Stream, write frameWriter, w
 		}
 		n, err := os.Stdin.Read(buf)
 		if n > 0 {
-			forwarded, detach := watcher.process(buf[:n])
+			forwarded, detach, info := watcher.process(buf[:n])
+			if info && printInfo != nil {
+				printInfo()
+			}
 			if !readonly && len(forwarded) > 0 {
 				// Mirror predicted bytes locally BEFORE sending to the
 				// daemon so the keystroke appears instantly. The daemon

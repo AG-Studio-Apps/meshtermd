@@ -7,120 +7,158 @@ import (
 	"time"
 )
 
-// fakeSnooper is a test EchoSnooper whose returned state can be
+// fakeSnooper is a test TermiosSnooper whose returned state can be
 // scripted between polls. Concurrent-safe so the watcher goroutine
 // and the test main goroutine don't race.
 type fakeSnooper struct {
-	mu   sync.Mutex
-	echo bool
-	ok   bool
+	mu    sync.Mutex
+	echo  bool
+	canon bool
+	ok    bool
 }
 
-func (f *fakeSnooper) set(echo, ok bool) {
+func (f *fakeSnooper) set(echo, canon, ok bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.echo, f.ok = echo, ok
+	f.echo, f.canon, f.ok = echo, canon, ok
 }
 
-func (f *fakeSnooper) EchoEnabled() (bool, bool) {
+func (f *fakeSnooper) TermiosState() (bool, bool, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.echo, f.ok
+	return f.echo, f.canon, f.ok
 }
 
-func TestWatchEchoEmitsInitialReading(t *testing.T) {
-	snooper := &fakeSnooper{echo: true, ok: true}
-	got := make(chan EchoState, 4)
+func TestWatchTermiosSuppressesInitialUnknownTransition(t *testing.T) {
+	t.Parallel()
+	snooper := &fakeSnooper{echo: true, canon: true, ok: true}
+	got := make(chan TermiosSnapshot, 4)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go WatchEchoOn(ctx, snooper, 10*time.Millisecond, func(s EchoState) {
+	go WatchTermiosOn(ctx, snooper, 10*time.Millisecond, func(s TermiosSnapshot) {
 		got <- s
 	})
+	// Initial reading is on/on but the watcher primes `last` to
+	// unknown/unknown and treats the first transition as
+	// unknown→known — suppressed by the realTransition filter. No
+	// emit expected within the first 150ms.
 	select {
 	case s := <-got:
-		// Initial reading is `on` because the snooper returns
-		// (echo=true, ok=true). We transition from unknown → on,
-		// which by design is suppressed... wait, that would mean no
-		// emit. Let's re-check the emitIfChanged logic.
-		//
-		// emitIfChanged: prev=unknown, cur=on → skipped because of
-		// the "prev==unknown OR cur==unknown" guard. So the FIRST
-		// real emit only fires on the SECOND change.
-		t.Logf("got initial emit: %s", s)
+		t.Errorf("got spurious initial emit: %+v", s)
 	case <-time.After(150 * time.Millisecond):
-		// Expected: no emit yet because initial unknown→on is
-		// filtered out as a non-transition. Proceed to the next test
-		// case below.
+		// expected
 	}
 }
 
-func TestWatchEchoFiresOnTransition(t *testing.T) {
-	snooper := &fakeSnooper{echo: true, ok: true}
-	got := make(chan EchoState, 4)
+func TestWatchTermiosFiresOnEchoTransition(t *testing.T) {
+	t.Parallel()
+	snooper := &fakeSnooper{echo: true, canon: true, ok: true}
+	got := make(chan TermiosSnapshot, 4)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go WatchEchoOn(ctx, snooper, 10*time.Millisecond, func(s EchoState) {
+	go WatchTermiosOn(ctx, snooper, 10*time.Millisecond, func(s TermiosSnapshot) {
 		got <- s
 	})
-	// Let the watcher prime its `last` to "on".
-	time.Sleep(40 * time.Millisecond)
+	time.Sleep(40 * time.Millisecond) // prime last to {on, on}
 
-	// Flip to echo off — should emit EchoStateOff.
-	snooper.set(false, true)
-
+	// Flip echo off; canon stays on. Should emit with Echo=off, Canon=on.
+	snooper.set(false, true, true)
 	select {
 	case s := <-got:
-		if s != EchoStateOff {
-			t.Errorf("got %q, want %q", s, EchoStateOff)
+		if s.Echo != EchoStateOff {
+			t.Errorf("Echo = %q, want off", s.Echo)
+		}
+		if s.Canon != EchoStateOn {
+			t.Errorf("Canon = %q, want on (unchanged)", s.Canon)
 		}
 	case <-time.After(150 * time.Millisecond):
-		t.Fatal("no emit after on→off transition")
-	}
-
-	// Flip back to on.
-	snooper.set(true, true)
-	select {
-	case s := <-got:
-		if s != EchoStateOn {
-			t.Errorf("got %q, want %q", s, EchoStateOn)
-		}
-	case <-time.After(150 * time.Millisecond):
-		t.Fatal("no emit after off→on transition")
+		t.Fatal("no emit after echo on→off")
 	}
 }
 
-func TestWatchEchoSuppressesUnknownFlapping(t *testing.T) {
-	snooper := &fakeSnooper{echo: true, ok: true}
-	got := make(chan EchoState, 4)
+func TestWatchTermiosFiresOnCanonTransition(t *testing.T) {
+	t.Parallel()
+	snooper := &fakeSnooper{echo: true, canon: true, ok: true}
+	got := make(chan TermiosSnapshot, 4)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go WatchEchoOn(ctx, snooper, 10*time.Millisecond, func(s EchoState) {
+	go WatchTermiosOn(ctx, snooper, 10*time.Millisecond, func(s TermiosSnapshot) {
 		got <- s
 	})
-	time.Sleep(40 * time.Millisecond) // prime to "on"
+	time.Sleep(40 * time.Millisecond) // prime to {on, on}
 
-	// Briefly flip to unknown then back to on. The watcher should
-	// NOT emit anything — on→unknown→on is dropped to avoid flap
-	// noise on transient ioctl errors.
-	snooper.set(true, false) // unknown
+	// Flip canon only (raw-mode entry like vim). Echo stays on.
+	snooper.set(true, false, true)
+	select {
+	case s := <-got:
+		if s.Canon != EchoStateOff {
+			t.Errorf("Canon = %q, want off", s.Canon)
+		}
+		if s.Echo != EchoStateOn {
+			t.Errorf("Echo = %q, want on (unchanged)", s.Echo)
+		}
+	case <-time.After(150 * time.Millisecond):
+		t.Fatal("no emit after canon on→off")
+	}
+}
+
+func TestWatchTermiosFiresOnSimultaneousFlip(t *testing.T) {
+	t.Parallel()
+	snooper := &fakeSnooper{echo: true, canon: true, ok: true}
+	got := make(chan TermiosSnapshot, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go WatchTermiosOn(ctx, snooper, 10*time.Millisecond, func(s TermiosSnapshot) {
+		got <- s
+	})
+	time.Sleep(40 * time.Millisecond) // prime
+
+	// Flip both simultaneously (typical raw-mode entry: ECHO + ICANON
+	// cleared together).
+	snooper.set(false, false, true)
+	select {
+	case s := <-got:
+		if s.Echo != EchoStateOff || s.Canon != EchoStateOff {
+			t.Errorf("got %+v, want both off", s)
+		}
+	case <-time.After(150 * time.Millisecond):
+		t.Fatal("no emit after simultaneous flip")
+	}
+}
+
+func TestWatchTermiosSuppressesUnknownFlapping(t *testing.T) {
+	t.Parallel()
+	snooper := &fakeSnooper{echo: true, canon: true, ok: true}
+	got := make(chan TermiosSnapshot, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go WatchTermiosOn(ctx, snooper, 10*time.Millisecond, func(s TermiosSnapshot) {
+		got <- s
+	})
+	time.Sleep(40 * time.Millisecond) // prime to {on, on}
+
+	// Briefly flip both to unknown then back. The watcher should NOT
+	// emit anything — on→unknown→on is dropped to avoid flap noise.
+	snooper.set(true, true, false) // unknown
 	time.Sleep(30 * time.Millisecond)
-	snooper.set(true, true) // back to on
+	snooper.set(true, true, true) // back to on
 	time.Sleep(40 * time.Millisecond)
 
 	select {
 	case s := <-got:
-		t.Errorf("got spurious emit %q during unknown flap", s)
+		t.Errorf("got spurious emit during unknown flap: %+v", s)
 	default:
 		// expected
 	}
 }
 
-func TestWatchEchoExitsOnContextCancel(t *testing.T) {
-	snooper := &fakeSnooper{echo: true, ok: true}
+func TestWatchTermiosExitsOnContextCancel(t *testing.T) {
+	t.Parallel()
+	snooper := &fakeSnooper{echo: true, canon: true, ok: true}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		WatchEchoOn(ctx, snooper, 10*time.Millisecond, func(s EchoState) {})
+		WatchTermiosOn(ctx, snooper, 10*time.Millisecond, func(TermiosSnapshot) {})
 		close(done)
 	}()
 	cancel()
@@ -128,21 +166,21 @@ func TestWatchEchoExitsOnContextCancel(t *testing.T) {
 	case <-done:
 		// good
 	case <-time.After(100 * time.Millisecond):
-		t.Fatal("WatchEcho did not return after ctx cancel")
+		t.Fatal("WatchTermios did not return after ctx cancel")
 	}
 }
 
-func TestWatchEchoNoOpWhenSnooperUnsupported(t *testing.T) {
-	// WatchEcho is the dispatch shim: passes PTY (no snoop method)
+func TestWatchTermiosNoOpWhenSnooperUnsupported(t *testing.T) {
+	t.Parallel()
+	// WatchTermios is the dispatch shim: passes PTY (no snoop method)
 	// directly. Use a tiny PTY-like that satisfies neither the
-	// session.PTY interface fully nor EchoSnooper. We hit the early
-	// return via WatchEcho.
+	// session.PTY interface fully nor TermiosSnooper.
 	type unsupportedPTY struct{ PTY }
 	got := false
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	WatchEcho(ctx, unsupportedPTY{}, time.Millisecond, func(EchoState) { got = true })
+	WatchTermios(ctx, unsupportedPTY{}, time.Millisecond, func(TermiosSnapshot) { got = true })
 	if got {
-		t.Error("onChange fired for a PTY that doesn't implement EchoSnooper")
+		t.Error("onChange fired for a PTY that doesn't implement TermiosSnooper")
 	}
 }

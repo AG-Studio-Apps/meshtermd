@@ -98,6 +98,7 @@ const (
 	TypePong        = "Pong"
 	TypeGoodbye     = "Goodbye"
 	TypeEchoConfirm = "EchoConfirm"
+	TypeRTTNotify   = "RTTNotify"
 )
 
 // EchoState mirrors the tri-state value carried in EchoConfirm.
@@ -217,6 +218,16 @@ type AttachAck struct {
 	// difference; CBOR omitempty keeps the wire form small in the
 	// non-restored common case.
 	Restored bool `cbor:"r,omitempty"`
+
+	// RTTNanos is the daemon's measured smoothed RTT to the client at
+	// attach time, in nanoseconds. Sourced from quic-go's
+	// ConnectionStats().SmoothedRTT. v0.7.0+ field; older clients
+	// ignore it. Zero means "not measured yet" (handshake hasn't
+	// settled smoothing window). Clients use it to seed their
+	// `--predict=adaptive` underline threshold without waiting for
+	// the first RTTNotify; ongoing updates flow via the 5-second
+	// RTTNotify ticker.
+	RTTNanos int64 `cbor:"rtt,omitempty"`
 }
 
 // Ack reports the highest output sequence number the client has
@@ -246,11 +257,24 @@ type Pong struct {
 }
 
 // EchoConfirm is sent by the daemon (server → client) whenever the
-// PTY's slave-side ECHO termios flag flips. Clients use it to toggle
-// predictive local echo: `on` → safe to predict, `off` → vim/less/
-// password prompt territory, disarm hard. `unknown` is sent when
-// the daemon can't determine state (e.g., tcgetattr failed); clients
-// treat that as a soft suggestion to stay conservative.
+// PTY's slave-side ECHO or ICANON termios flag flips. Clients use it
+// to toggle predictive local echo:
+//
+//   - EchoState=on  → safe to predict printable echo.
+//   - EchoState=off → vim/less/password prompt; disarm hard.
+//   - EchoState=unknown → daemon couldn't determine state (rare);
+//     clients stay conservative.
+//   - CanonMode=true → ICANON set (line-buffered mode); safe to
+//     predict backspace + line edits. Omitted/false → don't predict
+//     line edits.
+//
+// CanonMode was added in v0.7.0; older clients ignore the unknown
+// field. The daemon emits CanonMode=true only when it has positively
+// observed the ICANON bit set; transient ioctl failures suppress the
+// emit entirely (the watcher's unknown-flap filter applies to both
+// flags independently), so the wire never carries an explicit
+// "canon unknown" — clients default to false when the field is
+// absent, which is the cautious choice.
 //
 // v0: control-stream message. Spec § 10.1 reserves the slot as a
 // datagram for future low-latency optimisation; we stick with the
@@ -264,12 +288,26 @@ type EchoConfirm struct {
 	T         string `cbor:"t"`
 	StdinSeq  uint64 `cbor:"sin,omitempty"`
 	EchoState string `cbor:"es"`
+	CanonMode bool   `cbor:"cm,omitempty"`
 }
 
 // Goodbye is the last message either side sends before closing.
 type Goodbye struct {
 	T      string `cbor:"t"`
 	Reason string `cbor:"reason"`
+}
+
+// RTTNotify is sent periodically by the daemon (every ~5 seconds) on
+// the control stream, carrying the current smoothed-RTT estimate from
+// quic-go. Clients use it to drive `--predict=adaptive` decisions
+// (whether to underline unconfirmed predictions) and to surface
+// connection latency in info commands like mtctl attach's `~?`.
+//
+// v0.7.0+; older clients hit `default: continue` in their control-
+// frame dispatch and ignore it.
+type RTTNotify struct {
+	T        string `cbor:"t"`
+	RTTNanos int64  `cbor:"rtt"`
 }
 
 // MarshalAttach / UnmarshalAttach (etc.) are convenience wrappers that
@@ -284,6 +322,7 @@ func MarshalResize(m Resize) ([]byte, error)         { m.T = TypeResize; return 
 func MarshalPing(m Ping) ([]byte, error)             { m.T = TypePing; return cborMarshal(m) }
 func MarshalPong(m Pong) ([]byte, error)             { m.T = TypePong; return cborMarshal(m) }
 func MarshalGoodbye(m Goodbye) ([]byte, error)       { m.T = TypeGoodbye; return cborMarshal(m) }
+func MarshalRTTNotify(m RTTNotify) ([]byte, error) { m.T = TypeRTTNotify; return cborMarshal(m) }
 func MarshalEchoConfirm(m EchoConfirm) ([]byte, error) {
 	m.T = TypeEchoConfirm
 	return cborMarshal(m)

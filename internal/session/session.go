@@ -270,6 +270,21 @@ func (s *Session) IdleTimeout() time.Duration {
 	return s.idleTimeout
 }
 
+// SetIdleTimeout updates the per-session GC timeout. Used by the
+// daemon's reattach path: when an iOS client edits its host's
+// Keep-alive setting, the next `meshtermd connect` carries a new
+// --idle-timeout value; without this setter the existing session
+// kept its original value and the GC reaped it at the OLD interval.
+//
+// Pass zero to revert to the registry's default. Callers should
+// clamp via Registry.ResolveIdleTimeout first if they want the
+// operator's --max-idle-timeout ceiling applied.
+func (s *Session) SetIdleTimeout(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.idleTimeout = d
+}
+
 // ID returns the session's hex-encoded identifier.
 func (s *Session) ID() SessionID { return s.id }
 

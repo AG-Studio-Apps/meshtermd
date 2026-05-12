@@ -418,6 +418,7 @@ func (d *Daemon) lookupOrCreateSession(req ipc.AllocateRequest) (*session.Sessio
 		// anonymous spawn (legacy).
 		if req.Name != "" {
 			if sess, err := d.registry.LookupByName(req.Name); err == nil {
+				d.applyIdleTimeoutOnReattach(sess, req)
 				return sess, nil
 			}
 			// Not found — fall through to spawn (which will use
@@ -448,7 +449,34 @@ func (d *Daemon) lookupOrCreateSession(req ipc.AllocateRequest) (*session.Sessio
 	// req.Rows/Cols are still meaningful for the spawn path above
 	// (initial PTY size for new sessions). For reattach, the QUIC
 	// control-frame path is the single source of truth.
+	d.applyIdleTimeoutOnReattach(sess, req)
 	return sess, nil
+}
+
+// applyIdleTimeoutOnReattach updates an existing session's idle
+// timeout when the client's request specifies a different value.
+// Without this the session would keep its original timeout — the
+// iOS-side Keep-alive picker would silently no-op on reattach,
+// which historically caused sessions to be GC'd at the OLD interval
+// after a user edited the host (e.g. 1h → 30d).
+//
+// req.IdleTimeoutNanos == 0 means "use the daemon default" and is
+// applied verbatim (matches the spawn-time semantics). A non-zero
+// value is clamped at the registry's --max-idle-timeout ceiling
+// before being written so an operator-set bound isn't bypassed.
+func (d *Daemon) applyIdleTimeoutOnReattach(sess *session.Session, req ipc.AllocateRequest) {
+	resolved := d.registry.ResolveIdleTimeout(time.Duration(req.IdleTimeoutNanos))
+	if resolved == sess.IdleTimeout() {
+		return
+	}
+	prev := sess.IdleTimeout()
+	sess.SetIdleTimeout(resolved)
+	d.logger.Info("session.idle_timeout_updated",
+		"session", sess.ID().String(),
+		"name", sess.Name(),
+		"prev", prev.String(),
+		"new", resolved.String(),
+	)
 }
 
 // spawnSession opens a PTY + child shell, wraps it in a Session,

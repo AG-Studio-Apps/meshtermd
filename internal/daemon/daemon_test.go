@@ -233,6 +233,74 @@ func TestDaemonReattachLooksUpExistingSession(t *testing.T) {
 	}
 }
 
+// TestDaemonReattachUpdatesIdleTimeout reproduces the 2026-05-12
+// bug report: a user edited the iOS Keep-alive picker from 1h to
+// 30d, but the daemon's existing session kept its original 1h
+// timeout and got GC'd at the old interval. lookupOrCreateSession
+// must apply the new value on reattach.
+func TestDaemonReattachUpdatesIdleTimeout(t *testing.T) {
+	t.Parallel()
+	d, c, cleanup := startDaemon(t)
+	defer cleanup()
+
+	// First allocate: 1h timeout (matches iOS's .oneHour preset).
+	first, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID:        "new",
+		Name:             "dev",
+		Rows:             24, Cols: 80,
+		Shell:            "/bin/sh",
+		Exec:             []string{"-c", "while true; do sleep 1; done"},
+		IdleTimeoutNanos: int64(time.Hour),
+	})
+	if err != nil || !first.Ok {
+		t.Fatalf("first allocate: %v %s %s", err, first.Err, first.Msg)
+	}
+	sid, err := session.ParseSessionID(first.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := d.registry.Lookup(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sess.IdleTimeout(); got != time.Hour {
+		t.Fatalf("post-spawn idle timeout = %v, want 1h", got)
+	}
+
+	// Simulate the user editing Keep-alive to 30d in iOS, then
+	// reattaching. iOS reattaches by SessionID, not Name, after the
+	// first connect — but the by-name path also has to apply the
+	// update, so cover both.
+	thirtyDays := 30 * 24 * time.Hour
+	second, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID:        first.SessionID,
+		IdleTimeoutNanos: int64(thirtyDays),
+	})
+	if err != nil || !second.Ok {
+		t.Fatalf("reattach by id: %v %s %s", err, second.Err, second.Msg)
+	}
+	if got := sess.IdleTimeout(); got != thirtyDays {
+		t.Errorf("after reattach by id: idle timeout = %v, want %v", got, thirtyDays)
+	}
+
+	// Reattach by NAME path (iOS create-if-missing). Drop back to 1h.
+	third, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID:        "new",
+		Name:             "dev",
+		Rows:             24, Cols: 80,
+		IdleTimeoutNanos: int64(time.Hour),
+	})
+	if err != nil || !third.Ok {
+		t.Fatalf("reattach by name: %v %s %s", err, third.Err, third.Msg)
+	}
+	if third.SessionID != first.SessionID {
+		t.Fatalf("by-name reattach hit a different session: got %q want %q", third.SessionID, first.SessionID)
+	}
+	if got := sess.IdleTimeout(); got != time.Hour {
+		t.Errorf("after reattach by name: idle timeout = %v, want 1h", got)
+	}
+}
+
 func TestDaemonReattachOnUnknownSessionFails(t *testing.T) {
 	t.Parallel()
 	_, c, cleanup := startDaemon(t)

@@ -59,6 +59,23 @@ func WatchEcho(ctx context.Context, pty PTY, interval time.Duration, onChange fu
 	WatchEchoOn(ctx, snooper, interval, onChange)
 }
 
+// WatchEcho is also exposed as a method on Session for the common
+// case of "watch the echo state of MY PTY, and call onChange when it
+// flips." The Session owns its PTY field privately so callers can't
+// reach it directly; this method threads the public surface.
+//
+// Blocks until ctx is cancelled or the session is closed.
+func (s *Session) WatchEcho(ctx context.Context, interval time.Duration, onChange func(EchoState)) {
+	s.mu.Lock()
+	pty := s.pty
+	closed := s.closed
+	s.mu.Unlock()
+	if closed || pty == nil {
+		return
+	}
+	WatchEcho(ctx, pty, interval, onChange)
+}
+
 // WatchEchoOn is the testable form of WatchEcho — takes the snooper
 // directly instead of fishing it out of a PTY.
 func WatchEchoOn(ctx context.Context, snooper EchoSnooper, interval time.Duration, onChange func(EchoState)) {

@@ -90,13 +90,23 @@ const (
 // Type tags for the discriminated-union encoding of control messages.
 // These match the "t" key value emitted on the wire.
 const (
-	TypeAttach    = "Attach"
-	TypeAttachAck = "AttachAck"
-	TypeAck       = "Ack"
-	TypeResize    = "Resize"
-	TypePing      = "Ping"
-	TypePong      = "Pong"
-	TypeGoodbye   = "Goodbye"
+	TypeAttach      = "Attach"
+	TypeAttachAck   = "AttachAck"
+	TypeAck         = "Ack"
+	TypeResize      = "Resize"
+	TypePing        = "Ping"
+	TypePong        = "Pong"
+	TypeGoodbye     = "Goodbye"
+	TypeEchoConfirm = "EchoConfirm"
+)
+
+// EchoState mirrors the tri-state value carried in EchoConfirm.
+// The daemon emits these from the termios watcher; clients toggle
+// predictive-echo arming based on the value.
+const (
+	EchoStateOn      = "on"
+	EchoStateOff     = "off"
+	EchoStateUnknown = "unknown"
 )
 
 // Reason codes for Goodbye. Defined as constants so callers don't
@@ -209,6 +219,27 @@ type Pong struct {
 	Nonce uint32 `cbor:"n"`
 }
 
+// EchoConfirm is sent by the daemon (server → client) whenever the
+// PTY's slave-side ECHO termios flag flips. Clients use it to toggle
+// predictive local echo: `on` → safe to predict, `off` → vim/less/
+// password prompt territory, disarm hard. `unknown` is sent when
+// the daemon can't determine state (e.g., tcgetattr failed); clients
+// treat that as a soft suggestion to stay conservative.
+//
+// v0: control-stream message. Spec § 10.1 reserves the slot as a
+// datagram for future low-latency optimisation; we stick with the
+// control stream here so the existing tagged-frame dispatch handles
+// it without datagram plumbing on both ends.
+//
+// `StdinSeq` is reserved for future client-side echo prediction
+// synchronisation (the daemon can stamp "this state applied AFTER
+// stdin sequence N"); not used in v0.
+type EchoConfirm struct {
+	T         string `cbor:"t"`
+	StdinSeq  uint64 `cbor:"sin,omitempty"`
+	EchoState string `cbor:"es"`
+}
+
 // Goodbye is the last message either side sends before closing.
 type Goodbye struct {
 	T      string `cbor:"t"`
@@ -227,6 +258,10 @@ func MarshalResize(m Resize) ([]byte, error)         { m.T = TypeResize; return 
 func MarshalPing(m Ping) ([]byte, error)             { m.T = TypePing; return cborMarshal(m) }
 func MarshalPong(m Pong) ([]byte, error)             { m.T = TypePong; return cborMarshal(m) }
 func MarshalGoodbye(m Goodbye) ([]byte, error)       { m.T = TypeGoodbye; return cborMarshal(m) }
+func MarshalEchoConfirm(m EchoConfirm) ([]byte, error) {
+	m.T = TypeEchoConfirm
+	return cborMarshal(m)
+}
 
 // PeekType extracts only the "t" field from a CBOR frame body. Used by
 // ReadFrame to dispatch to the right typed unmarshal.

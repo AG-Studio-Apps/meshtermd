@@ -46,6 +46,7 @@ func TestEachMarshalStampsItsType(t *testing.T) {
 		{"Ping", func() ([]byte, error) { return MarshalPing(Ping{}) }, TypePing},
 		{"Pong", func() ([]byte, error) { return MarshalPong(Pong{}) }, TypePong},
 		{"Goodbye", func() ([]byte, error) { return MarshalGoodbye(Goodbye{}) }, TypeGoodbye},
+		{"EchoConfirm", func() ([]byte, error) { return MarshalEchoConfirm(EchoConfirm{}) }, TypeEchoConfirm},
 	}
 	for _, c := range cases {
 		c := c

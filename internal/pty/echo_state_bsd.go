@@ -12,6 +12,8 @@ import "golang.org/x/sys/unix"
 // (uint64 on Darwin, uint32 on FreeBSD), but the comparison
 // promotes either to int so the ECHO check is identical.
 func (h *Handle) EchoEnabled() (echo bool, ok bool) {
+	h.fdMu.RLock()
+	defer h.fdMu.RUnlock()
 	t, err := unix.IoctlGetTermios(int(h.pt.Fd()), unix.TIOCGETA)
 	if err != nil {
 		return false, false

@@ -298,12 +298,16 @@ QUIC datagrams (RFC 9221) are used for low-latency unreliable signals where a st
 ```cbor
 {
   "t": "EchoConfirm",
-  "stdin_seq": 0,                  // not used in v0; reserved
-  "echo_state": "on"               // "on" | "off" | "unknown"
+  "sin": 0,                        // stdin_seq — not used in v0; reserved
+  "es": "on"                       // echo_state: "on" | "off" | "unknown"
 }
 ```
 
-Sent when the daemon detects the shell's echo mode changed (e.g., entering a password prompt). Client uses this to suppress predictive echo. v0: best-effort, server MAY omit.
+Sent when the daemon detects the shell's echo mode changed (e.g., entering a password prompt or `vim`). Client uses this to authoritatively toggle predictive local echo arming, overriding the client-side prompt-sniff heuristic.
+
+**v0 transport: control-stream frame.** This slot was originally reserved as a QUIC datagram for lower latency; the v0 implementation uses the existing tagged-frame control stream so the same dispatch path handles it on both ends without datagram plumbing. EchoConfirm payloads are ~20 bytes CBOR; head-of-line blocking behind stdout chunks (max 16 KiB) is bounded and acceptable for the use case. A future minor-version bump may add a datagram fast path while keeping the control-stream path as fallback.
+
+**Best-effort:** the server MAY omit EchoConfirm entirely (older daemons, daemons whose PTY implementation doesn't support tcgetattr). Clients that don't receive EchoConfirm fall back to the prompt-sniff heuristic. Clients that don't recognise EchoConfirm (older versions) silently drop the unknown control type — forward-compat is built in.
 
 ### 10.2 Heartbeat datagrams
 

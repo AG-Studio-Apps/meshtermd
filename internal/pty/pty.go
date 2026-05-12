@@ -78,6 +78,14 @@ type Handle struct {
 	cmd       *exec.Cmd
 	closeOnce sync.Once
 	closeErr  error
+
+	// fdMu serialises access to h.pt's underlying fd between Close()
+	// and operations that read h.pt.Fd() (currently just EchoEnabled
+	// — Read/Write go through h.pt.Read/Write which the os.File
+	// internals already make safe across Close). Without this lock
+	// the race detector flags EchoEnabled's Fd() call against the
+	// pump goroutine's eventual Close() on session teardown.
+	fdMu sync.RWMutex
 }
 
 // Spawn starts the child and returns a Handle. The child inherits
@@ -167,6 +175,12 @@ func (h *Handle) Close() error {
 				_ = h.cmd.Wait()
 			}()
 		}
+		// Take the write lock so any in-flight EchoEnabled (read
+		// lock) finishes before we close the master fd. Without this
+		// the Fd() call inside EchoEnabled races with Close per the
+		// os.File semantics.
+		h.fdMu.Lock()
+		defer h.fdMu.Unlock()
 		if err := h.pt.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 			h.closeErr = err
 		}

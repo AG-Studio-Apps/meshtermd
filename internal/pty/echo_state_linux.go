@@ -12,6 +12,8 @@ import "golang.org/x/sys/unix"
 //
 // Linux uses the TCGETS ioctl.
 func (h *Handle) EchoEnabled() (echo bool, ok bool) {
+	h.fdMu.RLock()
+	defer h.fdMu.RUnlock()
 	t, err := unix.IoctlGetTermios(int(h.pt.Fd()), unix.TCGETS)
 	if err != nil {
 		return false, false

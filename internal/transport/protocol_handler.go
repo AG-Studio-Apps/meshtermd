@@ -206,7 +206,7 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 	defer pumpsCancel()
 
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 
 	// Output pump: read from the session's ring buffer and emit
 	// FrameTypeStdout frames on the single stream.
@@ -229,6 +229,29 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 			!errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
 			log.DebugContext(pumpsCtx, "read pump exit", "err", err)
 		}
+	}()
+
+	// Echo watcher (Stage B): polls the PTY's slave-side ECHO termios
+	// flag and emits EchoConfirm frames whenever it flips. Clients use
+	// these to authoritatively toggle predictive-echo arming (vim
+	// entry disarms instantly; shell prompt return rearms). One
+	// watcher per attach for simplicity — duplicate syscalls across
+	// co-attached clients are cheap. No-op if the PTY implementation
+	// doesn't support tcgetattr (e.g., the pipe-backed test PTY).
+	go func() {
+		defer wg.Done()
+		sess.WatchEcho(pumpsCtx, session.DefaultEchoPollInterval, func(s session.EchoState) {
+			body, err := protocol.MarshalEchoConfirm(protocol.EchoConfirm{
+				EchoState: string(s),
+			})
+			if err != nil {
+				return
+			}
+			// Write errors are silent — if the stream is dead, the
+			// read/output pumps will exit on their own and tear the
+			// connection down. EchoConfirm is best-effort by spec.
+			_ = writeFrame(protocol.FrameTypeControl, body)
+		})
 	}()
 
 	wg.Wait()

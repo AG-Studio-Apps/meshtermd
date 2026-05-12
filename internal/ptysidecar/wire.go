@@ -33,10 +33,23 @@ const (
 	FrameResize    FrameType = 0x02 // daemon → sidecar: [u16 rows][u16 cols]
 	FrameQueryEcho FrameType = 0x03 // daemon → sidecar: request termios echo state
 	FrameDieNow    FrameType = 0x04 // daemon → sidecar: SIGHUP child + exit immediately
+	FrameAck       FrameType = 0x05 // daemon → sidecar: [u64 consumed_through] free bytes ≤ this seq
+	FrameResume    FrameType = 0x06 // daemon → sidecar: [u64 from_seq] reposition read cursor
 
-	FrameStdout    FrameType = 0x10 // sidecar → daemon: raw PTY output
+	FrameStdout    FrameType = 0x10 // sidecar → daemon: [u64 first_byte_seq][u8 flags][N bytes]
 	FrameEchoState FrameType = 0x11 // sidecar → daemon: [u8 echo] 0=off 1=on 2=unknown
 	FrameChildExit FrameType = 0x12 // sidecar → daemon: [i32 code][i32 signal]
+)
+
+// Flag bits for FrameStdout body. The flags byte sits between the
+// seq prefix and the payload bytes.
+const (
+	// StdoutFlagTruncBefore signals that bytes were silently dropped
+	// between the previous FrameStdout's last byte and this frame's
+	// first byte. The daemon advances its session-ring headSeq past
+	// the gap (no payload bytes for the lost span) so iOS's existing
+	// AttachAck.trunc semantics fire on the next attach.
+	StdoutFlagTruncBefore byte = 0x01
 )
 
 // MaxFramePayload bounds the body length of any single frame. Sized
@@ -143,4 +156,57 @@ func DecodeChildExit(body []byte) (code, signal int32, err error) {
 	code = int32(binary.BigEndian.Uint32(body[0:4]))
 	signal = int32(binary.BigEndian.Uint32(body[4:8]))
 	return code, signal, nil
+}
+
+// EncodeSeq builds an 8-byte body carrying a single u64 seq value.
+// Used as the body of FrameAck (consumed_through) and FrameResume
+// (from_seq).
+func EncodeSeq(seq uint64) []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, seq)
+	return b
+}
+
+// DecodeSeq parses an 8-byte seq body. Used for FrameAck + FrameResume.
+func DecodeSeq(body []byte) (seq uint64, err error) {
+	if len(body) != 8 {
+		return 0, fmt.Errorf("ptysidecar: seq body must be 8 bytes, got %d", len(body))
+	}
+	return binary.BigEndian.Uint64(body), nil
+}
+
+// stdoutHeaderLen is the on-wire size of [u64 first_seq][u8 flags].
+const stdoutHeaderLen = 9
+
+// EncodeStdoutBody builds a FrameStdout body. The first 8 bytes carry
+// the seq of `payload[0]`; the next byte carries flags; the rest is
+// the payload. A zero-payload frame (purely a Trunc signal) is legal
+// — `payload` may be nil.
+func EncodeStdoutBody(firstSeq uint64, flags byte, payload []byte) []byte {
+	b := make([]byte, stdoutHeaderLen+len(payload))
+	binary.BigEndian.PutUint64(b[0:8], firstSeq)
+	b[8] = flags
+	if len(payload) > 0 {
+		copy(b[9:], payload)
+	}
+	return b
+}
+
+// DecodeStdoutBody parses a FrameStdout body. Returns the seq of the
+// first payload byte (or, when payload is empty, the next seq the
+// drainer would have emitted had bytes been available), the flags
+// byte, and a slice that aliases `body` for the payload portion.
+//
+// The returned `payload` shares backing memory with `body` — callers
+// that retain it across the next ReadFrame must copy.
+func DecodeStdoutBody(body []byte) (firstSeq uint64, flags byte, payload []byte, err error) {
+	if len(body) < stdoutHeaderLen {
+		return 0, 0, nil, fmt.Errorf("ptysidecar: stdout body must be ≥%d bytes, got %d", stdoutHeaderLen, len(body))
+	}
+	firstSeq = binary.BigEndian.Uint64(body[0:8])
+	flags = body[8]
+	if len(body) > stdoutHeaderLen {
+		payload = body[stdoutHeaderLen:]
+	}
+	return firstSeq, flags, payload, nil
 }

@@ -104,6 +104,69 @@ func TestDecodeResizeRejectsShortBody(t *testing.T) {
 	}
 }
 
+func TestEncodeDecodeSeq(t *testing.T) {
+	for _, s := range []uint64{0, 1, 42, 1<<32 - 1, 1<<63 + 7, ^uint64(0)} {
+		body := EncodeSeq(s)
+		if len(body) != 8 {
+			t.Errorf("EncodeSeq(%d): want 8 bytes, got %d", s, len(body))
+		}
+		got, err := DecodeSeq(body)
+		if err != nil {
+			t.Errorf("DecodeSeq(%d): %v", s, err)
+		}
+		if got != s {
+			t.Errorf("roundtrip: want %d, got %d", s, got)
+		}
+	}
+}
+
+func TestDecodeSeqRejectsShortBody(t *testing.T) {
+	_, err := DecodeSeq([]byte{0x00, 0x01})
+	if err == nil {
+		t.Fatal("expected error on short body")
+	}
+}
+
+func TestEncodeDecodeStdoutBody(t *testing.T) {
+	cases := []struct {
+		name     string
+		firstSeq uint64
+		flags    byte
+		payload  []byte
+	}{
+		{"small no flags", 0, 0, []byte("hello")},
+		{"with trunc flag", 1024, StdoutFlagTruncBefore, []byte("after gap")},
+		{"trunc-only frame", 99, StdoutFlagTruncBefore, nil},
+		{"large seq", 1 << 50, 0, []byte("seq survives 50-bit shift")},
+		{"empty payload no flag", 0, 0, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := EncodeStdoutBody(tc.firstSeq, tc.flags, tc.payload)
+			firstSeq, flags, payload, err := DecodeStdoutBody(body)
+			if err != nil {
+				t.Fatalf("DecodeStdoutBody: %v", err)
+			}
+			if firstSeq != tc.firstSeq {
+				t.Errorf("firstSeq: want %d, got %d", tc.firstSeq, firstSeq)
+			}
+			if flags != tc.flags {
+				t.Errorf("flags: want 0x%02x, got 0x%02x", tc.flags, flags)
+			}
+			if !bytes.Equal(payload, tc.payload) && !(len(payload) == 0 && len(tc.payload) == 0) {
+				t.Errorf("payload mismatch: want %q, got %q", tc.payload, payload)
+			}
+		})
+	}
+}
+
+func TestDecodeStdoutBodyRejectsShortHeader(t *testing.T) {
+	_, _, _, err := DecodeStdoutBody([]byte{0x00, 0x01})
+	if err == nil {
+		t.Fatal("expected error on header-truncated body")
+	}
+}
+
 func TestEncodeDecodeChildExit(t *testing.T) {
 	for _, tc := range []struct{ code, signal int32 }{
 		{0, 0}, {1, 0}, {42, 0}, {0, 9}, {0, 15}, {-1, 0},

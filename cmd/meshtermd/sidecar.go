@@ -29,6 +29,8 @@ func runPtySidecar(args []string) int {
 	pidfile := fs.String("pidfile", "", "path to write the flock'd pidfile (required)")
 	sessionID := fs.String("session-id", "", "hex sessionID, used in log fields (optional)")
 	shell := fs.String("shell", "", "absolute path to child shell ($SHELL → /bin/sh if empty)")
+	var shellArgs stringSliceFlag
+	fs.Var(&shellArgs, "shell-arg", "additional arg passed to the child shell after the binary name; repeat for multiple")
 	rows := fs.Uint("rows", 24, "initial PTY rows")
 	cols := fs.Uint("cols", 80, "initial PTY cols")
 	envFile := fs.String("env-file", "", "path to KEY=VAL\\n env file; deleted by sidecar after read")
@@ -59,6 +61,7 @@ func runPtySidecar(args []string) int {
 		PidfilePath: *pidfile,
 		SessionID:   *sessionID,
 		Shell:       *shell,
+		ShellArgs:   shellArgs,
 		Rows:        uint16(*rows),
 		Cols:        uint16(*cols),
 		EnvFile:     *envFile,
@@ -78,6 +81,22 @@ func runPtySidecar(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// stringSliceFlag is a flag.Value that accumulates repeated --flag=val
+// occurrences into a slice. Used for --shell-arg.
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string {
+	if s == nil {
+		return ""
+	}
+	return fmt.Sprintf("%v", []string(*s))
+}
+
+func (s *stringSliceFlag) Set(v string) error {
+	*s = append(*s, v)
+	return nil
 }
 
 func buildSidecarLogger(path string) *slog.Logger {

@@ -42,6 +42,8 @@ func runPtySidecarForTests(args []string) int {
 	pidfile := fs.String("pidfile", "", "")
 	sessionID := fs.String("session-id", "", "")
 	shell := fs.String("shell", "", "")
+	var shellArgs sliceFlag
+	fs.Var(&shellArgs, "shell-arg", "")
 	rows := fs.Uint("rows", 24, "")
 	cols := fs.Uint("cols", 80, "")
 	envFile := fs.String("env-file", "", "")
@@ -76,6 +78,7 @@ func runPtySidecarForTests(args []string) int {
 		PidfilePath: *pidfile,
 		SessionID:   *sessionID,
 		Shell:       *shell,
+		ShellArgs:   shellArgs,
 		Rows:        uint16(*rows),
 		Cols:        uint16(*cols),
 		EnvFile:     *envFile,
@@ -87,4 +90,13 @@ func runPtySidecarForTests(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// sliceFlag accumulates a repeating --flag=val into a string slice.
+type sliceFlag []string
+
+func (s *sliceFlag) String() string { return fmt.Sprintf("%v", []string(*s)) }
+func (s *sliceFlag) Set(v string) error {
+	*s = append(*s, v)
+	return nil
 }

@@ -81,6 +81,82 @@ func startDaemon(t *testing.T) (*Daemon, *ipc.Client, func()) {
 	return d, ipc.NewClient(socket, time.Second), cleanup
 }
 
+// TestDaemonSessionBufferBytesConfigFlowsThrough verifies that
+// Config.SessionBufferBytes from `meshtermd serve --session-buffer-bytes N`
+// actually reaches the per-session RingBuffer that spawnSession creates.
+// Without this, the flag would silently default to 4 MiB and operators
+// wouldn't see their `--session-buffer-bytes 16777216` take effect.
+func TestDaemonSessionBufferBytesConfigFlowsThrough(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("daemon assumes POSIX")
+	}
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("/bin/sh not available")
+	}
+	tmp := t.TempDir()
+	if err := os.Chmod(tmp, 0o700); err != nil {
+		t.Fatalf("chmod tempdir: %v", err)
+	}
+	socket := filepath.Join(tmp, "meshtermd.sock")
+
+	const want = 8 * 1024 * 1024 // 8 MiB; non-default so a regression to the 4 MiB const fails this test.
+
+	d, err := New(Config{
+		QUICAddr:           "127.0.0.1:0",
+		IPCSocketPath:      socket,
+		CertDir:            tmp,
+		IdleTimeout:        time.Hour,
+		SessionBufferBytes: want,
+	})
+	if err != nil {
+		t.Fatalf("daemon.New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- d.Run(ctx) }()
+	defer func() {
+		cancel()
+		<-runDone
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(socket); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("daemon socket did not appear within 1s")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	c := ipc.NewClient(socket, time.Second)
+	resp, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID: "new",
+		Rows:      24,
+		Cols:      80,
+		Shell:     "/bin/sh",
+		Exec:      []string{"-c", "while true; do sleep 1; done"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Ok {
+		t.Fatalf("Allocate failed: %s %s", resp.Err, resp.Msg)
+	}
+	sid, err := session.ParseSessionID(resp.SessionID)
+	if err != nil {
+		t.Fatalf("ParseSessionID(%q): %v", resp.SessionID, err)
+	}
+	sess, err := d.registry.Lookup(sid)
+	if err != nil {
+		t.Fatalf("registry.Lookup: %v", err)
+	}
+	if got := sess.Buffer().Capacity(); got != want {
+		t.Errorf("session buffer Capacity() = %d, want %d", got, want)
+	}
+}
+
 func TestDaemonAllocateNewSessionReturnsValidBootstrap(t *testing.T) {
 	t.Parallel()
 	d, c, cleanup := startDaemon(t)

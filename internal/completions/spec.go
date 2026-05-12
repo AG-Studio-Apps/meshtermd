@@ -89,8 +89,11 @@ var Meshtermd = Binary{
 		{Name: "serve", Help: "run the long-lived daemon",
 			Flags: []Flag{
 				{Long: "--addr", Help: "QUIC listen address (default 127.0.0.1:0)"},
+				{Long: "--socket", Help: "IPC socket path (default: XDG_RUNTIME_DIR/meshtermd.sock)"},
 				{Long: "--max-sessions", Help: "cap on concurrent sessions"},
-				{Long: "--max-idle-timeout", Help: "ceiling for per-session idle timeouts"}}},
+				{Long: "--idle-timeout", Help: "default per-session idle timeout (0 = 1h)"},
+				{Long: "--max-idle-timeout", Help: "ceiling for per-session idle timeouts"},
+				{Long: "--session-buffer-bytes", Help: "per-session output ring buffer in bytes (0 = 4 MiB)"}}},
 		{Name: "connect", Help: "SSH-side bootstrap helper (invoked by the iOS app)"},
 		{Name: "list", Help: "enumerate live sessions on this daemon",
 			Flags: []Flag{jsonFlag}},

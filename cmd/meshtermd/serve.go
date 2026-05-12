@@ -34,6 +34,11 @@ func runServe(args []string) int {
 	maxIdleTimeout := fs.Duration("max-idle-timeout", 0,
 		"ceiling on per-session idle-timeout requests from clients. 0 = no ceiling (appropriate for personal-server "+
 			"deployments). Set on shared/multi-user hosts to bound resource cost (e.g. 168h = 7d).")
+	sessionBufferBytes := fs.Int("session-buffer-bytes", 0,
+		"per-session output ring buffer capacity in bytes (0 = default 4 MiB). Raise this on hosts where you watch "+
+			"long, output-heavy builds and want more reattach-replay history. Each live session allocates one buffer "+
+			"of this size, so the worst-case RAM cost is N×<value> where N is the active-session count. "+
+			"Common values: 16777216 (16 MiB), 33554432 (32 MiB).")
 	verbose := fs.Bool("v", false, "verbose logging (slog DEBUG level)")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: meshtermd serve [flags]\n\n")
@@ -53,12 +58,13 @@ func runServe(args []string) int {
 	}
 
 	d, err := daemon.New(daemon.Config{
-		QUICAddr:       *addr,
-		IPCSocketPath:  socketPath,
-		MaxSessions:    *maxSessions,
-		IdleTimeout:    *idleTimeout,
-		MaxIdleTimeout: *maxIdleTimeout,
-		Logger:         logger,
+		QUICAddr:           *addr,
+		IPCSocketPath:      socketPath,
+		MaxSessions:        *maxSessions,
+		IdleTimeout:        *idleTimeout,
+		MaxIdleTimeout:     *maxIdleTimeout,
+		SessionBufferBytes: *sessionBufferBytes,
+		Logger:             logger,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "meshtermd serve: %v\n", err)

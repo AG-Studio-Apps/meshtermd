@@ -37,6 +37,13 @@ real scrollback through every disconnect.
     SSH bootstrap helper. Normally launched by a supervisor (systemd-user,
     launchd, or nohup fallback) rather than directly.
 
+    Notable flags: **\-\-addr** (QUIC bind), **\-\-socket** (IPC
+    socket path), **\-\-max-sessions** (concurrent session cap),
+    **\-\-idle-timeout** / **\-\-max-idle-timeout** (per-session GC
+    knobs), **\-\-session-buffer-bytes** (per-session output ring
+    buffer; default 4 MiB, raise for hosts where you want richer
+    reattach-replay history during long output-heavy builds).
+
 **connect** [*options*]
 :   SSH-side bootstrap helper invoked by the meshTerm iOS app (or by
     **mtctl attach**). Allocates a single-use attach token, looks up

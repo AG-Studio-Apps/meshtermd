@@ -61,6 +61,14 @@ type Config struct {
 	// client requesting a 30-day timeout on every session.
 	MaxIdleTimeout time.Duration
 
+	// SessionBufferBytes overrides the per-session output ring buffer
+	// capacity. Zero falls back to session.DefaultBufferCapacity
+	// (4 MiB). Operators who run long, output-heavy builds and want
+	// generous reattach-replay history should raise this; the trade
+	// is RAM per live session (one buffer per session). 16-32 MiB is
+	// reasonable on a dev box; multi-MiB hits are fine even on a Pi.
+	SessionBufferBytes int
+
 	// Logger receives operational logs. Defaults to slog.Default().
 	Logger *slog.Logger
 }
@@ -505,7 +513,9 @@ func (d *Daemon) spawnSession(req ipc.AllocateRequest) (*session.Session, error)
 		return nil, &allocateErr{Code: ipc.ErrSpawnFailed, Msg: err.Error()}
 	}
 
-	sess, err := session.NewSession(sid, name, ptyHandle, rows, cols, 0, idleTimeout)
+	// Operator-configurable buffer cap; 0 falls back to
+	// session.DefaultBufferCapacity inside NewSession.
+	sess, err := session.NewSession(sid, name, ptyHandle, rows, cols, d.cfg.SessionBufferBytes, idleTimeout)
 	if err != nil {
 		_ = ptyHandle.Close()
 		return nil, &allocateErr{Code: ipc.ErrInternal, Msg: err.Error()}

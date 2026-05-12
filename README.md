@@ -56,7 +56,15 @@ The minisign public key for `SHA256SUMS.minisig` verification lives in [`docs/re
 
 The formula and `PKGBUILD`s are already staged under [`packaging/`](packaging/) so anyone curious can preview the install shape; the live channels go up on co-release day.
 
-Once installed, the daemon usually runs under a supervisor — systemd-user on Linux, launchd on macOS, or a `nohup` fallback. The supervisor unit is dropped automatically by the iOS app's auto-installer on first connect, or you can write one yourself by hand.
+Once installed, the daemon usually runs under a supervisor — systemd-user on Linux, launchd on macOS, or a `nohup` fallback. The supervisor unit is dropped automatically by the iOS app's auto-installer on first connect, by the distro packages on `pacman -S` / `brew install`, or by hand:
+
+```
+meshtermd unit print > ~/.config/systemd/user/meshtermd.service
+systemctl --user daemon-reload
+systemctl --user enable --now meshtermd
+```
+
+`meshtermd unit print` is the single source of truth for the systemd-user unit — it's what every install path emits, so the `KillMode=process` setting (load-bearing for v0.6+ pty-sidecar restart-resilience) is always in place.
 
 ## Companion CLI: `mtctl`
 

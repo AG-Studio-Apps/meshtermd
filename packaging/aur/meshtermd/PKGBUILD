@@ -37,6 +37,15 @@ package() {
     install -Dm755 meshtermd "${pkgdir}/usr/bin/meshtermd"
     install -Dm755 mtctl     "${pkgdir}/usr/bin/mtctl"
 
+    # systemd-user unit. Generated from the daemon binary itself so
+    # the file always matches what `meshtermd unit print` emits —
+    # avoids drift between this PKGBUILD and the in-tree template.
+    # Lands under /usr/lib/systemd/user/ where systemd-user finds
+    # vendor-shipped units; an `ExecStart=%h/.local/bin/meshtermd` is
+    # rewritten to `/usr/bin/meshtermd` for the distro install path.
+    ./meshtermd unit print --bin=/usr/bin/meshtermd > meshtermd.service
+    install -Dm644 meshtermd.service "${pkgdir}/usr/lib/systemd/user/meshtermd.service"
+
     # Man pages.
     install -Dm644 dist/man/meshtermd.8 "${pkgdir}/usr/share/man/man8/meshtermd.8"
     install -Dm644 dist/man/mtctl.1     "${pkgdir}/usr/share/man/man1/mtctl.1"

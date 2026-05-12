@@ -48,6 +48,24 @@ type Registry struct {
 	// indices must move in lockstep on Add/Remove/Sweep.
 	byName map[string]*Session
 	tokens map[AttachToken]pendingAttach
+
+	// stateDir is the daemon's persistence root directory (the parent
+	// of `sessions/`). Set by the daemon via SetStateDir after
+	// constructing the registry. When non-empty, Remove and Sweep
+	// remove the per-session on-disk directory for reaped sessions
+	// so disk space doesn't leak. Shutdown deliberately does NOT —
+	// daemon-shutdown preserves on-disk state for the next start.
+	// Empty string disables the cleanup (tests, dev setups without
+	// a state dir).
+	stateDir string
+
+	// persistenceDefault is the daemon-wide default for whether new
+	// sessions opt into disk persistence. Resolved through
+	// ResolvePersist against the client's tri-state request:
+	// nil → use this default; explicit true/false → honour the
+	// client. Default true (matches the SSHHost.persistRoamSessions
+	// default-on on iOS). Set by the daemon via SetPersistenceDefault.
+	persistenceDefault bool
 }
 
 // pendingAttach is the registry-side state for a single in-flight
@@ -175,14 +193,69 @@ func NewRegistry(maxSessions int, idleTimeout, gcInterval, maxIdleTimeout time.D
 		maxIdleTimeout = 0
 	}
 	return &Registry{
-		maxSessions:    maxSessions,
-		idleTimeout:    idleTimeout,
-		maxIdleTimeout: maxIdleTimeout,
-		gcInterval:     gcInterval,
-		sessions:       make(map[SessionID]*Session),
-		byName:         make(map[string]*Session),
-		tokens:         make(map[AttachToken]pendingAttach),
+		maxSessions:        maxSessions,
+		idleTimeout:        idleTimeout,
+		maxIdleTimeout:     maxIdleTimeout,
+		gcInterval:         gcInterval,
+		sessions:           make(map[SessionID]*Session),
+		byName:             make(map[string]*Session),
+		tokens:             make(map[AttachToken]pendingAttach),
+		// Persistence default-on matches the iOS SSHHost.persistRoamSessions
+		// default-on. Daemons running on shared / multi-user hosts can
+		// flip this via `meshtermd serve --persistence-default off`
+		// (which calls SetPersistenceDefault(false) at startup).
+		persistenceDefault: true,
 	}
+}
+
+// SetStateDir wires the daemon's persistence root directory in so
+// Remove + Sweep clean up the per-session subdirectories for reaped
+// sessions. Pass empty to disable (tests). Idempotent; safe to call
+// multiple times.
+func (r *Registry) SetStateDir(dir string) {
+	r.mu.Lock()
+	r.stateDir = dir
+	r.mu.Unlock()
+}
+
+// StateDir returns the configured persistence root. Used by the
+// daemon's startup path to feed LoadPersisted and the flusher.
+func (r *Registry) StateDir() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.stateDir
+}
+
+// SetPersistenceDefault flips the daemon-wide opt-in default for new
+// sessions whose client didn't specify Persist. Default true on
+// fresh registries; daemons running with `--persistence-default off`
+// flip this at startup to opt-out for shared / multi-user hosts.
+func (r *Registry) SetPersistenceDefault(on bool) {
+	r.mu.Lock()
+	r.persistenceDefault = on
+	r.mu.Unlock()
+}
+
+// PersistenceDefault returns the daemon-wide default. Used by
+// HandleStatus for operator visibility into the running config.
+func (r *Registry) PersistenceDefault() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.persistenceDefault
+}
+
+// ResolvePersist maps a client-requested Persist value (nil =
+// "use the daemon default", or an explicit true/false) to the
+// concrete bool the session will carry. Mirrors ResolveIdleTimeout's
+// shape so the daemon orchestration code threads the two through
+// the same way.
+func (r *Registry) ResolvePersist(requested *bool) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if requested == nil {
+		return r.persistenceDefault
+	}
+	return *requested
 }
 
 // ResolveIdleTimeout maps a client-requested timeout to the value the
@@ -346,6 +419,13 @@ func (r *Registry) Remove(id SessionID) {
 	r.mu.Unlock()
 	if s != nil {
 		_ = s.Close()
+		// Remove is the explicit-kill path (e.g. mtctl kill). Drop
+		// the on-disk persistence dir so reaped sessions don't leak
+		// disk space. Daemon shutdown uses Shutdown which preserves
+		// on-disk state for the next start.
+		if r.stateDir != "" {
+			_ = s.DeletePersisted(r.stateDir)
+		}
 	}
 }
 
@@ -532,6 +612,12 @@ func (r *Registry) Sweep() int {
 
 	for _, s := range doomed {
 		_ = s.Close()
+		// GC-reaped sessions should have their on-disk persistence
+		// directory removed too — they're leaving the registry
+		// permanently, unlike daemon-shutdown which preserves state.
+		if r.stateDir != "" {
+			_ = s.DeletePersisted(r.stateDir)
+		}
 		if r.OnReap != nil {
 			r.OnReap(s)
 		}

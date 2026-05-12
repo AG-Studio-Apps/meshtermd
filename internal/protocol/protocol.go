@@ -191,6 +191,22 @@ type AttachAck struct {
 	Peers     []string `cbor:"peers,omitempty"`
 	Err       string   `cbor:"err,omitempty"`
 	Msg       string   `cbor:"msg,omitempty"`
+	// Restored is true when the session this attach is connecting to
+	// was reconstructed from on-disk state at the daemon's most
+	// recent startup, rather than freshly spawned. Set on the FIRST
+	// successful attach after a daemon restart; the daemon clears
+	// the session's restoredFromDisk flag immediately after sending
+	// the AttachAck so subsequent reattaches (within the same daemon
+	// run) see Restored=false.
+	//
+	// Clients use this to surface a "Restored from previous session"
+	// banner so users understand they're seeing replayed scrollback,
+	// not output from a still-running shell — the actual shell is a
+	// fresh process that the daemon lazy-spawned on this attach.
+	// Forward-compat: older clients ignore the field with no UI
+	// difference; CBOR omitempty keeps the wire form small in the
+	// non-restored common case.
+	Restored bool `cbor:"r,omitempty"`
 }
 
 // Ack reports the highest output sequence number the client has

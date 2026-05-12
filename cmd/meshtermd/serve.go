@@ -39,6 +39,14 @@ func runServe(args []string) int {
 			"long, output-heavy builds and want more reattach-replay history. Each live session allocates one buffer "+
 			"of this size, so the worst-case RAM cost is N×<value> where N is the active-session count. "+
 			"Common values: 16777216 (16 MiB), 33554432 (32 MiB).")
+	persistenceDefault := fs.String("persistence-default", "on",
+		"daemon-wide default for cross-restart session persistence: 'on' (default; new sessions persist to disk so "+
+			"they survive daemon updates and host reboots) or 'off' (sessions are in-memory only unless the client "+
+			"explicitly passes --persist). Clients can override per-session via meshtermd connect --persist/--no-persist.")
+	persistenceFlushInterval := fs.Duration("persistence-flush-interval", 0,
+		"how often each persisted session checkpoints its scrollback to disk. 0 = default 30s. Shorter = more "+
+			"frequent disk I/O; longer = more scrollback lost on crash. The final snapshot on graceful shutdown "+
+			"runs regardless.")
 	verbose := fs.Bool("v", false, "verbose logging (slog DEBUG level)")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: meshtermd serve [flags]\n\n")
@@ -57,14 +65,33 @@ func runServe(args []string) int {
 		socketPath = defaultSocketPath()
 	}
 
+	// Parse --persistence-default. Tolerate "on"/"off" plus the
+	// usual bool synonyms so users don't have to remember exactly.
+	var persistDefault *bool
+	switch *persistenceDefault {
+	case "on", "true", "yes", "1":
+		v := true
+		persistDefault = &v
+	case "off", "false", "no", "0":
+		v := false
+		persistDefault = &v
+	case "":
+		// leave nil so the daemon's NewRegistry default applies
+	default:
+		fmt.Fprintf(os.Stderr, "meshtermd serve: invalid --persistence-default %q (want on|off)\n", *persistenceDefault)
+		return 2
+	}
+
 	d, err := daemon.New(daemon.Config{
-		QUICAddr:           *addr,
-		IPCSocketPath:      socketPath,
-		MaxSessions:        *maxSessions,
-		IdleTimeout:        *idleTimeout,
-		MaxIdleTimeout:     *maxIdleTimeout,
-		SessionBufferBytes: *sessionBufferBytes,
-		Logger:             logger,
+		QUICAddr:                 *addr,
+		IPCSocketPath:            socketPath,
+		MaxSessions:              *maxSessions,
+		IdleTimeout:              *idleTimeout,
+		MaxIdleTimeout:           *maxIdleTimeout,
+		SessionBufferBytes:       *sessionBufferBytes,
+		PersistenceDefault:       persistDefault,
+		PersistenceFlushInterval: *persistenceFlushInterval,
+		Logger:                   logger,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "meshtermd serve: %v\n", err)

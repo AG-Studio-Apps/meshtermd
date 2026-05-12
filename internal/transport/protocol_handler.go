@@ -56,6 +56,16 @@ func drainBriefly(s *quic.Stream, d time.Duration) {
 type ProtocolHandler struct {
 	Registry *session.Registry
 	Logger   *slog.Logger
+
+	// PTYSpawner is the lazy-spawn factory the handler calls when a
+	// client attaches to a session that was restored from disk by
+	// LoadPersisted (and therefore has Session.pty == nil). The daemon
+	// wires this to a closure that does pty.Spawn with the user's
+	// shell, then starts Session.Pump in a new goroutine. Nil-safe:
+	// when this field is nil, restored sessions can't be reattached
+	// (the AttachAck reports a generic error) — tests that don't
+	// exercise restore can leave it unset.
+	PTYSpawner func(rows, cols uint16) (session.PTY, error)
 }
 
 // HandleConnection implements Handler.
@@ -108,6 +118,23 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 	attachMode := session.AttachExclusive
 	if att.Mode == protocol.AttachModeReadonly {
 		attachMode = session.AttachReadonly
+	}
+
+	// Lazy-spawn the PTY for sessions hydrated by LoadPersisted. The
+	// session's scrollback is already populated from the on-disk
+	// snapshot; we just need a fresh shell process to attach to.
+	// Capture the restored flag NOW so the AttachAck a few lines
+	// below can report it (AssignPTY clears the flag).
+	wasRestored := sess.RestoredFromDisk()
+	if wasRestored {
+		if err := h.lazySpawnRestoredPTY(ctx, sess, att.Rows, att.Cols, log); err != nil {
+			_ = sendAttachAck(ctrl, protocol.AttachAck{
+				V:   1,
+				Err: protocol.AttachErrUnknownSession,
+				Msg: "restored session: " + err.Error(),
+			})
+			return
+		}
 	}
 
 	// Acquire the session — exclusive displaces any prior exclusive
@@ -172,6 +199,7 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 		Trunc:     trunc,
 		Mode:      resolvedMode,
 		Peers:     sess.PeerModes(attachGen),
+		Restored:  wasRestored,
 	})
 	if err != nil {
 		log.WarnContext(ctx, "marshal AttachAck", "err", err)
@@ -256,6 +284,62 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 
 	wg.Wait()
 	log.InfoContext(ctx, "connection closed", "session", sess.ID().String())
+}
+
+// lazySpawnRestoredPTY handles the first-attach-after-restart path
+// for a session that was hydrated from disk by LoadPersisted. The
+// session's scrollback is already populated from the snapshot, but
+// the PTY field is nil (no shell process — the previous daemon
+// instance's child died on its SIGTERM). We spawn a fresh shell at
+// the session's saved dimensions, hand it to Session.AssignPTY, and
+// start the Pump goroutine so subsequent output flows into the same
+// ring buffer the restored scrollback lives in.
+//
+// Concurrency: two simultaneous attaches can race here. AssignPTY's
+// nil-check + ErrSessionHasPTY tells the loser they lost; the loser
+// closes its handle and proceeds with a normal attach. No retry
+// needed — the winner's spawn is what both clients end up attached
+// to.
+func (h *ProtocolHandler) lazySpawnRestoredPTY(ctx context.Context, sess *session.Session, rows, cols uint16, log *slog.Logger) error {
+	if h.PTYSpawner == nil {
+		return errors.New("daemon not configured for restored sessions")
+	}
+	if rows == 0 || cols == 0 {
+		// Fall back to the session's persisted dimensions.
+		savedRows, savedCols := sess.WindowSize()
+		if rows == 0 {
+			rows = savedRows
+		}
+		if cols == 0 {
+			cols = savedCols
+		}
+	}
+	handle, err := h.PTYSpawner(rows, cols)
+	if err != nil {
+		return fmt.Errorf("spawn PTY: %w", err)
+	}
+	if err := sess.AssignPTY(handle); err != nil {
+		// Race lost OR session was closed in the meantime. Either
+		// way, close our handle so we don't leak the child shell.
+		// Closer is the PTY interface's Close method.
+		if closer, ok := handle.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+		if errors.Is(err, session.ErrSessionHasPTY) {
+			// Winner's PTY is in place; attach can proceed.
+			return nil
+		}
+		return err
+	}
+	// We won the race — start the pump so output flows.
+	go sess.Pump()
+	log.InfoContext(ctx, "session.restored.lazy_spawn",
+		"session", sess.ID().String(),
+		"name", sess.Name(),
+		"rows", rows,
+		"cols", cols,
+	)
+	return nil
 }
 
 func (h *ProtocolHandler) logger() *slog.Logger {

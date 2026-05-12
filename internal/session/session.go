@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -200,6 +201,13 @@ type Session struct {
 	// banner. After first attach the session behaves identically
 	// to a freshly-spawned one.
 	restoredFromDisk bool
+
+	// flusherCancel and flusherDone are the lifecycle handles for
+	// the background snapshot goroutine. Non-nil while running.
+	// Cleared by stopFlusher (called from Close). Idempotent —
+	// StartFlusher checks for non-nil and no-ops.
+	flusherCancel context.CancelFunc
+	flusherDone   chan struct{}
 
 	closed bool
 }
@@ -590,8 +598,16 @@ func (s *Session) Closed() bool {
 }
 
 // Close terminates the PTY (which sends SIGHUP to the child),
-// cancels every attached client, and marks the session unusable.
-// Safe to call multiple times; subsequent calls return nil.
+// cancels every attached client, stops the persistence flusher
+// (if running), and marks the session unusable. Safe to call
+// multiple times; subsequent calls return nil.
+//
+// Close intentionally does NOT delete the session's on-disk
+// persistence directory — that decision belongs to the caller:
+// Registry.Remove / Sweep call DeletePersisted afterward (Kill
+// or idle-GC reap should drop the on-disk state), but
+// Registry.Shutdown (daemon-wide shutdown) leaves it so the next
+// daemon start can restore.
 func (s *Session) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -610,6 +626,13 @@ func (s *Session) Close() error {
 	s.clients = nil
 	s.mu.Unlock()
 
+	// Synchronously stop the flusher BEFORE closing the PTY. This
+	// gives the flusher's ctx-done path a chance to do its final
+	// SaveTo before we mark the session closed (and on daemon
+	// shutdown that final write is what preserves the session for
+	// the next daemon start).
+	s.stopFlusher()
+
 	for _, c := range cancels {
 		c()
 	}
@@ -617,6 +640,144 @@ func (s *Session) Close() error {
 		return pty.Close()
 	}
 	return nil
+}
+
+// ErrSessionHasPTY is returned by AssignPTY when called on a session
+// that already owns a PTY. Indicates a race between two attach
+// handlers both trying to be the first-attach lazy spawner for a
+// restored session; the loser closes its handle and continues.
+var ErrSessionHasPTY = errors.New("session already has a PTY")
+
+// AssignPTY hands ownership of a freshly-spawned PTY to a previously-
+// restored Session. The caller (protocol_handler on first attach to
+// a session that was hydrated by LoadPersisted) builds the *pty.Handle
+// via pty.Spawn and passes it here; AssignPTY plumbs it onto s.pty
+// and clears the restoredFromDisk flag so subsequent attaches see
+// Restored=false on the wire.
+//
+// On error the caller is responsible for closing the supplied PTY —
+// AssignPTY does NOT take ownership if it fails. The expected error
+// is ErrSessionHasPTY (race lost to another concurrent attach);
+// callers handle that by simply closing their PTY handle and
+// proceeding with the normal attach path.
+//
+// The caller must also start the session's Pump goroutine
+// (`go sess.Pump()`) after a successful AssignPTY — this method
+// only wires the handle; it doesn't kick off reads.
+func (s *Session) AssignPTY(p PTY) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrSessionClosed
+	}
+	if s.pty != nil {
+		return ErrSessionHasPTY
+	}
+	s.pty = p
+	s.restoredFromDisk = false
+	return nil
+}
+
+// StartFlusher launches the background snapshot loop. Idempotent —
+// second call is a no-op (or a no-op when persist is false). The
+// flusher writes via SaveTo on every interval where the buffer's
+// HeadSeq has advanced past the last snapshot, plus one final write
+// on stopFlusher. Failed writes are logged but don't kill the loop.
+//
+// `parentDir` is the daemon's state dir (the parent of `sessions/`).
+// `interval` zero falls back to 30 seconds. `logger` may be nil
+// (defaults to slog.Default()).
+func (s *Session) StartFlusher(parentDir string, interval time.Duration, logger *slog.Logger) {
+	s.mu.Lock()
+	if s.flusherCancel != nil || !s.persist || s.closed {
+		s.mu.Unlock()
+		return
+	}
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.flusherCancel = cancel
+	s.flusherDone = make(chan struct{})
+	done := s.flusherDone
+	s.mu.Unlock()
+
+	go func() {
+		defer close(done)
+		s.runFlusher(ctx, parentDir, interval, logger)
+	}()
+}
+
+// runFlusher is the actual snapshot loop body. Exits on ctx
+// cancellation; performs a final flush before returning so daemon
+// shutdown preserves the most-recent state.
+//
+// Two paths through the dirty check:
+//
+//   - Normal tick: checks `s.closed`. If the session has been killed
+//     (Remove/Sweep called Close), the caller will DeletePersisted
+//     shortly — skip the write to avoid recreating a dir that's
+//     about to be removed.
+//   - ctx-done (Close-initiated shutdown): writes UNCONDITIONALLY
+//     if there's dirty state, because Close intentionally preserves
+//     on-disk content. The caller (daemon shutdown) needs the
+//     latest snapshot for the next start. The DeletePersisted-races-
+//     with-final-flush concern doesn't apply here: Close only
+//     touches on-disk after stopFlusher returns (which is after this
+//     function exits), and Remove's DeletePersisted runs even later.
+func (s *Session) runFlusher(ctx context.Context, parentDir string, interval time.Duration, logger *slog.Logger) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+
+	flushIfDirty := func(force bool) {
+		currentHead := s.buf.HeadSeq()
+		s.mu.Lock()
+		last := s.lastSnapshotSeq
+		closed := s.closed
+		s.mu.Unlock()
+		if closed && !force {
+			return
+		}
+		if currentHead == last {
+			return
+		}
+		if err := s.SaveTo(parentDir); err != nil {
+			logger.Warn("session.flusher.write_failed",
+				"session", s.ID().String(),
+				"err", err.Error(),
+			)
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			flushIfDirty(true)
+			return
+		case <-t.C:
+			flushIfDirty(false)
+		}
+	}
+}
+
+// stopFlusher signals the flusher to exit and waits for it. Idempotent.
+// Called from Close; package-private because the lifecycle is owned
+// by Session itself, not by external callers.
+func (s *Session) stopFlusher() {
+	s.mu.Lock()
+	cancel := s.flusherCancel
+	done := s.flusherDone
+	s.flusherCancel = nil
+	s.flusherDone = nil
+	s.mu.Unlock()
+	if cancel == nil {
+		return
+	}
+	cancel()
+	<-done
 }
 
 // Pump runs the read-PTY-into-ring-buffer loop. It blocks until the

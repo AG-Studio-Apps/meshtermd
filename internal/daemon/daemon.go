@@ -69,6 +69,27 @@ type Config struct {
 	// reasonable on a dev box; multi-MiB hits are fine even on a Pi.
 	SessionBufferBytes int
 
+	// PersistenceDefault controls whether new sessions opt into
+	// cross-restart persistence when the client didn't specify
+	// (AllocateRequest.Persist == nil). True (the default-on
+	// posture) matches user-mental-model "of course my work
+	// survives." Operators of shared / multi-user hosts can flip
+	// this to false via `meshtermd serve --persistence-default off`
+	// for privacy-by-default; individual sessions still opt back in
+	// with explicit `--persist`.
+	//
+	// Defaults to true when the field is zero-value (uses the
+	// `*bool` pattern so empty Config behaves correctly).
+	PersistenceDefault *bool
+
+	// PersistenceFlushInterval is how often each persisted session's
+	// background flusher checkpoints its ring buffer to disk. Zero
+	// falls back to 30s, which trades durability (lose up to 30s of
+	// scrollback on crash) for write amplification (4 MiB buffer × 100
+	// sessions × every 30s ≈ 13 MB/s peak even at full saturation,
+	// well within any SSD's budget).
+	PersistenceFlushInterval time.Duration
+
 	// Logger receives operational logs. Defaults to slog.Default().
 	Logger *slog.Logger
 }
@@ -82,6 +103,9 @@ type Daemon struct {
 	registry *session.Registry
 	quic     *transport.Server
 	ipc      *ipc.Server
+	// stateDir is the persistence root resolved at New(). Reused by
+	// spawnSession when starting the per-session flusher.
+	stateDir string
 	// startedAt is set once in New so HandleStatus can compute
 	// uptime without keeping a separate state machine.
 	startedAt time.Time
@@ -125,19 +149,67 @@ func New(cfg Config) (*Daemon, error) {
 		)
 	}
 
+	// Persistence wiring. State dir lives next to the cert dir
+	// (cert.DefaultDir), so a single ~/.local/share/meshtermd holds
+	// everything that survives daemon restart: cert, key, IPC socket,
+	// and now per-session subdirs under sessions/.
+	stateDir := cfg.CertDir
+	if stateDir == "" {
+		stateDir, err = cert.DefaultDir()
+		if err != nil {
+			return nil, fmt.Errorf("resolve state dir: %w", err)
+		}
+	}
+	reg.SetStateDir(stateDir)
+	if cfg.PersistenceDefault != nil {
+		reg.SetPersistenceDefault(*cfg.PersistenceDefault)
+	}
+	// (Zero-value Config preserves the registry's default-on posture
+	// set in NewRegistry — no setter call needed.)
+
 	d := &Daemon{
 		cfg:       cfg,
 		logger:    logger,
 		cert:      tlsCert,
 		certFP:    fp,
 		registry:  reg,
+		stateDir:  stateDir,
 		startedAt: time.Now(),
 	}
 
+	// Hydrate sessions that were persisted by a prior daemon run.
+	// PTYs are NOT spawned here — protocol_handler does that lazily
+	// on the first client attach. The flushers, however, are started
+	// immediately so any output that arrives once a client attaches
+	// gets checkpointed on the normal cadence.
+	restored, lerr := session.LoadPersisted(stateDir, reg, logger)
+	if lerr != nil {
+		logger.Warn("session.persistence.load_failed", "err", lerr.Error())
+	}
+	if restored > 0 {
+		logger.Info("session.persistence.restored", "count", restored)
+	}
+	for _, sid := range reg.IDs() {
+		if s, lookupErr := reg.Lookup(sid); lookupErr == nil && s.Persist() {
+			s.StartFlusher(stateDir, cfg.PersistenceFlushInterval, logger)
+		}
+	}
+
 	d.quic, err = transport.New(transport.Config{
-		Addr:    cfg.QUICAddr,
-		Cert:    tlsCert,
-		Handler: &transport.ProtocolHandler{Registry: reg, Logger: logger},
+		Addr: cfg.QUICAddr,
+		Cert: tlsCert,
+		Handler: &transport.ProtocolHandler{
+			Registry: reg,
+			Logger:   logger,
+			// PTYSpawner gives protocol_handler a way to lazy-spawn
+			// the child shell for a restored session on its first
+			// attach. Closure-over-pty.Spawn keeps the transport
+			// package free of any direct pty import (would be a
+			// layering bend; the daemon owns the spawn policy).
+			PTYSpawner: func(rows, cols uint16) (session.PTY, error) {
+				return pty.Spawn(pty.SpawnConfig{Rows: rows, Cols: cols})
+			},
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("transport: %w", err)
@@ -549,6 +621,14 @@ func (d *Daemon) spawnSession(req ipc.AllocateRequest) (*session.Session, error)
 		return nil, &allocateErr{Code: ipc.ErrInternal, Msg: err.Error()}
 	}
 
+	// Resolve persistence tri-state. nil → daemon default
+	// (`--persistence-default`, default-on). Wire the flag before
+	// the session enters the registry so a Sweep or Remove that
+	// fires before we start the flusher already sees the correct
+	// persist value.
+	persist := d.registry.ResolvePersist(req.Persist)
+	sess.SetPersist(persist)
+
 	if err := d.registry.Add(sess); err != nil {
 		_ = sess.Close()
 		code := ipc.ErrInternal
@@ -561,11 +641,19 @@ func (d *Daemon) spawnSession(req ipc.AllocateRequest) (*session.Session, error)
 		return nil, &allocateErr{Code: code, Msg: err.Error()}
 	}
 
+	// Start the persistence flusher (no-op when persist is false).
+	// Lifecycle is owned by the Session — Session.Close stops the
+	// goroutine and does one final write.
+	if persist {
+		sess.StartFlusher(d.stateDir, d.cfg.PersistenceFlushInterval, d.logger)
+	}
+
 	go sess.Pump()
 	d.logger.Info("session spawned",
 		"session", sid.String(),
 		"name", name,
 		"rows", rows, "cols", cols,
+		"persist", persist,
 	)
 	return sess, nil
 }

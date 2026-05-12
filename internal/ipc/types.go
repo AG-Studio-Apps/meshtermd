@@ -74,6 +74,26 @@ type AllocateRequest struct {
 	// Names must be unique per daemon; collisions on a fresh
 	// spawn return ErrNameInUse.
 	Name string `cbor:"name,omitempty"`
+
+	// Persist is the tri-state opt-in for cross-restart session
+	// persistence:
+	//   nil   → use the daemon-wide default
+	//          (`meshtermd serve --persistence-default`, default on).
+	//   *true  → explicitly opt this session in.
+	//   *false → explicitly opt this session out.
+	//
+	// Pointer-to-bool is the wire-side encoding of the three states
+	// (CBOR omitempty drops nil; serialises true/false explicitly).
+	// This lets clients that don't care about persistence inherit
+	// the daemon's policy without having to know its value, and
+	// older clients that don't set the field round-trip cleanly as
+	// "use default."
+	//
+	// Resolved through Registry.ResolvePersist into a concrete bool
+	// at session-spawn time. Ignored on reattach to an existing
+	// session — persistence is fixed at spawn; opt-out a running
+	// session by killing + respawning.
+	Persist *bool `cbor:"p,omitempty"`
 }
 
 // AllocateResponse carries the fields that go into the bootstrap

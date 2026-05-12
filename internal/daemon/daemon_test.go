@@ -81,6 +81,140 @@ func startDaemon(t *testing.T) (*Daemon, *ipc.Client, func()) {
 	return d, ipc.NewClient(socket, time.Second), cleanup
 }
 
+// TestDaemonPersistenceRoundTrip verifies the end-to-end persistence
+// flow at the daemon level: start a daemon, allocate a persisted
+// session, type bytes into its buffer, stop the daemon, start a fresh
+// daemon on the same state dir, confirm the session is restored with
+// scrollback intact and Restored-flag set.
+func TestDaemonPersistenceRoundTrip(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("daemon assumes POSIX")
+	}
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("/bin/sh not available")
+	}
+	tmp := t.TempDir()
+	if err := os.Chmod(tmp, 0o700); err != nil {
+		t.Fatalf("chmod tempdir: %v", err)
+	}
+	socket := filepath.Join(tmp, "meshtermd.sock")
+
+	d1, err := New(Config{
+		QUICAddr:                 "127.0.0.1:0",
+		IPCSocketPath:            socket,
+		CertDir:                  tmp,
+		IdleTimeout:              time.Hour,
+		PersistenceFlushInterval: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("daemon.New (first): %v", err)
+	}
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	d1Done := make(chan error, 1)
+	go func() { d1Done <- d1.Run(ctx1) }()
+	waitForSocket(t, socket)
+
+	// Allocate a persisted session.
+	c := ipc.NewClient(socket, time.Second)
+	persistTrue := true
+	resp, err := c.Allocate(context.Background(), ipc.AllocateRequest{
+		SessionID: "new",
+		Name:      "persist-test",
+		Rows:      24, Cols: 80,
+		Shell:   "/bin/sh",
+		Exec:    []string{"-c", "while true; do sleep 1; done"},
+		Persist: &persistTrue,
+	})
+	if err != nil || !resp.Ok {
+		t.Fatalf("allocate: %v %s %s", err, resp.Err, resp.Msg)
+	}
+	sid, err := session.ParseSessionID(resp.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Inject scrollback so we can verify it round-trips through disk.
+	sess, err := d1.registry.Lookup(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const payload = "persistence end-to-end test\n"
+	if _, err := sess.Buffer().Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	// Wait for the flusher to checkpoint at least once.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	sessionDir := filepath.Join(tmp, "sessions", sid.String())
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(filepath.Join(sessionDir, "meta.cbor")); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(filepath.Join(sessionDir, "meta.cbor")); err != nil {
+		t.Fatalf("flusher did not write meta.cbor within 500ms: %v", err)
+	}
+
+	// Stop the first daemon. The deferred Shutdown in Registry.Run
+	// fires final flushes via Session.Close → stopFlusher.
+	cancel1()
+	select {
+	case <-d1Done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first daemon did not exit within 2s")
+	}
+
+	// Start a fresh daemon on the same state dir; expect the session
+	// to be restored from disk.
+	d2, err := New(Config{
+		QUICAddr:      "127.0.0.1:0",
+		IPCSocketPath: socket,
+		CertDir:       tmp,
+		IdleTimeout:   time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("daemon.New (second): %v", err)
+	}
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	d2Done := make(chan error, 1)
+	go func() { d2Done <- d2.Run(ctx2) }()
+	waitForSocket(t, socket)
+	defer func() {
+		cancel2()
+		<-d2Done
+	}()
+
+	restored, err := d2.registry.Lookup(sid)
+	if err != nil {
+		t.Fatalf("session not restored: %v", err)
+	}
+	if !restored.RestoredFromDisk() {
+		t.Error("restored session should report RestoredFromDisk() == true")
+	}
+	data, _, _ := restored.Buffer().ReadSince(0, 0)
+	if string(data) != payload {
+		t.Errorf("scrollback after restart: got %q, want %q", data, payload)
+	}
+}
+
+// waitForSocket polls until the IPC socket file appears or fails the
+// test after a short deadline. Used by tests that start daemons in
+// goroutines.
+func waitForSocket(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("socket did not appear within 1s: %s", path)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // TestDaemonSessionBufferBytesConfigFlowsThrough verifies that
 // Config.SessionBufferBytes from `meshtermd serve --session-buffer-bytes N`
 // actually reaches the per-session RingBuffer that spawnSession creates.

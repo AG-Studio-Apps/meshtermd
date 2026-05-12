@@ -257,6 +257,148 @@ func TestDeletePersistedRemovesDirectory(t *testing.T) {
 	}
 }
 
+// TestStartFlusherWritesOnInterval: the background goroutine fires
+// on its ticker cadence, advances lastSnapshotSeq, and produces a
+// readable on-disk snapshot. Uses a short interval (50ms) so the
+// test wraps quickly.
+func TestStartFlusherWritesOnInterval(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s := makePersistedSession(t, []byte("initial"))
+
+	// Pre-flusher: no on-disk state yet.
+	sessionDir := filepath.Join(dir, sessionsSubdir, s.ID().String())
+	if _, err := os.Stat(sessionDir); !os.IsNotExist(err) {
+		t.Fatalf("pre-flusher state: dir should not exist: %v", err)
+	}
+
+	s.StartFlusher(dir, 50*time.Millisecond, nullLogger())
+	t.Cleanup(func() { _ = s.Close() }) // also stops the flusher
+
+	// Wait for at least one tick — flusher needs to fire and call
+	// SaveTo. 200ms gives plenty of margin.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(filepath.Join(sessionDir, metaFilename)); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(filepath.Join(sessionDir, metaFilename)); err != nil {
+		t.Fatalf("flusher did not write meta.cbor within 500ms: %v", err)
+	}
+
+	// Push more bytes; expect the next tick to update the file.
+	_, _ = s.buf.Write([]byte("\nmore output"))
+	time.Sleep(120 * time.Millisecond)
+
+	// Verify the on-disk scrollback reflects the new content via a
+	// fresh Load.
+	reg := NewRegistry(0, time.Hour, time.Hour, 0)
+	if _, err := LoadPersisted(dir, reg, nullLogger()); err != nil {
+		t.Fatalf("LoadPersisted: %v", err)
+	}
+	restored, err := reg.Lookup(s.ID())
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	data, _, _ := restored.Buffer().ReadSince(0, 0)
+	if want := "initial\nmore output"; string(data) != want {
+		t.Errorf("restored buffer = %q, want %q", data, want)
+	}
+}
+
+// TestFlusherFinalFlushOnClose: the ctx-done path inside the flusher
+// performs one final SaveTo before exiting, so a dirty session that
+// hadn't yet reached its next interval is still preserved on
+// daemon shutdown.
+func TestFlusherFinalFlushOnClose(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s := makePersistedSession(t, []byte("before-close"))
+
+	// Long interval so the ticker never fires during the test —
+	// the only write we expect is the final flush from stopFlusher.
+	s.StartFlusher(dir, 1*time.Hour, nullLogger())
+
+	// Append more after the flusher started; this is what the final
+	// flush should capture.
+	_, _ = s.buf.Write([]byte("-final"))
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reg := NewRegistry(0, time.Hour, time.Hour, 0)
+	if _, err := LoadPersisted(dir, reg, nullLogger()); err != nil {
+		t.Fatalf("LoadPersisted: %v", err)
+	}
+	restored, err := reg.Lookup(s.ID())
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	data, _, _ := restored.Buffer().ReadSince(0, 0)
+	if want := "before-close-final"; string(data) != want {
+		t.Errorf("restored buffer after final flush = %q, want %q", data, want)
+	}
+}
+
+// TestResolvePersistTriState verifies the Registry's nil/true/false
+// resolution. nil → daemon default (default-on), true/false → as-is.
+func TestResolvePersistTriState(t *testing.T) {
+	t.Parallel()
+	yes, no := true, false
+	cases := []struct {
+		name      string
+		def       bool
+		requested *bool
+		want      bool
+	}{
+		{"nil with default on", true, nil, true},
+		{"nil with default off", false, nil, false},
+		{"explicit true overrides default off", false, &yes, true},
+		{"explicit false overrides default on", true, &no, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := NewRegistry(0, time.Hour, time.Hour, 0)
+			r.SetPersistenceDefault(tc.def)
+			if got := r.ResolvePersist(tc.requested); got != tc.want {
+				t.Errorf("ResolvePersist(%v) with default=%v = %v, want %v",
+					tc.requested, tc.def, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRemoveDeletesOnDiskState: explicit Remove (mtctl kill path)
+// drops the on-disk session dir so reaped sessions don't leak disk.
+func TestRemoveDeletesOnDiskState(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s := makePersistedSession(t, []byte("kill me"))
+	if err := s.SaveTo(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	reg := NewRegistry(0, time.Hour, time.Hour, 0)
+	reg.SetStateDir(dir)
+	if err := reg.Add(s); err != nil {
+		t.Fatal(err)
+	}
+
+	sessionDir := filepath.Join(dir, sessionsSubdir, s.ID().String())
+	if _, err := os.Stat(sessionDir); err != nil {
+		t.Fatalf("pre-condition: dir should exist: %v", err)
+	}
+
+	reg.Remove(s.ID())
+
+	if _, err := os.Stat(sessionDir); !os.IsNotExist(err) {
+		t.Errorf("Remove did not delete on-disk state")
+	}
+}
+
 // TestLoadPersistedReturnsZeroOnMissingDir: a fresh daemon install
 // (no sessions/ dir yet) should not error.
 func TestLoadPersistedReturnsZeroOnMissingDir(t *testing.T) {

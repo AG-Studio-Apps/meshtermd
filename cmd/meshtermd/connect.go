@@ -47,6 +47,14 @@ func runConnect(args []string) int {
 		"user-visible session name. With --session=new (or omitted), enables 'create-if-missing': the daemon "+
 			"reattaches to an existing session of this name, or spawns a fresh one with this name. With "+
 			"--session=<hex>, --name is ignored (the session's identity is fixed at creation).")
+	persist := fs.Bool("persist", false,
+		"opt this session into cross-restart persistence. The daemon snapshots the scrollback + metadata to "+
+			"~/.local/share/meshtermd/sessions/ so the session survives daemon updates and host reboots. "+
+			"Mutually exclusive with --no-persist. When neither is set, the daemon's --persistence-default "+
+			"applies. Ignored on reattach to an existing session (persistence is fixed at spawn).")
+	noPersist := fs.Bool("no-persist", false,
+		"opt this session OUT of cross-restart persistence. Use on hosts where --persistence-default is on "+
+			"but a specific session is sensitive (e.g. one-off commands you don't want lingering on disk).")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: meshtermd connect [flags]\n\n")
 		fs.PrintDefaults()
@@ -77,6 +85,22 @@ func runConnect(args []string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
+	// Resolve --persist / --no-persist into the tri-state *bool the
+	// IPC request expects. Both set is a usage error; neither set
+	// leaves the field nil so the daemon's default applies.
+	if *persist && *noPersist {
+		fmt.Fprintln(os.Stderr, "meshtermd connect: --persist and --no-persist are mutually exclusive")
+		return connectExitGenericError
+	}
+	var persistPtr *bool
+	if *persist {
+		v := true
+		persistPtr = &v
+	} else if *noPersist {
+		v := false
+		persistPtr = &v
+	}
+
 	resp, err := client.Allocate(ctx, ipc.AllocateRequest{
 		SessionID:        *sessionID,
 		Rows:             uint16(*rows),
@@ -85,6 +109,7 @@ func runConnect(args []string) int {
 		Shell:            *shell,
 		IdleTimeoutNanos: int64(*idleTimeout),
 		Name:             *name,
+		Persist:          persistPtr,
 	})
 	if err != nil {
 		if errors.Is(err, ipc.ErrDaemonNotRunning) {

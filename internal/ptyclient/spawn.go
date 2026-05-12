@@ -141,11 +141,7 @@ func SpawnNew(ctx context.Context, cfg SpawnConfig) (*Conn, error) {
 		args = append(args, "--shell="+cfg.Shell)
 	}
 	for _, a := range cfg.ShellArgs {
-		// Shell args are passed through the daemon's flag-set as a
-		// repeating positional after `--`. Today we don't pass any,
-		// so we keep the surface minimal; if a future use case needs
-		// it we can introduce a --shell-arg=… repeating flag here.
-		_ = a
+		args = append(args, "--shell-arg="+a)
 	}
 
 	cmd := exec.Command(cfg.DaemonBinary, args...)

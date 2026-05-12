@@ -56,6 +56,8 @@ func main() {
 		os.Exit(runUninstall(args))
 	case "pty-sidecar":
 		os.Exit(runPtySidecar(args))
+	case "unit":
+		os.Exit(runUnit(args))
 	case "help", "--help", "-h":
 		usage(os.Stdout)
 	default:
@@ -81,6 +83,7 @@ Subcommands:
   status             print the daemon's operational snapshot (--json for tooling)
   update             check for / apply a signed self-update from GitHub Releases
   uninstall          remove the daemon, supervisor unit, and (optionally) state
+  unit               emit / manage the systemd-user unit file
 
 Run 'meshtermd <subcommand> --help' for subcommand-specific flags.
 `, build.Version)

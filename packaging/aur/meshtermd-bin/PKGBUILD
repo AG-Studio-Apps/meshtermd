@@ -97,6 +97,13 @@ package() {
     install -Dm755 "${srcdir}/meshtermd" "${pkgdir}/usr/bin/meshtermd"
     install -Dm755 "${srcdir}/mtctl"     "${pkgdir}/usr/bin/mtctl"
 
+    # systemd-user unit, generated from the freshly-installed binary
+    # so the file always matches `meshtermd unit print`. KillMode=
+    # process is load-bearing for the v0.6+ sidecar architecture.
+    chmod +x "${srcdir}/meshtermd"
+    "${srcdir}/meshtermd" unit print --bin=/usr/bin/meshtermd > "${srcdir}/meshtermd.service"
+    install -Dm644 "${srcdir}/meshtermd.service" "${pkgdir}/usr/lib/systemd/user/meshtermd.service"
+
     install -Dm644 "${srcdir}/meshtermd.8" "${pkgdir}/usr/share/man/man8/meshtermd.8"
     install -Dm644 "${srcdir}/mtctl.1"     "${pkgdir}/usr/share/man/man1/mtctl.1"
 

@@ -17,7 +17,7 @@ func TestEnvAllowlistFiltersOutSensitive(t *testing.T) {
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "should-not-leak")
 	t.Setenv("MY_TOKEN", "also-should-not-leak")
 
-	env := buildEnv(nil)
+	env := BuildEnv(nil)
 
 	if !envContains(env, "HOME") {
 		t.Error("HOME missing from built env")
@@ -40,7 +40,7 @@ func TestBuildEnvSetsDefaultsWhenMissing(t *testing.T) {
 	t.Setenv("LANG", "")
 	t.Setenv("LC_ALL", "")
 
-	env := buildEnv(nil)
+	env := BuildEnv(nil)
 
 	hasTERM := false
 	hasLANG := false
@@ -68,7 +68,7 @@ func TestBuildEnvSetsDefaultsWhenMissing(t *testing.T) {
 
 func TestBuildEnvAppendsExtraEnv(t *testing.T) {
 	t.Setenv("HOME", "/tmp/h")
-	env := buildEnv([]string{"MESHTERM_SESSION_ID=abc123"})
+	env := BuildEnv([]string{"MESHTERM_SESSION_ID=abc123"})
 	if !envContains(env, "MESHTERM_SESSION_ID") {
 		t.Error("ExtraEnv was not appended")
 	}

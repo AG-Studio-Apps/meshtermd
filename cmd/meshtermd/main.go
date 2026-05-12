@@ -54,6 +54,8 @@ func main() {
 		os.Exit(runUpdate(args))
 	case "uninstall":
 		os.Exit(runUninstall(args))
+	case "pty-sidecar":
+		os.Exit(runPtySidecar(args))
 	case "help", "--help", "-h":
 		usage(os.Stdout)
 	default:

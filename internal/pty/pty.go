@@ -108,7 +108,7 @@ func Spawn(cfg SpawnConfig) (*Handle, error) {
 	}
 
 	cmd := exec.Command(shell, cfg.Args...)
-	cmd.Env = buildEnv(cfg.ExtraEnv)
+	cmd.Env = BuildEnv(cfg.ExtraEnv)
 
 	rows, cols := cfg.Rows, cfg.Cols
 	if rows == 0 {
@@ -220,10 +220,13 @@ func resolveShell(explicit string) (string, error) {
 	return "", errors.New("no usable shell found (tried SHELL, /bin/bash, /bin/sh)")
 }
 
-// buildEnv constructs the child's environment from the allowlist
+// BuildEnv constructs the child's environment from the allowlist
 // plus any caller-supplied additions. Sets sensible defaults for
-// TERM and LANG when the daemon has no value to inherit.
-func buildEnv(extra []string) []string {
+// TERM and LANG when the daemon has no value to inherit. Exported so
+// the out-of-process PTY sidecar transport (internal/ptyclient) can
+// reuse the same env construction it would have inherited via
+// pty.Spawn.
+func BuildEnv(extra []string) []string {
 	env := make([]string, 0, len(envAllowlist)+len(extra)+2)
 	for _, key := range envAllowlist {
 		// Treat empty values as "not set" — passing "TERM=" through

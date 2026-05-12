@@ -14,14 +14,17 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"time"
 
+	"os"
+
 	"github.com/AG-Studio-Apps/meshtermd/internal/build"
 	"github.com/AG-Studio-Apps/meshtermd/internal/cert"
 	"github.com/AG-Studio-Apps/meshtermd/internal/ipc"
-	"github.com/AG-Studio-Apps/meshtermd/internal/pty"
+	"github.com/AG-Studio-Apps/meshtermd/internal/ptyclient"
 	"github.com/AG-Studio-Apps/meshtermd/internal/session"
 	"github.com/AG-Studio-Apps/meshtermd/internal/transport"
 )
@@ -92,6 +95,13 @@ type Config struct {
 
 	// Logger receives operational logs. Defaults to slog.Default().
 	Logger *slog.Logger
+
+	// SidecarStderr is the io.Writer passed through to each spawned
+	// sidecar's stderr. nil → os.Stderr (production posture: sidecar
+	// logs surface in the daemon's journal). Tests pass io.Discard
+	// to drop sidecar stderr so the test binary's stderr fd doesn't
+	// stay open past reap (which makes `go test` park at WaitDelay).
+	SidecarStderr io.Writer
 }
 
 // Daemon owns the lifetime of the long-running server pieces.
@@ -106,9 +116,32 @@ type Daemon struct {
 	// stateDir is the persistence root resolved at New(). Reused by
 	// spawnSession when starting the per-session flusher.
 	stateDir string
+	// daemonBinary is os.Executable() cached at New(). Re-exec'd as
+	// `meshtermd pty-sidecar` for each session's PTY-owning helper.
+	daemonBinary string
 	// startedAt is set once in New so HandleStatus can compute
 	// uptime without keeping a separate state machine.
 	startedAt time.Time
+}
+
+// sessionExtraEnvForID returns the per-session env additions the
+// daemon already injected into the in-process pty.SpawnConfig before
+// the sidecar split. Centralised here so spawnSession + the
+// PTYSpawner closure stay in sync.
+func sessionExtraEnvForID(sid session.SessionID) []string {
+	return []string{
+		"MESHTERM_SESSION_ID=" + sid.String(),
+		// MESHTERM_ROAM=1 lets user shells short-circuit auto-tmux
+		// blocks in their rc files; see the original comment in
+		// spawnSession for the recommended guard form.
+		"MESHTERM_ROAM=1",
+	}
+}
+
+// sessionExtraEnv is the *Session-flavoured wrapper used by the
+// lazy-spawn closure where the SessionID lives behind the *Session.
+func sessionExtraEnv(sess *session.Session) []string {
+	return sessionExtraEnvForID(sess.ID())
 }
 
 // New constructs a Daemon. Loads or generates the TLS cert,
@@ -195,6 +228,26 @@ func New(cfg Config) (*Daemon, error) {
 		}
 	}
 
+	// Cache os.Executable() once — we re-exec it as `meshtermd
+	// pty-sidecar` for every session's PTY-owning helper process.
+	daemonBinary, exeErr := os.Executable()
+	if exeErr != nil {
+		return nil, fmt.Errorf("os.Executable: %w", exeErr)
+	}
+	d.daemonBinary = daemonBinary
+
+	// Reattach any sidecars that survived the previous daemon's exit.
+	// Per-session pidfile + socket in {stateDir}/sessions/<sid>/ point
+	// at live processes; we dial each and inject a sidecar-backed
+	// PTY into the corresponding Session. Sessions whose sidecars
+	// died (or never had one) fall through to the lazy-spawn path on
+	// next attach, same as v0.5.x behaviour.
+	if discovered, dErr := ptyclient.Discover(context.Background(), reg, stateDir, logger); dErr != nil {
+		logger.Warn("session.sidecar.discovery_failed", "err", dErr.Error())
+	} else if discovered > 0 {
+		logger.Info("session.sidecar.reattached", "count", discovered)
+	}
+
 	d.quic, err = transport.New(transport.Config{
 		Addr: cfg.QUICAddr,
 		Cert: tlsCert,
@@ -203,11 +256,24 @@ func New(cfg Config) (*Daemon, error) {
 			Logger:   logger,
 			// PTYSpawner gives protocol_handler a way to lazy-spawn
 			// the child shell for a restored session on its first
-			// attach. Closure-over-pty.Spawn keeps the transport
-			// package free of any direct pty import (would be a
-			// layering bend; the daemon owns the spawn policy).
-			PTYSpawner: func(rows, cols uint16) (session.PTY, error) {
-				return pty.Spawn(pty.SpawnConfig{Rows: rows, Cols: cols})
+			// attach. We spawn an out-of-process sidecar so the
+			// child shell survives subsequent daemon restarts —
+			// see internal/ptysidecar for the design.
+			PTYSpawner: func(sess *session.Session, rows, cols uint16) (session.PTY, error) {
+				// context.Background here is fine: SpawnNew only uses
+				// the ctx for the bounded 3 s dial-with-backoff, and a
+				// daemon-shutdown that races a fresh spawn will just
+				// see the sidecar disconnect cleanly via socket-close.
+				return ptyclient.SpawnNew(context.Background(), ptyclient.SpawnConfig{
+					SessionID:    sess.ID().String(),
+					Rows:         rows,
+					Cols:         cols,
+					ExtraEnv:     sessionExtraEnv(sess),
+					StateDir:     stateDir,
+					DaemonBinary: daemonBinary,
+					Logger:       logger,
+					Stderr:       cfg.SidecarStderr,
+				})
 			},
 		},
 	})
@@ -582,33 +648,29 @@ func (d *Daemon) spawnSession(req ipc.AllocateRequest) (*session.Session, error)
 	// sweeps consult its value rather than the daemon-wide default.
 	idleTimeout := d.registry.ResolveIdleTimeout(time.Duration(req.IdleTimeoutNanos))
 
-	spawnCfg := pty.SpawnConfig{
-		Shell: req.Shell,
-		Args:  req.Exec,
-		Rows:  rows,
-		Cols:  cols,
-		ExtraEnv: []string{
-			"MESHTERM_SESSION_ID=" + sid.String(),
-			// MESHTERM_ROAM=1 is a guard variable user shells can
-			// check to avoid auto-attaching to tmux/screen on Roam
-			// sessions. Without it, a typical .bashrc / .zshrc that
-			// runs `tmux attach -t main || tmux new -s main` on
-			// interactive login lands the Roam shell inside the same
-			// tmux session as a regular SSH client — multi-attach
-			// mirrors keystrokes and breaks the user's terminal UX.
-			// Recommended .bashrc guard:
-			//
-			//   if [[ -z "$TMUX" && -z "$MESHTERM_ROAM" && $- == *i* ]]; then
-			//     tmux attach -t main || tmux new -s main
-			//   fi
-			//
-			// The Roam shell is already persistent via meshtermd's
-			// own session registry, so skipping tmux is a no-op
-			// from the user's persistence perspective.
-			"MESHTERM_ROAM=1",
-		},
-	}
-	ptyHandle, err := pty.Spawn(spawnCfg)
+	// Spawn the PTY-owning sidecar process. The sidecar holds the
+	// child shell as a direct subprocess and survives subsequent
+	// daemon restarts; the returned *ptyclient.Conn implements
+	// session.PTY and slots in everywhere a *pty.Handle used to.
+	//
+	// MESHTERM_ROAM=1 lets user shells short-circuit auto-tmux blocks
+	// in their rc files (we don't want Roam shells to nest inside the
+	// user's regular tmux session — see the recommended guard form
+	// in the sidecarExtraEnv comment). The Roam shell already
+	// persists via meshtermd's own session machinery, so skipping
+	// tmux is a no-op from the user's persistence perspective.
+	ptyHandle, err := ptyclient.SpawnNew(context.Background(), ptyclient.SpawnConfig{
+		SessionID:    sid.String(),
+		Shell:        req.Shell,
+		ShellArgs:    req.Exec,
+		Rows:         rows,
+		Cols:         cols,
+		ExtraEnv:     sessionExtraEnvForID(sid),
+		StateDir:     d.stateDir,
+		DaemonBinary: d.daemonBinary,
+		Logger:       d.logger,
+		Stderr:       d.cfg.SidecarStderr,
+	})
 	if err != nil {
 		return nil, &allocateErr{Code: ipc.ErrSpawnFailed, Msg: err.Error()}
 	}

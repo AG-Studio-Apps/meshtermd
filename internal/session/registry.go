@@ -418,11 +418,14 @@ func (r *Registry) Remove(id SessionID) {
 	}
 	r.mu.Unlock()
 	if s != nil {
-		_ = s.Close()
-		// Remove is the explicit-kill path (e.g. mtctl kill). Drop
-		// the on-disk persistence dir so reaped sessions don't leak
-		// disk space. Daemon shutdown uses Shutdown which preserves
-		// on-disk state for the next start.
+		// Remove is the explicit-kill path (mtctl kill, daemon-side
+		// API). Use Kill so sidecar-backed PTYs send die_now for
+		// immediate child-shell teardown rather than entering the
+		// 30s reconnect-grace window. Drop the on-disk persistence
+		// dir so reaped sessions don't leak disk space. Daemon
+		// shutdown uses Shutdown which preserves on-disk state for
+		// the next start.
+		_ = s.Kill()
 		if r.stateDir != "" {
 			_ = s.DeletePersisted(r.stateDir)
 		}
@@ -611,7 +614,9 @@ func (r *Registry) Sweep() int {
 	r.mu.Unlock()
 
 	for _, s := range doomed {
-		_ = s.Close()
+		// Idle-GC reap is a kill semantically — drop the child shell
+		// immediately rather than letting a sidecar enter grace.
+		_ = s.Kill()
 		// GC-reaped sessions should have their on-disk persistence
 		// directory removed too — they're leaving the registry
 		// permanently, unlike daemon-shutdown which preserves state.

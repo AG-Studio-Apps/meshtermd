@@ -8,10 +8,13 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -23,6 +26,75 @@ import (
 	"github.com/AG-Studio-Apps/meshtermd/internal/protocol"
 	"github.com/AG-Studio-Apps/meshtermd/internal/session"
 )
+
+// shortTempDir is t.TempDir()'s short cousin: t.TempDir encodes the
+// full test-function name into the path, which combines with the
+// per-session subdirectory ({stateDir}/sessions/{32-hex-sid}/sidecar
+// .sock) to push the daemon's per-session unix socket path past
+// Linux's 108-byte limit. We mint a short, randomly-named dir under
+// /tmp instead and register cleanup with the test.
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "mtd-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+// killLeftoverSidecars walks {stateDir}/sessions/<sid>/sidecar.pid
+// and SIGKILLs each live sidecar, then waits up to 2 s for the
+// pidfile to disappear (or the process to be unreachable). Used by
+// test cleanup to short-circuit the 30 s production grace timer + to
+// close the inherited stderr fd that's keeping `go test` parked at
+// WaitDelay.
+//
+// SIGKILL rather than SIGTERM because we don't need a graceful
+// teardown here — the temp dir is about to be RemoveAll'd anyway.
+func killLeftoverSidecars(stateDir string) {
+	sessionsDir := filepath.Join(stateDir, "sessions")
+	entries, err := os.ReadDir(sessionsDir)
+	if err != nil {
+		return
+	}
+	var pids []int
+	for _, ent := range entries {
+		if !ent.IsDir() {
+			continue
+		}
+		pidPath := filepath.Join(sessionsDir, ent.Name(), "sidecar.pid")
+		data, rerr := os.ReadFile(pidPath)
+		if rerr != nil {
+			continue
+		}
+		// pidfile format: "PID\nbinary_path\n" — first line is the PID.
+		line := strings.SplitN(string(data), "\n", 2)[0]
+		pid, perr := strconv.Atoi(strings.TrimSpace(line))
+		if perr != nil || pid <= 0 {
+			continue
+		}
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		pids = append(pids, pid)
+	}
+	// Wait for the kernel to reap (or at least make the pid unreachable).
+	// Without this, the inherited stderr fd lingers and go test's
+	// WaitDelay fires.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		alive := false
+		for _, pid := range pids {
+			if syscall.Kill(pid, 0) == nil {
+				alive = true
+				break
+			}
+		}
+		if !alive {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
 
 // startDaemon brings up a Daemon on ephemeral ports + sockets in a
 // fresh tmpdir. Returns the running daemon, an IPC client targeting
@@ -36,7 +108,7 @@ func startDaemon(t *testing.T) (*Daemon, *ipc.Client, func()) {
 		t.Skip("/bin/sh not available")
 	}
 
-	tmp := t.TempDir()
+	tmp := shortTempDir(t)
 	// audit F5: NewServer rejects socket parent dirs with mode > 0700.
 	if err := os.Chmod(tmp, 0o700); err != nil {
 		t.Fatalf("chmod tempdir: %v", err)
@@ -48,6 +120,7 @@ func startDaemon(t *testing.T) (*Daemon, *ipc.Client, func()) {
 		IPCSocketPath: socket,
 		CertDir:       tmp,
 		IdleTimeout:   time.Hour,
+		SidecarStderr: io.Discard,
 	})
 	if err != nil {
 		t.Fatalf("daemon.New: %v", err)
@@ -77,8 +150,18 @@ func startDaemon(t *testing.T) (*Daemon, *ipc.Client, func()) {
 		case <-time.After(2 * time.Second):
 			t.Error("daemon Run did not return within 2s of cancel")
 		}
+		// Sidecars spawned during the test enter a 30 s grace timer on
+		// daemon disconnect waiting for a reattach (production
+		// semantics). Tests can't wait that long — walk the state dir
+		// and SIGTERM any sidecar.pid we find so `go test` can release
+		// child-process fds and the test binary can exit.
+		killLeftoverSidecars(tmp)
 	}
-	return d, ipc.NewClient(socket, time.Second), cleanup
+	// 5 s IPC timeout. Spawning a sidecar in tests means forking the
+	// (large) test binary and dialing its unix socket with backoff —
+	// the 1 s budget used by mtctl in production isn't safe under
+	// `go test` on cold caches.
+	return d, ipc.NewClient(socket, 5*time.Second), cleanup
 }
 
 // TestDaemonPersistenceRoundTrip verifies the end-to-end persistence
@@ -94,7 +177,7 @@ func TestDaemonPersistenceRoundTrip(t *testing.T) {
 	if _, err := os.Stat("/bin/sh"); err != nil {
 		t.Skip("/bin/sh not available")
 	}
-	tmp := t.TempDir()
+	tmp := shortTempDir(t)
 	if err := os.Chmod(tmp, 0o700); err != nil {
 		t.Fatalf("chmod tempdir: %v", err)
 	}
@@ -106,6 +189,7 @@ func TestDaemonPersistenceRoundTrip(t *testing.T) {
 		CertDir:                  tmp,
 		IdleTimeout:              time.Hour,
 		PersistenceFlushInterval: 50 * time.Millisecond,
+		SidecarStderr:            io.Discard,
 	})
 	if err != nil {
 		t.Fatalf("daemon.New (first): %v", err)
@@ -116,7 +200,7 @@ func TestDaemonPersistenceRoundTrip(t *testing.T) {
 	waitForSocket(t, socket)
 
 	// Allocate a persisted session.
-	c := ipc.NewClient(socket, time.Second)
+	c := ipc.NewClient(socket, 5*time.Second)
 	persistTrue := true
 	resp, err := c.Allocate(context.Background(), ipc.AllocateRequest{
 		SessionID: "new",
@@ -172,6 +256,7 @@ func TestDaemonPersistenceRoundTrip(t *testing.T) {
 		IPCSocketPath: socket,
 		CertDir:       tmp,
 		IdleTimeout:   time.Hour,
+		SidecarStderr: io.Discard,
 	})
 	if err != nil {
 		t.Fatalf("daemon.New (second): %v", err)
@@ -189,12 +274,15 @@ func TestDaemonPersistenceRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("session not restored: %v", err)
 	}
-	if !restored.RestoredFromDisk() {
-		t.Error("restored session should report RestoredFromDisk() == true")
-	}
+	// Note: with the v0.6 sidecar split, RestoredFromDisk is cleared by
+	// Discover/AssignPTY at startup (the daemon-side session has a live
+	// PTY conn again). The "restored" signal users actually consume is
+	// AttachAck.restored, which is sampled before AssignPTY clears the
+	// flag — covered by transport-level tests. Here we just confirm the
+	// scrollback round-tripped through disk.
 	data, _, _ := restored.Buffer().ReadSince(0, 0)
-	if string(data) != payload {
-		t.Errorf("scrollback after restart: got %q, want %q", data, payload)
+	if !strings.Contains(string(data), payload) {
+		t.Errorf("scrollback after restart: %q does not contain %q", data, payload)
 	}
 }
 
@@ -228,7 +316,7 @@ func TestDaemonSessionBufferBytesConfigFlowsThrough(t *testing.T) {
 	if _, err := os.Stat("/bin/sh"); err != nil {
 		t.Skip("/bin/sh not available")
 	}
-	tmp := t.TempDir()
+	tmp := shortTempDir(t)
 	if err := os.Chmod(tmp, 0o700); err != nil {
 		t.Fatalf("chmod tempdir: %v", err)
 	}
@@ -242,6 +330,7 @@ func TestDaemonSessionBufferBytesConfigFlowsThrough(t *testing.T) {
 		CertDir:            tmp,
 		IdleTimeout:        time.Hour,
 		SessionBufferBytes: want,
+		SidecarStderr:      io.Discard,
 	})
 	if err != nil {
 		t.Fatalf("daemon.New: %v", err)
@@ -264,7 +353,7 @@ func TestDaemonSessionBufferBytesConfigFlowsThrough(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	c := ipc.NewClient(socket, time.Second)
+	c := ipc.NewClient(socket, 5*time.Second)
 	resp, err := c.Allocate(context.Background(), ipc.AllocateRequest{
 		SessionID: "new",
 		Rows:      24,

@@ -85,7 +85,14 @@ type Handle struct {
 	// internals already make safe across Close). Without this lock
 	// the race detector flags EchoEnabled's Fd() call against the
 	// pump goroutine's eventual Close() on session teardown.
-	fdMu sync.RWMutex
+	//
+	// `closed` is set under the write lock before pt.Close runs and
+	// gates EchoEnabled. Without this gate, a watcher tick that starts
+	// after Close returns can still call Fd() while internal/poll's
+	// deferred destroy (triggered when Pump's pending Read unwinds)
+	// is mutating the file's internal state.
+	fdMu   sync.RWMutex
+	closed bool
 }
 
 // Spawn starts the child and returns a Handle. The child inherits
@@ -178,9 +185,13 @@ func (h *Handle) Close() error {
 		// Take the write lock so any in-flight EchoEnabled (read
 		// lock) finishes before we close the master fd. Without this
 		// the Fd() call inside EchoEnabled races with Close per the
-		// os.File semantics.
+		// os.File semantics. Set `closed` under the same lock so any
+		// subsequent EchoEnabled tick observes the flag and skips
+		// Fd() entirely — Pump's deferred destroy still races with a
+		// late Fd() call otherwise.
 		h.fdMu.Lock()
 		defer h.fdMu.Unlock()
+		h.closed = true
 		if err := h.pt.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 			h.closeErr = err
 		}

@@ -40,8 +40,8 @@ func TestConnReadDeliversStdoutFrame(t *testing.T) {
 	if string(buf[:n]) != "hello world" {
 		t.Errorf("got %q, want %q", buf[:n], "hello world")
 	}
-	if conn.LastDeliveredSeq() != uint64(len("hello world")) {
-		t.Errorf("LastDeliveredSeq: want %d, got %d", len("hello world"), conn.LastDeliveredSeq())
+	if conn.LastAppendedSeq() != uint64(len("hello world")) {
+		t.Errorf("LastAppendedSeq: want %d, got %d", len("hello world"), conn.LastAppendedSeq())
 	}
 }
 
@@ -244,8 +244,8 @@ func TestConnTruncFlagSurfacesViaConsumeTrunc(t *testing.T) {
 	if gap := conn.ConsumeTrunc(); gap != 0 {
 		t.Errorf("second ConsumeTrunc should return 0 after reset, got %d", gap)
 	}
-	if conn.LastDeliveredSeq() != 40 {
-		t.Errorf("LastDeliveredSeq: want 40, got %d", conn.LastDeliveredSeq())
+	if conn.LastAppendedSeq() != 40 {
+		t.Errorf("LastAppendedSeq: want 40, got %d", conn.LastAppendedSeq())
 	}
 }
 
@@ -298,6 +298,35 @@ func TestConnAckEncodesFrameAck(t *testing.T) {
 	seq, err := ptysidecar.DecodeSeq(got.body)
 	if err != nil || seq != 99999 {
 		t.Errorf("body decode: seq=%d err=%v", seq, err)
+	}
+}
+
+func TestConnLastConsumedSeqAdvancesOnRead(t *testing.T) {
+	conn, sidecar := pipePair(t)
+	// One frame with 10 bytes at firstSeq=100. Read 3 then 7 from
+	// the daemon side; LastConsumedSeq should hit 103 then 110.
+	go func() {
+		_ = ptysidecar.WriteFrame(sidecar, ptysidecar.FrameStdout,
+			ptysidecar.EncodeStdoutBody(100, 0, []byte("0123456789")))
+	}()
+	buf := make([]byte, 3)
+	if n, err := conn.Read(buf); err != nil || n != 3 {
+		t.Fatalf("first Read: n=%d err=%v", n, err)
+	}
+	// LastAppendedSeq is 110 (all 10 bytes already in readBuf).
+	if got := conn.LastAppendedSeq(); got != 110 {
+		t.Errorf("LastAppendedSeq after first Read: want 110, got %d", got)
+	}
+	// LastConsumedSeq trails — only 3 bytes returned by Read so far.
+	if got := conn.LastConsumedSeq(); got != 103 {
+		t.Errorf("LastConsumedSeq after first Read: want 103, got %d", got)
+	}
+	buf2 := make([]byte, 16)
+	if n, _ := conn.Read(buf2); n != 7 {
+		t.Errorf("second Read: want 7, got %d", n)
+	}
+	if got := conn.LastConsumedSeq(); got != 110 {
+		t.Errorf("LastConsumedSeq after second Read: want 110, got %d", got)
 	}
 }
 

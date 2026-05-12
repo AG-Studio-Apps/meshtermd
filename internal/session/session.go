@@ -118,6 +118,29 @@ type PTY interface {
 	SetSize(rows, cols uint16) error
 }
 
+// SeqAwarePTY is implemented by sidecar-backed PTY connections that
+// expose the underlying byte-seq counter. Pump probes for this
+// interface so it can ack consumed bytes back to the sidecar (freeing
+// them from the sidecar's drop-oldest ring) and propagate Trunc
+// events as RingBuffer.AdvanceWithGap calls. In-process PTYs
+// (internal/pty.Handle) don't implement this — the legacy path
+// behaves exactly as before.
+type SeqAwarePTY interface {
+	// ConsumeTrunc returns the byte count silently dropped since the
+	// last call, resetting the counter. Pump applies this via
+	// RingBuffer.AdvanceWithGap before its next Write so the daemon-
+	// ring's headSeq jumps past the lost span.
+	ConsumeTrunc() uint64
+
+	// LastConsumedSeq returns the sidecar-side seq just past the
+	// last byte the daemon has read off the wire (= what Pump should
+	// pass to AdvanceSidecarSeq + Ack after a successful buf.Write).
+	LastConsumedSeq() uint64
+
+	// Ack tells the sidecar bytes ≤ consumedSeq can be freed.
+	Ack(consumedSeq uint64) error
+}
+
 // Session is one persistent terminal: a PTY + child process + an
 // output ring buffer. Sessions outlive QUIC connections; clients
 // attach by ID, the buffer replays anything they missed.
@@ -884,7 +907,16 @@ func (s *Session) Pump() {
 	// than enough to not be the bottleneck.
 	chunk := make([]byte, 8*1024)
 	filter := NewQueryFilter(s.pty)
+	seqAware, _ := s.pty.(SeqAwarePTY)
 	for {
+		// Surface any Trunc-before-frame from the sidecar BEFORE the
+		// next Read so the daemon-ring's headSeq advances past the
+		// lost span before payload bytes land on top of it.
+		if seqAware != nil {
+			if gap := seqAware.ConsumeTrunc(); gap > 0 {
+				s.buf.AdvanceWithGap(gap)
+			}
+		}
 		n, err := s.pty.Read(chunk)
 		if n > 0 {
 			data := chunk[:n]
@@ -905,6 +937,15 @@ func (s *Session) Pump() {
 			filtered := filter.Process(data)
 			if len(filtered) > 0 {
 				_, _ = s.buf.Write(filtered)
+			}
+			if seqAware != nil {
+				// Watermark the highest sidecar seq we've durably
+				// committed. Best-effort Ack — a network error here
+				// just means the sidecar will get our up-to-date lcs
+				// on the next attach via FrameResume.
+				seq := seqAware.LastConsumedSeq()
+				s.AdvanceSidecarSeq(seq)
+				_ = seqAware.Ack(seq)
 			}
 			s.Touch()
 		}

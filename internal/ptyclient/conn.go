@@ -56,17 +56,20 @@ type Conn struct {
 	readErr  error // set once; never cleared
 
 	// Per-byte seq tracking from the new FrameStdout envelope:
-	//   - lastDeliveredSeq is the seq just past the last byte appended
-	//     to readBuf. Used to compute the consumed-through value the
-	//     caller passes to Ack().
+	//   - lastAppendedSeq is the seq just past the last byte appended
+	//     to readBuf via handleStdout. Used internally for gap accounting.
+	//   - lastConsumedSeq is the seq just past the last byte returned
+	//     by Read — what Pump passes to AdvanceSidecarSeq + Ack. This
+	//     trails lastAppendedSeq by whatever's still buffered in readBuf.
 	//   - pendingGapBytes is incremented when a FrameStdout arrives
 	//     with StdoutFlagTruncBefore set; the consumer reads it via
 	//     ConsumeTrunc() between Reads and bumps its own session ring
 	//     headSeq accordingly.
-	seqMu            sync.Mutex
-	lastDeliveredSeq uint64
-	pendingGapBytes  uint64
-	seqValid         bool // false until the first FrameStdout arrives
+	seqMu           sync.Mutex
+	lastAppendedSeq uint64
+	lastConsumedSeq uint64
+	pendingGapBytes uint64
+	seqValid        bool // false until the first FrameStdout arrives
 
 	// Echo state cache. last echo_state body[0] received from sidecar;
 	// EchoEnabled() reads under echoMu.
@@ -129,7 +132,13 @@ func (c *Conn) Read(p []byte) (int, error) {
 	if c.readBuf.Len() > 0 {
 		// Deliver bytes first; the error surfaces on the next call
 		// once the buffer is fully drained.
-		return c.readBuf.Read(p)
+		n, err := c.readBuf.Read(p)
+		if n > 0 {
+			c.seqMu.Lock()
+			c.lastConsumedSeq += uint64(n)
+			c.seqMu.Unlock()
+		}
+		return n, err
 	}
 	return 0, c.readErr
 }
@@ -271,25 +280,24 @@ func (c *Conn) runFrameReader() {
 }
 
 // handleStdout records the gap-before signal (if any) and appends
-// the payload to readBuf, advancing lastDeliveredSeq.
+// the payload to readBuf, advancing lastAppendedSeq.
 func (c *Conn) handleStdout(firstSeq uint64, flags byte, payload []byte) {
 	c.seqMu.Lock()
-	if flags&ptysidecar.StdoutFlagTruncBefore != 0 {
-		// The dropped span is [previousLastDeliveredSeq, firstSeq).
-		// Until we've received any byte, previousLastDeliveredSeq is
-		// unknown — use firstSeq alone as the gap-marker boundary;
-		// the daemon already knows how many bytes it asked for vs got
-		// back via its FrameResume(from_seq) → firstSeq diff.
-		if c.seqValid {
-			c.pendingGapBytes += firstSeq - c.lastDeliveredSeq
-		}
+	if flags&ptysidecar.StdoutFlagTruncBefore != 0 && c.seqValid {
+		// The dropped span is [lastAppendedSeq, firstSeq) — count
+		// those bytes for the Pump to apply via AdvanceWithGap on its
+		// next iteration.
+		c.pendingGapBytes += firstSeq - c.lastAppendedSeq
+	}
+	if !c.seqValid {
+		// First FrameStdout we've ever seen: anchor both watermarks
+		// at firstSeq so subsequent reads/appends advance from here.
+		c.lastConsumedSeq = firstSeq
+		c.lastAppendedSeq = firstSeq
+		c.seqValid = true
 	}
 	if len(payload) > 0 {
-		c.lastDeliveredSeq = firstSeq + uint64(len(payload))
-		c.seqValid = true
-	} else if !c.seqValid {
-		c.lastDeliveredSeq = firstSeq
-		c.seqValid = true
+		c.lastAppendedSeq = firstSeq + uint64(len(payload))
 	}
 	c.seqMu.Unlock()
 
@@ -299,10 +307,11 @@ func (c *Conn) handleStdout(firstSeq uint64, flags byte, payload []byte) {
 }
 
 // ConsumeTrunc returns the number of bytes silently dropped since
-// the last call (and resets the counter). The Pump goroutine reads
-// this between Read calls and advances the daemon's session ring via
+// the last call (and resets the counter). Pump reads this between
+// Read calls and advances the daemon's session ring via
 // RingBuffer.AdvanceWithGap so iOS's existing AttachAck.trunc fires
-// on next attach. Returns 0 when no gap has accumulated.
+// on next attach. Returns 0 when no gap has accumulated. Part of the
+// session.SeqAwarePTY interface.
 func (c *Conn) ConsumeTrunc() uint64 {
 	c.seqMu.Lock()
 	defer c.seqMu.Unlock()
@@ -311,14 +320,22 @@ func (c *Conn) ConsumeTrunc() uint64 {
 	return gap
 }
 
-// LastDeliveredSeq returns the sidecar-side seq just past the last
-// byte delivered to readBuf. Callers use this as the watermark for
-// Ack(seq); we ack what we've durably committed to our session ring,
-// which is bounded above by lastDeliveredSeq.
-func (c *Conn) LastDeliveredSeq() uint64 {
+// LastConsumedSeq returns the sidecar-side seq just past the last
+// byte returned by Read. Pump passes this to AdvanceSidecarSeq + Ack
+// after each successful buf.Write. Part of session.SeqAwarePTY.
+func (c *Conn) LastConsumedSeq() uint64 {
 	c.seqMu.Lock()
 	defer c.seqMu.Unlock()
-	return c.lastDeliveredSeq
+	return c.lastConsumedSeq
+}
+
+// LastAppendedSeq exposes the watermark of what's been appended to
+// readBuf (independent of what Read has returned). Useful for tests;
+// production code uses LastConsumedSeq.
+func (c *Conn) LastAppendedSeq() uint64 {
+	c.seqMu.Lock()
+	defer c.seqMu.Unlock()
+	return c.lastAppendedSeq
 }
 
 // SendResume emits a FrameResume(from_seq) to the sidecar. Called by

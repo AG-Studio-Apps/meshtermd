@@ -125,6 +125,18 @@ func reattachOne(ctx context.Context, sess *session.Session, sessionDir string, 
 	}
 
 	conn := newConn(sess.ID().String(), sock, logger)
+
+	// Send FrameResume(lastSidecarSeq) BEFORE AssignPTY + Pump start.
+	// The sidecar's peekResumeOrDispatch consumes the frame with a
+	// 50 ms deadline and SeekReads its ring; the first FrameStdout we
+	// then receive carries the seq we asked for. Without this, the
+	// sidecar would replay un-acked bytes from its current readOutSeq,
+	// re-numbering bytes the daemon already committed.
+	if err := conn.SendResume(sess.LastSidecarSeq()); err != nil {
+		_ = conn.Close()
+		return false, fmt.Errorf("SendResume: %w", err)
+	}
+
 	if err := sess.AssignPTY(conn); err != nil {
 		_ = conn.Close()
 		// AssignPTY returns ErrSessionHasPTY if the session somehow
@@ -139,6 +151,7 @@ func reattachOne(ctx context.Context, sess *session.Session, sessionDir string, 
 		"session", sess.ID().String(),
 		"name", sess.Name(),
 		"sidecar_pid", pid,
+		"resume_from", sess.LastSidecarSeq(),
 	)
 	return true, nil
 }

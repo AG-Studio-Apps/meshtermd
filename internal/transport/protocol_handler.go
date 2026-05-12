@@ -60,12 +60,15 @@ type ProtocolHandler struct {
 	// PTYSpawner is the lazy-spawn factory the handler calls when a
 	// client attaches to a session that was restored from disk by
 	// LoadPersisted (and therefore has Session.pty == nil). The daemon
-	// wires this to a closure that does pty.Spawn with the user's
-	// shell, then starts Session.Pump in a new goroutine. Nil-safe:
-	// when this field is nil, restored sessions can't be reattached
-	// (the AttachAck reports a generic error) — tests that don't
-	// exercise restore can leave it unset.
-	PTYSpawner func(rows, cols uint16) (session.PTY, error)
+	// wires this to a closure that spawns either an in-process
+	// pty.Handle or a sidecar-backed ptyclient.Conn (per-session,
+	// crash-survivable), then starts Session.Pump in a new goroutine.
+	// The *Session is passed in so sidecar-backed spawns can name
+	// their per-session state dir by the SessionID. Nil-safe: when
+	// this field is nil, restored sessions can't be reattached (the
+	// AttachAck reports a generic error) — tests that don't exercise
+	// restore can leave it unset.
+	PTYSpawner func(sess *session.Session, rows, cols uint16) (session.PTY, error)
 }
 
 // HandleConnection implements Handler.
@@ -314,7 +317,7 @@ func (h *ProtocolHandler) lazySpawnRestoredPTY(ctx context.Context, sess *sessio
 			cols = savedCols
 		}
 	}
-	handle, err := h.PTYSpawner(rows, cols)
+	handle, err := h.PTYSpawner(sess, rows, cols)
 	if err != nil {
 		return fmt.Errorf("spawn PTY: %w", err)
 	}

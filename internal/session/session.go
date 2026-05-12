@@ -608,6 +608,12 @@ func (s *Session) Closed() bool {
 // or idle-GC reap should drop the on-disk state), but
 // Registry.Shutdown (daemon-wide shutdown) leaves it so the next
 // daemon start can restore.
+//
+// Close is the graceful path: when the PTY is a sidecar.Conn, this
+// just closes the socket — the sidecar enters its grace timer and
+// will be reattached on next daemon startup. Use Kill instead when
+// the caller wants the child shell reaped immediately (e.g. user-
+// invoked `mtctl kill`).
 func (s *Session) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -640,6 +646,52 @@ func (s *Session) Close() error {
 		return pty.Close()
 	}
 	return nil
+}
+
+// PTYKiller is the optional capability a session.PTY can implement
+// to request immediate teardown of the underlying process tree (vs.
+// the graceful socket-close that PTY.Close performs). The sidecar-
+// backed ptyclient.Conn implements this by writing a die_now frame
+// before closing the socket; the in-process pty.Handle does not
+// implement this (its Close already reaps the child).
+type PTYKiller interface {
+	Kill() error
+}
+
+// Kill is the immediate-teardown sibling of Close. For sidecar-
+// backed PTYs (the v0.6+ Roam sessions) it sends die_now so the
+// child shell is SIGHUP'd within ~250 ms. For in-process PTYs it
+// falls back to Close (which already SIGHUPs synchronously).
+//
+// Used by registry.Remove so `mtctl kill` doesn't leave the child
+// shell running during the sidecar's 30s reconnect-grace window.
+func (s *Session) Kill() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	pty := s.pty
+	cancels := make([]context.CancelFunc, 0, len(s.clients))
+	for _, c := range s.clients {
+		cancels = append(cancels, c.cancel)
+	}
+	s.clients = nil
+	s.mu.Unlock()
+
+	s.stopFlusher()
+
+	for _, c := range cancels {
+		c()
+	}
+	if pty == nil {
+		return nil
+	}
+	if k, ok := pty.(PTYKiller); ok {
+		return k.Kill()
+	}
+	return pty.Close()
 }
 
 // ErrSessionHasPTY is returned by AssignPTY when called on a session

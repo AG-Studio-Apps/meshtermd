@@ -59,8 +59,29 @@ type pendingAttach struct {
 }
 
 // DefaultIdleTimeout is the time a detached session can remain idle
-// before the GC sweep reaps it. One hour matches the plan default.
-const DefaultIdleTimeout = time.Hour
+// before the GC sweep reaps it. 30 days matches user expectations
+// for a persistent-terminal product — "I closed my laptop for the
+// weekend, my session is still there" rather than "I went to lunch
+// and lost everything." The reaper still respects operator caps via
+// the registry's maxIdleTimeout, and a client may request a shorter
+// per-session value via IdleTimeoutNanos.
+//
+// Bumped from 1h to 30d on 2026-05-12 — the 1h default matched the
+// pre-v0.4 spec but was lunch-break short for the workflows iOS
+// users actually wanted (mosh+tmux-style "session lives until I
+// kill it"). See feedback in the session lifecycle thread.
+const DefaultIdleTimeout = 30 * 24 * time.Hour
+
+// NoIdleTimeout is the sentinel returned by ResolveIdleTimeout when
+// the client requests an unbounded "Never" timeout AND the operator
+// hasn't set a ceiling. The Sweep skips any session whose idleTimeout
+// is negative — those live until the daemon dies (SIGTERM, reboot,
+// `meshtermd update` restart, or crash).
+//
+// Wire-side: iOS represents "Never" as IdleTimeoutNanos < 0
+// (typically -1_000_000_000, from `--idle-timeout -1s`). The daemon
+// normalises through ResolveIdleTimeout.
+const NoIdleTimeout = time.Duration(-1)
 
 // DefaultGCInterval is how often the Run loop ticks. Granularity
 // here is fine; idle reaping is not latency-sensitive.
@@ -165,12 +186,30 @@ func NewRegistry(maxSessions int, idleTimeout, gcInterval, maxIdleTimeout time.D
 }
 
 // ResolveIdleTimeout maps a client-requested timeout to the value the
-// session will actually carry. Zero from the client means "use the
-// daemon default". A non-zero value is clamped at the registry's
-// MaxIdleTimeout ceiling when one is set.
+// session will actually carry. Tri-state semantics:
+//
+//   - requested == 0: use the daemon default (r.idleTimeout).
+//   - requested  > 0: explicit positive value; clamped at the
+//     operator's MaxIdleTimeout ceiling when one is set.
+//   - requested  < 0: "Never" — the session opts out of idle GC and
+//     lives until the daemon dies. Clamped at MaxIdleTimeout when
+//     the operator has set one (so a shared-host operator's policy
+//     can't be bypassed by a client asking for unbounded). Returns
+//     NoIdleTimeout (= -1) when no ceiling is in effect.
+//
+// The Sweep loop treats negative idleTimeout as "skip this session"
+// (see Registry.Sweep). Operator-clamped "Never" requests come out
+// as positive values and follow the normal sweep path at the
+// ceiling.
 func (r *Registry) ResolveIdleTimeout(requested time.Duration) time.Duration {
-	if requested <= 0 {
+	if requested == 0 {
 		return r.idleTimeout
+	}
+	if requested < 0 {
+		if r.maxIdleTimeout > 0 {
+			return r.maxIdleTimeout
+		}
+		return NoIdleTimeout
 	}
 	if r.maxIdleTimeout > 0 && requested > r.maxIdleTimeout {
 		return r.maxIdleTimeout
@@ -462,9 +501,16 @@ func (r *Registry) Sweep() int {
 			continue
 		}
 		// Per-session timeout takes precedence; zero means
-		// "inherit the registry default", set at NewSession time.
+		// "inherit the registry default", negative means "Never —
+		// opt out of the GC sweep entirely" (the session lives
+		// until the daemon dies).
 		timeout := s.idleTimeoutForGC()
-		if timeout <= 0 {
+		if timeout < 0 {
+			// Session opted out of GC. Move on; nothing else to
+			// check for this entry.
+			continue
+		}
+		if timeout == 0 {
 			timeout = r.idleTimeout
 		}
 		if now.Sub(s.lastActivityForGC()) >= timeout {

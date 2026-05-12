@@ -36,10 +36,12 @@ func runConnect(args []string) int {
 	timeout := fs.Duration("timeout", 5*time.Second, "max time to wait for the daemon to respond")
 	idleTimeout := fs.Duration("idle-timeout", 0,
 		"per-session idle timeout — how long the daemon keeps this session alive while no client is attached "+
-			"and the shell is producing no output. 0 = use the daemon's default. Applied on both fresh spawns "+
-			"AND on reattach: passing a different value than the existing session's timeout updates it in place "+
-			"(this is how the iOS Keep-alive picker change reaches an already-running session). Clamped at the "+
-			"daemon's --max-idle-timeout ceiling when set.")
+			"and the shell is producing no output. 0 = use the daemon's default. A negative value (e.g. -1s) means "+
+			"\"Never\" — the session opts out of GC and lives until the daemon dies (SIGTERM, reboot, update, or "+
+			"crash). Applied on both fresh spawns AND on reattach: passing a different value than the existing "+
+			"session's timeout updates it in place (this is how the iOS Keep-alive picker change reaches an "+
+			"already-running session). Clamped at the daemon's --max-idle-timeout ceiling when set, including "+
+			"the \"Never\" path so a shared-host operator's policy isn't bypassed.")
 	name := fs.String("name", "",
 		"user-visible session name. With --session=new (or omitted), enables 'create-if-missing': the daemon "+
 			"reattaches to an existing session of this name, or spawns a fresh one with this name. With "+

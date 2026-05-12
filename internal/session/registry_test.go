@@ -151,6 +151,46 @@ func TestSweepHonoursPerSessionIdleTimeout(t *testing.T) {
 	}
 }
 
+// TestSweepSkipsSessionsWithNegativeIdleTimeout verifies the
+// "Never" sentinel: a session whose idleTimeout is negative opts
+// out of the GC sweep entirely and lives until the daemon dies.
+// Sit-test setup uses a very short registry default so anything
+// not opted out would reap.
+func TestSweepSkipsSessionsWithNegativeIdleTimeout(t *testing.T) {
+	t.Parallel()
+	// Registry default of 5ms — any non-opted-out session reaps
+	// after the sleep below.
+	r := NewRegistry(0, 5*time.Millisecond, time.Hour, 0)
+
+	never, err := newSessionWithTimeout(NoIdleTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Add(never); err != nil {
+		t.Fatal(err)
+	}
+
+	willReap, err := newSessionWithTimeout(5 * time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Add(willReap); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(40 * time.Millisecond)
+
+	if reaped := r.Sweep(); reaped != 1 {
+		t.Errorf("Sweep reaped %d, want 1 (only the non-Never session)", reaped)
+	}
+	if _, err := r.Lookup(never.ID()); err != nil {
+		t.Errorf("Never session was reaped despite idleTimeout=NoIdleTimeout: %v", err)
+	}
+	if _, err := r.Lookup(willReap.ID()); !errors.Is(err, ErrUnknownSession) {
+		t.Error("expected normal-timeout session to be reaped")
+	}
+}
+
 // TestSweepSkipsAttachedSession verifies the fix for the audit
 // finding "Idle-GC reaps active-but-silent sessions". A session with
 // an attached client whose shell is idle (no stdout for the timeout
@@ -201,6 +241,12 @@ func TestResolveIdleTimeout(t *testing.T) {
 		{"explicit under ceiling → as-is", time.Hour, 24 * time.Hour, 30 * time.Minute, 30 * time.Minute},
 		{"explicit over ceiling → clamped", time.Hour, 24 * time.Hour, 30 * 24 * time.Hour, 24 * time.Hour},
 		{"no ceiling → no clamp", time.Hour, 0, 30 * 24 * time.Hour, 30 * 24 * time.Hour},
+		// Tri-state: negative request = "Never". Returns NoIdleTimeout
+		// sentinel when no operator ceiling, or clamps to the ceiling
+		// when one is set.
+		{"never, no ceiling → NoIdleTimeout", time.Hour, 0, -time.Second, NoIdleTimeout},
+		{"never, ceiling set → clamped to ceiling", time.Hour, 24 * time.Hour, -time.Second, 24 * time.Hour},
+		{"never with -1 sentinel → NoIdleTimeout", time.Hour, 0, NoIdleTimeout, NoIdleTimeout},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -176,6 +176,31 @@ type Session struct {
 	// pollution that grows on each cold-start.
 	suppressNextRedraw bool
 
+	// persist indicates whether this session should be snapshotted
+	// to disk so it survives daemon restart. Set at spawn time from
+	// the IPC AllocateRequest's Persist field (clamped through
+	// Registry.ResolvePersist so the daemon-wide default applies
+	// when the client didn't specify). Persisted sessions get a
+	// background flusher goroutine started by the registry.
+	persist bool
+
+	// lastSnapshotSeq is the buffer's headSeq at the last successful
+	// disk snapshot. The flusher compares the buffer's current
+	// headSeq to this value; if equal, nothing new has arrived and
+	// the snapshot is skipped. Updated only after a successful
+	// write (so a failed flush leaves dirty state and triggers
+	// another attempt on the next tick).
+	lastSnapshotSeq uint64
+
+	// restoredFromDisk is true when this Session was hydrated from
+	// on-disk state at daemon startup (LoadPersisted), rather than
+	// freshly spawned. Cleared the first time a client successfully
+	// attaches — until then the AttachAck.Restored flag fires so
+	// the client can surface a "Restored from previous session"
+	// banner. After first attach the session behaves identically
+	// to a freshly-spawned one.
+	restoredFromDisk bool
+
 	closed bool
 }
 
@@ -195,6 +220,47 @@ type Session struct {
 // when this field is zero. Pass an explicit duration to give this
 // session a per-session lifetime independent of the daemon-wide
 // default.
+// SetPersist sets whether this session should be snapshotted to disk.
+// Used by the daemon when spawning a session (after resolving the
+// client-requested value against the daemon-wide default) and by
+// LoadPersisted when restoring (the persisted bit is round-tripped).
+func (s *Session) SetPersist(p bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.persist = p
+}
+
+// Persist reports whether this session is opted into disk
+// snapshotting. The flusher goroutine reads this to decide whether
+// to write; the GC sweep reads it to decide whether to delete the
+// on-disk dir on reap.
+func (s *Session) Persist() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.persist
+}
+
+// RestoredFromDisk reports whether this session was reconstructed
+// from on-disk state at daemon startup. The protocol_handler reads
+// this when emitting AttachAck so the client sees Restored=true on
+// the first reattach after a daemon restart. Idempotent — reading
+// doesn't clear the flag; ClearRestoredFlag does.
+func (s *Session) RestoredFromDisk() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.restoredFromDisk
+}
+
+// SetRestoredFromDisk is used by LoadPersisted to mark a freshly
+// hydrated session. Package-private would be nicer but we don't
+// export here — the only external caller is the persistence loader
+// in the same package.
+func (s *Session) setRestoredFromDisk(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.restoredFromDisk = v
+}
+
 func NewSession(id SessionID, name string, pty PTY, rows, cols uint16, bufCapacity int, idleTimeout time.Duration) (*Session, error) {
 	if pty == nil {
 		return nil, errors.New("pty must not be nil")

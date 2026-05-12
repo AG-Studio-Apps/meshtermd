@@ -187,6 +187,51 @@ func (r *RingBuffer) WaitForData(ctx context.Context, seenSeq uint64) (uint64, e
 	}
 }
 
+// Snapshot returns the raw underlying buffer (a fresh copy, safe to
+// retain across subsequent writes), the current writePos, the
+// monotonic headSeq, and the `full` flag. Used by the persistence
+// layer to checkpoint a session's scrollback to disk: combined with
+// the buffer capacity (Capacity()) these four values fully describe
+// the FIFO's state, so RestoreFromSnapshot reconstructs an identical
+// buffer.
+//
+// The copy is intentional — callers serialise on background goroutines
+// and the buffer keeps mutating in parallel. 4 MiB at 30 s flush
+// intervals is ~140 KB/s of allocation churn per heavily-active
+// session; well within GC budget.
+func (r *RingBuffer) Snapshot() (buf []byte, writePos int, headSeq uint64, full bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]byte, len(r.buf))
+	copy(out, r.buf)
+	return out, r.writePos, r.headSeq, r.full
+}
+
+// RestoreFromSnapshot rebuilds the buffer's FIFO state from a prior
+// Snapshot. The byte slice must be exactly Capacity() long — same as
+// the buffer was allocated with — otherwise the geometry assertions
+// in subsequent ReadSince calls would be wrong. Returns
+// ErrInvalidCapacity on mismatch.
+//
+// Resets the notify channel since waiters from a prior life have no
+// reason to fire — fresh waiters arm on the new chan.
+func (r *RingBuffer) RestoreFromSnapshot(buf []byte, writePos int, headSeq uint64, full bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(buf) != len(r.buf) {
+		return ErrInvalidCapacity
+	}
+	if writePos < 0 || writePos >= len(r.buf) {
+		return ErrInvalidCapacity
+	}
+	copy(r.buf, buf)
+	r.writePos = writePos
+	r.headSeq = headSeq
+	r.full = full
+	r.notify = make(chan struct{})
+	return nil
+}
+
 // ReadSince returns the bytes from `fromSeq` onward, up to maxBytes.
 // The returned slice is a fresh copy and may be retained by the caller
 // after subsequent Writes.

@@ -43,6 +43,10 @@ func runAttach(args []string) int {
 		"attach mode. 'exclusive' (default) sends stdin and owns PTY size — displaces any prior exclusive client. "+
 			"'readonly' is a watcher: receives output only, can't type, can't resize. Multiple readonly clients can "+
 			"coexist with each other and with one exclusive client.")
+	noPredict := fs.Bool("no-predict", false,
+		"disable predictive local echo. By default mtctl mirrors typed characters to your terminal immediately "+
+			"so typing feels instant on lossy or high-latency links; the prediction is confirmed when the daemon's "+
+			"real echo arrives. Pass --no-predict to fall back to the byte-by-byte wait-for-the-daemon experience.")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: mtctl attach [flags] <id-or-name|new>\n\n")
 		fs.PrintDefaults()
@@ -74,10 +78,10 @@ func runAttach(args []string) int {
 	// Hand off to a function with proper defer-restore so any panic
 	// or early-return path still puts the terminal back to cooked
 	// mode. attachRun returns an exit code.
-	return attachRun(target, selector, *createName, *shell, resolvedMode, *idleTimeout, *timeout)
+	return attachRun(target, selector, *createName, *shell, resolvedMode, *idleTimeout, *timeout, *noPredict)
 }
 
-func attachRun(target, selector, createName, shell, mode string, idleTimeout, deadline time.Duration) int {
+func attachRun(target, selector, createName, shell, mode string, idleTimeout, deadline time.Duration, noPredict bool) int {
 	// Phase 1: SSH bootstrap. Translate the selector into the right
 	// `meshtermd connect` flags and capture the MTRM_QUIC line.
 	bootstrap, err := bootstrapForAttach(target, selector, createName, shell, idleTimeout, deadline)
@@ -186,17 +190,38 @@ func attachRun(target, selector, createName, shell, mode string, idleTimeout, de
 		return protocol.WriteTaggedFrame(stream, t, body)
 	}
 
+	// Stdout writes happen from both the stdin pump (predictive local
+	// echo) and the stdout pump (real daemon output). Serialise them
+	// so the two streams don't interleave mid-byte.
+	var stdoutMu sync.Mutex
+	writeStdout := func(b []byte) error {
+		if len(b) == 0 {
+			return nil
+		}
+		stdoutMu.Lock()
+		defer stdoutMu.Unlock()
+		_, err := os.Stdout.Write(b)
+		return err
+	}
+
+	predictor := NewPredictionEngine()
+	if noPredict || mode == protocol.AttachModeReadonly {
+		// Readonly attachers don't send stdin, so there's nothing to
+		// predict. Disable so OnUserInput / OnDaemonOutput are no-ops.
+		predictor.Disable()
+	}
+
 	done := make(chan error, 4)
 
 	readonly := mode == protocol.AttachModeReadonly
 
-	go runStdoutPump(pCtx, stream, writeFrame, done)
+	go runStdoutPump(pCtx, stream, writeFrame, writeStdout, predictor, done)
 	// Stdin pump runs even in readonly so the `~.` detach chord
 	// still works — the watcher consumes bytes locally and just
 	// doesn't forward them when readonly is set. SIGWINCH is
 	// pointless in readonly (daemon drops Resize frames anyway, and
 	// the exclusive client owns the size we observe), so skip it.
-	go runStdinPump(pCtx, stream, writeFrame, readonly, done)
+	go runStdinPump(pCtx, stream, writeFrame, writeStdout, predictor, readonly, done)
 	if !readonly {
 		go runSigwinchPump(pCtx, ts, writeFrame, done)
 	}
@@ -256,13 +281,14 @@ func sshHostOnly(target string) string {
 }
 
 // stdoutPump reads tagged frames from the QUIC stream and dispatches:
-//   - FrameTypeStdout → write the payload bytes to os.Stdout (the
-//     local terminal emulator renders the ANSI passthrough)
+//   - FrameTypeStdout → run the payload through the prediction engine
+//     (which may suppress confirmed-prediction bytes or prepend
+//     rollback sequences), then write the result to stdout.
 //   - FrameTypeControl → CBOR-decode; Pong is a no-op for now,
 //     Goodbye triggers a clean exit. Future Ping (server-initiated)
 //     can be answered by us — currently the daemon's Ping is on the
 //     keepalive path and we just ignore it.
-func runStdoutPump(ctx context.Context, stream *quic.Stream, write frameWriter, done chan<- error) {
+func runStdoutPump(ctx context.Context, stream *quic.Stream, write frameWriter, writeOut stdoutWriter, predictor *PredictionEngine, done chan<- error) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -283,7 +309,8 @@ func runStdoutPump(ctx context.Context, stream *quic.Stream, write frameWriter, 
 				done <- fmt.Errorf("decode stdout: %w", derr)
 				return
 			}
-			if _, werr := os.Stdout.Write(payload); werr != nil {
+			toWrite := predictor.OnDaemonOutput(payload)
+			if werr := writeOut(toWrite); werr != nil {
 				done <- fmt.Errorf("write stdout: %w", werr)
 				return
 			}
@@ -325,7 +352,14 @@ func runStdoutPump(ctx context.Context, stream *quic.Stream, write frameWriter, 
 // bytes are dropped on the floor — the watcher still runs so the
 // detach chord works, but the user's keystrokes don't reach the
 // remote shell.
-func runStdinPump(ctx context.Context, stream *quic.Stream, write frameWriter, readonly bool, done chan<- error) {
+//
+// Predictive local echo: forwarded bytes are also handed to the
+// prediction engine. If the engine is armed and the bytes are
+// predictable (printable ASCII), it returns a mirror that we write
+// to stdout immediately — so typing feels instant on a high-RTT
+// link. The daemon's real echo arrives later and is reconciled by
+// the prediction engine on the stdout pump side.
+func runStdinPump(ctx context.Context, stream *quic.Stream, write frameWriter, writeOut stdoutWriter, predictor *PredictionEngine, readonly bool, done chan<- error) {
 	_ = stream // we only ever write; the stream is held by `write`
 	watcher := newEscapeWatcher()
 	buf := make([]byte, 4*1024)
@@ -337,6 +371,16 @@ func runStdinPump(ctx context.Context, stream *quic.Stream, write frameWriter, r
 		if n > 0 {
 			forwarded, detach := watcher.process(buf[:n])
 			if !readonly && len(forwarded) > 0 {
+				// Mirror predicted bytes locally BEFORE sending to the
+				// daemon so the keystroke appears instantly. The daemon
+				// send still happens — predictive echo is purely
+				// additive.
+				if mirror := predictor.OnUserInput(forwarded); len(mirror) > 0 {
+					if werr := writeOut(mirror); werr != nil {
+						done <- fmt.Errorf("write predicted echo: %w", werr)
+						return
+					}
+				}
 				if werr := write(protocol.FrameTypeStdin, forwarded); werr != nil {
 					done <- fmt.Errorf("send stdin: %w", werr)
 					return
@@ -401,3 +445,9 @@ func runSigwinchPump(ctx context.Context, ts *terminalSession, write frameWriter
 // frameWriter is the serialised stream-write shape — same as the
 // daemon-side helper of the same name in internal/transport.
 type frameWriter func(t uint8, body []byte) error
+
+// stdoutWriter is the serialised local-terminal-write shape. Both the
+// stdin pump (predicted echo) and the stdout pump (real daemon output)
+// produce bytes destined for os.Stdout; this funnel keeps them from
+// interleaving mid-byte.
+type stdoutWriter func(b []byte) error

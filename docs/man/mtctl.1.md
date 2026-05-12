@@ -76,6 +76,13 @@ needs to be running on the remote host; **mtctl** is a client only.
     Anti-rollback is on by default; pass **\-\-allow-downgrade** to
     install an older tag.
 
+**restart** [**\-\-host** *user@host*] [**\-\-timeout** *DUR*]
+:   Cycle the remote daemon via its supervisor (systemd-user, launchd,
+    or nohup fallback). In-flight sessions survive the restart — see
+    **meshtermd**(8) for the v0.6 pty-sidecar architecture. Default
+    timeout 45s (exceeds the daemon's own 30s restart timeout so the
+    SSH side outlasts the inner call).
+
 **uninstall** [**\-\-yes**]
 :   Remove the **mtctl** binary at **~/.local/bin/mtctl**. **mtctl**
     has no state directory of its own.

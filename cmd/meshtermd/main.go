@@ -52,6 +52,8 @@ func main() {
 		os.Exit(runStatus(args))
 	case "update":
 		os.Exit(runUpdate(args))
+	case "restart":
+		os.Exit(runRestart(args))
 	case "uninstall":
 		os.Exit(runUninstall(args))
 	case "pty-sidecar":
@@ -82,6 +84,7 @@ Subcommands:
   rename             change a session's user-visible name (PTY + buffer unaffected)
   status             print the daemon's operational snapshot (--json for tooling)
   update             check for / apply a signed self-update from GitHub Releases
+  restart            cycle the daemon via the detected supervisor (sessions survive)
   uninstall          remove the daemon, supervisor unit, and (optionally) state
   unit               emit / manage the systemd-user unit file
 

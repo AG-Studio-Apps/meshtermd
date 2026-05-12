@@ -79,6 +79,9 @@ var Mtctl = Binary{
 		{Name: "rename", Help: "rename a session",
 			Flags: []Flag{hostFlag}},
 		{Name: "update", Help: "check for / apply a signed self-update", Flags: updateFlags},
+		{Name: "restart", Help: "cycle the remote daemon via its supervisor (sessions survive)",
+			Flags: []Flag{hostFlag,
+				{Long: "--timeout", Help: "SSH dial / command timeout (e.g. 45s)"}}},
 		{Name: "uninstall", Help: "remove the mtctl binary",
 			Flags: []Flag{{Long: "--yes", Help: "skip the confirmation prompt"}}},
 		{Name: "help", Help: "print top-level usage"},
@@ -119,6 +122,8 @@ var Meshtermd = Binary{
 			Flags: []Flag{{Long: "--all", Help: "kill every session"}}},
 		{Name: "rename", Help: "rename a session"},
 		{Name: "update", Help: "check for / apply a signed self-update", Flags: updateFlags},
+		{Name: "restart", Help: "cycle the daemon via the detected supervisor (sessions survive)",
+			Flags: []Flag{{Long: "--timeout", Help: "max time to wait for the supervisor to complete the restart"}}},
 		{Name: "uninstall", Help: "remove the daemon, supervisor unit, and (optionally) state",
 			Flags: []Flag{
 				{Long: "--yes", Help: "skip the confirmation prompt"},

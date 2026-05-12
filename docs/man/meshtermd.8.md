@@ -87,6 +87,14 @@ real scrollback through every disconnect.
     against the manifest, atomic file replace, then **svcmgr.Restart**
     via the detected supervisor.
 
+**restart** [**\-\-timeout** *DUR*]
+:   Cycle the daemon via the detected supervisor (systemd-user, launchd,
+    or nohup fallback). In-flight sessions survive the restart — the
+    v0.6 pty-sidecar architecture keeps PTYs alive in sidecar processes
+    while the daemon reattaches them via FrameResume on next boot. No
+    confirmation prompt; matches **systemctl restart**'s UX. Default
+    timeout 30s.
+
 **uninstall** [**\-\-purge**] [**\-\-yes**]
 :   Stop the daemon, remove the supervisor unit, remove the binary.
     **\-\-purge** also wipes **~/.local/share/meshtermd/** (certificate,

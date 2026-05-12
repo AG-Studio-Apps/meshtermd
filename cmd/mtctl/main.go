@@ -1,13 +1,11 @@
 // Command mtctl manages remote `meshtermd` sessions from a laptop /
-// desktop. Each invocation shells out to ssh once, runs the
-// corresponding `meshtermd <op>` on the remote host, and parses the
-// response (text for human output, JSON for `--json` / piping).
-//
-// Tier 1 (this binary): management commands — list, kill, rename,
-// new, status. No QUIC attach.
-//
-// Tier 3 (future): real terminal attach, which needs a Go QUIC client
-// that speaks the same wire protocol the iOS RoamTransport speaks.
+// desktop. Each invocation either shells out to ssh once and runs the
+// corresponding `meshtermd <op>` on the remote host (the management
+// commands — list, kill, rename, new, session-info, status, restart,
+// update, uninstall), or opens a QUIC attach via attach.go's bootstrap
+// (the `attach` subcommand: SSH bootstrap → QUIC handshake → raw-mode
+// terminal pumps speaking the same Roam protocol the iOS RoamTransport
+// speaks).
 //
 // Authentication: standard SSH. Your `~/.ssh/config`, ssh-agent, and
 // keys all work transparently because we invoke the system `ssh`
@@ -55,6 +53,8 @@ func main() {
 		os.Exit(runAttach(args))
 	case "update":
 		os.Exit(runUpdate(args))
+	case "restart":
+		os.Exit(runRestart(args))
 	case "uninstall":
 		os.Exit(runUninstall(args))
 	case "help", "--help", "-h":
@@ -81,6 +81,7 @@ Subcommands:
   kill               reap a session by id or name
   rename             rename a session
   update             check for / apply a signed self-update from GitHub Releases
+  restart            cycle the remote daemon via its supervisor (sessions survive)
   uninstall          remove the mtctl binary
 
 Common flags (any subcommand):

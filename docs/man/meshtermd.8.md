@@ -42,7 +42,13 @@ real scrollback through every disconnect.
     **\-\-idle-timeout** / **\-\-max-idle-timeout** (per-session GC
     knobs), **\-\-session-buffer-bytes** (per-session output ring
     buffer; default 4 MiB, raise for hosts where you want richer
-    reattach-replay history during long output-heavy builds).
+    reattach-replay history during long output-heavy builds),
+    **\-\-persistence-default** {*on*|*off*} (daemon-wide default for
+    cross-restart session persistence; on means new sessions
+    checkpoint scrollback to disk so they survive daemon update and
+    host reboot; clients can override per-session via **meshtermd
+    connect \-\-persist** / **\-\-no-persist**),
+    **\-\-persistence-flush-interval** (snapshot cadence; default 30s).
 
 **connect** [*options*]
 :   SSH-side bootstrap helper invoked by the meshTerm iOS app (or by

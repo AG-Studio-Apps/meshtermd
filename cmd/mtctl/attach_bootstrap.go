@@ -39,6 +39,7 @@ type attachBootstrap struct {
 func bootstrapForAttach(
 	target, selector, createName, shell string,
 	idleTimeout, deadline time.Duration,
+	persist *bool,
 ) (*attachBootstrap, error) {
 	var sessionArg string
 	var nameArg string
@@ -66,6 +67,17 @@ func bootstrapForAttach(
 	}
 	if idleTimeout > 0 {
 		cmd += fmt.Sprintf(" --idle-timeout %ds", int(idleTimeout.Seconds()))
+	}
+	// --persist / --no-persist only matter for fresh spawn (reattach
+	// inherits the existing session's persist bit). bootstrapForAttach
+	// passes the flag through unconditionally — the daemon ignores it
+	// when reattaching by hex ID.
+	if persist != nil {
+		if *persist {
+			cmd += " --persist"
+		} else {
+			cmd += " --no-persist"
+		}
 	}
 
 	ctx := context.Background()

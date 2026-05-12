@@ -229,7 +229,8 @@ The pre-`mode` field client posture is preserved exactly: an Attach with no `mod
   "buf_seq": 12345,                // current head of the output ring buffer (== start unless replay overflowed)
   "trunc": false,                  // true iff the requested ack point is older than the buffer's tail (replay was truncated)
   "mode": "exclusive",             // the role the daemon resolved (echoes Attach.mode; "exclusive" if unrecognised)
-  "peers": ["readonly"]            // modes of OTHER clients currently attached, excluding this one. Empty when sole attach.
+  "peers": ["readonly"],           // modes of OTHER clients currently attached, excluding this one. Empty when sole attach.
+  "r": false                       // restored (optional, omitempty): see § 7.3.1
 }
 ```
 
@@ -238,6 +239,14 @@ If `ok = false`, body contains `"err": "<short_code>"` and `"msg": "<human_msg>"
 If `trunc = true`, the client should display a one-line "[…some output lost during disconnect…]" indicator before rendering the replayed bytes.
 
 `peers` is a snapshot; a client of either mode can attach or detach milliseconds later. Useful for the iOS picker / mtctl status line ("also attached: 1 readonly") but not load-bearing for any protocol invariant.
+
+#### 7.3.1 Restored sessions
+
+`r: true` indicates the session this attach is connecting to was **reconstructed from on-disk state** at the daemon's most-recent startup — its scrollback was hydrated from a previous daemon run's snapshot, and the shell process the client is now attached to was lazily spawned on this attach (the prior shell died with the prior daemon). Set on the first attach after a daemon restart; subsequent reattaches within the same daemon run see `r: false` (or the field absent — CBOR omitempty).
+
+Clients SHOULD surface a transient "Restored from previous session" banner so users understand the scrollback above the current prompt is replayed history, not output from a still-running command.
+
+Forward-compat: pre-persistence clients ignore the field; `omitempty` keeps the wire form unchanged in the common non-restored case.
 
 ### 7.4 `Ack` (client → server, periodic)
 
@@ -361,6 +370,32 @@ Default capacity 4 MiB. When full, oldest bytes are dropped (FIFO). The daemon t
 
 - If `N >= tail_seq`: replay from `N`, no truncation
 - If `N < tail_seq`: replay from `tail_seq`, set `trunc = true` in AttachAck
+
+### 11.6 Persistence across daemon restart (v0.5.0+)
+
+Sessions can opt into **cross-restart persistence**: the daemon checkpoints scrollback + metadata to disk on a 30s cadence (configurable via `meshtermd serve --persistence-flush-interval`), plus one final write on graceful shutdown. On the next daemon start, persisted sessions are reconstructed in the registry with their scrollback intact. The shell process can't survive a daemon restart (SIGHUP on PTY close); instead, the daemon lazy-spawns a fresh shell when the first client attaches and announces `r: true` in AttachAck so clients can surface a "Restored from previous session" banner.
+
+**Opt-in:** clients set `AllocateRequest.Persist` (a tri-state `*bool` over IPC) — `nil` inherits the daemon-wide default; explicit `true`/`false` overrides. The default-on policy matches the iOS `SSHHost.persistRoamSessions` default; operators flip the daemon-wide default to off via `meshtermd serve --persistence-default off` for shared / multi-user hosts. Persistence is fixed at session spawn time — reattach inherits the existing session's bit, and opt-out for a running session means kill + respawn.
+
+**On-disk layout** (under the daemon's existing state dir, default `$XDG_DATA_HOME/meshtermd` or `~/.local/share/meshtermd`, mode 0700):
+
+```
+sessions/
+└── <session_id_hex>/         (mode 0700)
+    ├── meta.cbor             (mode 0600)
+    └── scrollback.bin        (mode 0600, raw ring-buffer bytes)
+```
+
+`meta.cbor` carries: `fv` (format version, currently 1), `sid` (16-byte SessionID), `name`, `created` + `last_active` (Unix nanos), `rows` + `cols`, `idle_timeout` (nanos), `persist` (bool), `buf_capacity` (int), `head_seq` + `write_pos` + `full` (the three fields needed to reconstruct the FIFO from `scrollback.bin`). Files are written via temp-file-then-rename; a reader observing `meta.cbor` sees a consistent snapshot even if the daemon crashes mid-flush.
+
+**Threat surface**: identical to the daemon's existing TLS private key (same directory, same mode-0600 permissions). Same-UID attacker reads scrollback (already true for live in-memory state per SECURITY.md threat G); other-UID processes are blocked by file permissions. No application-layer encryption — adding it would either require interactive passphrase entry (breaks unattended restart) or platform-specific keyring integration (fragile across user-session boundaries). See SECURITY.md for the threat-model rationale.
+
+**Lifecycle**:
+
+- Spawn with `Persist: true` (or `nil` when daemon default is on) → flusher goroutine starts, checkpoints every 30s.
+- Daemon SIGTERM → flusher does one final write, on-disk dir preserved.
+- Daemon restart → `LoadPersisted` walks `sessions/`, hydrates Sessions, drops entries whose `fv` mismatches the loader, whose buffers can't round-trip, or whose `last_active + idle_timeout` is already past.
+- Idle-GC reap or explicit `mtctl kill` → on-disk dir is removed (`os.RemoveAll`).
 
 ## 12. Versioning
 

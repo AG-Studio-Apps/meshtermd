@@ -46,14 +46,19 @@ needs to be running on the remote host; **mtctl** is a client only.
 :   Print the remote daemon's operational snapshot (uptime, QUIC addr,
     session count, idle policy, certificate fingerprint).
 
-**new** [**\-\-host** *user@host*] **\-\-name** *NAME* [**\-\-idle-timeout** *DUR*]
-:   Create a new named session without attaching.
+**new** [**\-\-host** *user@host*] **\-\-name** *NAME* [**\-\-idle-timeout** *DUR*] [**\-\-persist** | **\-\-no-persist**]
+:   Create a new named session without attaching. **\-\-persist** /
+    **\-\-no-persist** override the daemon-wide persistence default
+    for this specific session; absent means inherit the daemon
+    default (typically on).
 
-**attach** [**\-\-host** *user@host*] [**\-\-mode** {*exclusive*|*readonly*}] *id-or-name*
+**attach** [**\-\-host** *user@host*] [**\-\-mode** {*exclusive*|*readonly*}] [**\-\-persist** | **\-\-no-persist**] *id-or-name*
 :   Attach to a session as your local terminal. If the named session
     doesn't exist, **attach** creates it. Use **\-\-mode readonly** to
-    watch without sending input. Type `~.` on a fresh line to detach;
-    the remote shell stays alive on the daemon.
+    watch without sending input. **\-\-persist** / **\-\-no-persist**
+    apply only on fresh spawn — reattach inherits whatever the
+    original session was created with. Type `~.` on a fresh line to
+    detach; the remote shell stays alive on the daemon.
 
 **kill** [**\-\-host** *user@host*] *id-or-name*
 :   Reap a session by SessionID or by user-visible Name. Glob patterns

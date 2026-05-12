@@ -47,6 +47,12 @@ func runAttach(args []string) int {
 		"disable predictive local echo. By default mtctl mirrors typed characters to your terminal immediately "+
 			"so typing feels instant on lossy or high-latency links; the prediction is confirmed when the daemon's "+
 			"real echo arrives. Pass --no-predict to fall back to the byte-by-byte wait-for-the-daemon experience.")
+	persist := fs.Bool("persist", false,
+		"opt this session into cross-restart persistence on fresh spawn. Mutually exclusive with --no-persist; "+
+			"when neither is set, the daemon's --persistence-default applies. Ignored when reattaching to an "+
+			"existing session (persistence is fixed at spawn).")
+	noPersist := fs.Bool("no-persist", false,
+		"opt this session OUT of cross-restart persistence on fresh spawn.")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: mtctl attach [flags] <id-or-name|new>\n\n")
 		fs.PrintDefaults()
@@ -75,16 +81,29 @@ func runAttach(args []string) int {
 		return exitConfig
 	}
 
+	if *persist && *noPersist {
+		fmt.Fprintln(os.Stderr, "mtctl attach: --persist and --no-persist are mutually exclusive")
+		return exitConfig
+	}
+	var persistPtr *bool
+	if *persist {
+		v := true
+		persistPtr = &v
+	} else if *noPersist {
+		v := false
+		persistPtr = &v
+	}
+
 	// Hand off to a function with proper defer-restore so any panic
 	// or early-return path still puts the terminal back to cooked
 	// mode. attachRun returns an exit code.
-	return attachRun(target, selector, *createName, *shell, resolvedMode, *idleTimeout, *timeout, *noPredict)
+	return attachRun(target, selector, *createName, *shell, resolvedMode, *idleTimeout, *timeout, *noPredict, persistPtr)
 }
 
-func attachRun(target, selector, createName, shell, mode string, idleTimeout, deadline time.Duration, noPredict bool) int {
+func attachRun(target, selector, createName, shell, mode string, idleTimeout, deadline time.Duration, noPredict bool, persist *bool) int {
 	// Phase 1: SSH bootstrap. Translate the selector into the right
 	// `meshtermd connect` flags and capture the MTRM_QUIC line.
-	bootstrap, err := bootstrapForAttach(target, selector, createName, shell, idleTimeout, deadline)
+	bootstrap, err := bootstrapForAttach(target, selector, createName, shell, idleTimeout, deadline, persist)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mtctl attach: bootstrap: %v\n", err)
 		return exitRemote

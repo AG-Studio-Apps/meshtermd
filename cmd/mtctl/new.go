@@ -29,6 +29,13 @@ func runNew(args []string) int {
 	rows := fs.Uint("rows", 24, "initial PTY rows")
 	cols := fs.Uint("cols", 80, "initial PTY cols")
 	idleTimeout := fs.Duration("idle-timeout", 0, "per-session idle timeout (0 = use daemon default)")
+	persist := fs.Bool("persist", false,
+		"opt this session into cross-restart persistence. The daemon checkpoints scrollback to disk so the "+
+			"session survives daemon update and host reboot. Mutually exclusive with --no-persist; when neither "+
+			"is set, the daemon's --persistence-default applies (typically on).")
+	noPersist := fs.Bool("no-persist", false,
+		"opt this session OUT of cross-restart persistence (use when --persistence-default is on but a specific "+
+			"session is sensitive).")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: mtctl new --name <name> [flags]\n\n")
 		fs.PrintDefaults()
@@ -37,6 +44,10 @@ func runNew(args []string) int {
 	if *name == "" {
 		fmt.Fprintln(os.Stderr, "mtctl new: --name is required")
 		fs.Usage()
+		return exitConfig
+	}
+	if *persist && *noPersist {
+		fmt.Fprintln(os.Stderr, "mtctl new: --persist and --no-persist are mutually exclusive")
 		return exitConfig
 	}
 
@@ -59,6 +70,11 @@ func runNew(args []string) int {
 	}
 	if *idleTimeout > 0 {
 		cmd += fmt.Sprintf(" --idle-timeout %ds", int((*idleTimeout).Seconds()))
+	}
+	if *persist {
+		cmd += " --persist"
+	} else if *noPersist {
+		cmd += " --no-persist"
 	}
 
 	ctx := context.Background()

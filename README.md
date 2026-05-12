@@ -18,12 +18,14 @@ Pre-1.0. The wire protocol is documented but not frozen; we may break it before 
 | Real scrollback through drop | ✅              | ❌          | ✅          | ✅          | ✅               |
 | Named multi-session per host | ✅              | ❌          | ✅          | ✅          | partial          |
 | Modern UDP transport         | QUIC            | SSP/UDP     | n/a         | TCP/SSH     | TCP              |
-| Mobile-native client         | ✅ (meshTerm)   | partial     | ❌          | ❌          | ❌               |
+| Mobile-native client         | ✅ (meshTerm)†  | partial     | ❌          | ❌          | ❌               |
 | Same daemon, multiple clients| ✅              | ❌          | ✅          | client-specific | ✅           |
 | Tab completion / man pages   | ✅              | ✅          | ✅          | ✅          | ✅               |
 | Signed self-update           | ✅ (minisign)   | distro-only | distro-only | distro-only | distro-only      |
 
 The daemon is the source of truth; the clients are interchangeable. That's the line wezterm's multiplexer can't easily cross — it requires their emulator on both ends.
+
+† **meshTerm iOS status**: the QUIC-speaking meshTerm client is currently in TestFlight as the v2.0 release; the App Store version (v1.x) is the pre-Roam SSH client. The two ship in lockstep — when v2.0 hits the App Store, meshtermd cuts its first coordinated public release (see Install below).
 
 ## What it does
 
@@ -36,11 +38,23 @@ The daemon is the source of truth; the clients are interchangeable. That's the l
 
 ## Install
 
-Prebuilt binaries from [GitHub Releases](https://github.com/AG-Studio-Apps/meshtermd/releases/latest) for seven targets: linux amd64/arm64/armv7, darwin amd64/arm64, freebsd amd64/arm64. Releases include the daemon, the `mtctl` CLI, man pages, and shell completions for bash/zsh/fish.
+**Currently live (manual install only):** prebuilt binaries from [GitHub Releases](https://github.com/AG-Studio-Apps/meshtermd/releases/latest) for seven targets — linux amd64/arm64/armv7, darwin amd64/arm64, freebsd amd64/arm64. Releases include the daemon, the `mtctl` CLI, man pages, and shell completions for bash/zsh/fish.
 
-- **Homebrew** (macOS, Linux): `brew tap AG-Studio-Apps/meshtermd && brew install meshtermd`
-- **Arch Linux (AUR)**: `meshtermd-bin` (pre-built) or `meshtermd` (from source)
-- **Manual**: download the appropriate `meshtermd-*` + `mtctl-*` binaries, verify with `SHA256SUMS` + `SHA256SUMS.minisig` (public key in [`docs/release-public-key.txt`](docs/release-public-key.txt)), install to `~/.local/bin/`.
+```sh
+# Pick the right asset for your platform from the latest release.
+# Verify SHA-256 against the signed SHA256SUMS, then install:
+install -m 755 meshtermd-<platform> ~/.local/bin/meshtermd
+install -m 755 mtctl-<platform>     ~/.local/bin/mtctl
+```
+
+The minisign public key for `SHA256SUMS.minisig` verification lives in [`docs/release-public-key.txt`](docs/release-public-key.txt).
+
+**Coming with the v2.0 coordinated release** (alongside meshTerm iOS v2.0 hitting the App Store):
+
+- **Homebrew tap** (macOS, Linux): `brew tap AG-Studio-Apps/meshtermd && brew install meshtermd`
+- **Arch Linux (AUR)**: `meshtermd-bin` (pre-built) and `meshtermd` (build-from-source)
+
+The formula and `PKGBUILD`s are already staged under [`packaging/`](packaging/) so anyone curious can preview the install shape; the live channels go up on co-release day.
 
 Once installed, the daemon usually runs under a supervisor — systemd-user on Linux, launchd on macOS, or a `nohup` fallback. The supervisor unit is dropped automatically by the iOS app's auto-installer on first connect, or you can write one yourself by hand.
 

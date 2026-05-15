@@ -99,6 +99,17 @@ const (
 	TypeGoodbye     = "Goodbye"
 	TypeEchoConfirm = "EchoConfirm"
 	TypeRTTNotify   = "RTTNotify"
+	// TypeReplay (client → server) and TypeReplayMark (server →
+	// client) implement the v0.8.0 scrollback-replay flow used by
+	// iOS clients on device rotation. The client asks for a rewind
+	// of the output stream so SwiftTerm can repaint scrollback at
+	// the new column count. The daemon emits a ReplayMark
+	// immediately (the client's "reset boundary"), then re-streams
+	// the requested byte window. Backward-compatible: daemons that
+	// don't recognise TypeReplay fall through to the default ignore
+	// branch, and clients time out their pending mark gracefully.
+	TypeReplay     = "Replay"
+	TypeReplayMark = "ReplayMark"
 )
 
 // EchoState mirrors the tri-state value carried in EchoConfirm.
@@ -291,6 +302,49 @@ type EchoConfirm struct {
 	CanonMode bool   `cbor:"cm,omitempty"`
 }
 
+// Replay is sent by the client (typically iOS on rotation) to ask
+// the daemon to re-emit the output byte stream starting at
+// FromSeq. The daemon responds with a ReplayMark immediately (the
+// client's reset boundary), then re-streams the byte window via
+// the normal FrameTypeStdout pump. If FromSeq is older than the
+// ring buffer's TailSeq, the daemon clamps to TailSeq and reports
+// Trunc=true on the ReplayMark — older scrollback was already
+// dropped from the buffer and can't be recovered.
+//
+// Concurrent live PTY output continues to flow during the replay;
+// the client may receive overlapping seqs (the rewound window
+// plus any bytes the pump emitted between the rotation and the
+// replay frame's arrival). The client's terminal reset on
+// ReplayMark handles this — anything before the mark is
+// invalidated, anything after is what gets rendered.
+//
+// v0.8.0+ wire type. Old daemons fall through to the default
+// ignore branch in handleControlFrame; old clients never send it.
+type Replay struct {
+	T       string `cbor:"t"`
+	FromSeq uint64 `cbor:"from"`
+}
+
+// ReplayMark is the daemon's response to a Replay request, sent
+// IMMEDIATELY before any rewound bytes appear on the stdout
+// stream. The client uses receipt of this frame as the boundary
+// at which to reset its terminal state — everything before the
+// mark is invalidated, everything after is the post-reset
+// repaint.
+//
+//   - FromSeq echoes the seq the daemon actually honoured
+//     (post-clamp; equals the requested seq when nothing was
+//     truncated, equals the ring tail when it was).
+//   - Trunc is true when FromSeq was clamped from below — i.e.
+//     the client asked for older bytes than the ring still
+//     held. Clients can surface a "older scrollback dropped"
+//     hint or just log it.
+type ReplayMark struct {
+	T       string `cbor:"t"`
+	FromSeq uint64 `cbor:"from"`
+	Trunc   bool   `cbor:"trunc,omitempty"`
+}
+
 // Goodbye is the last message either side sends before closing.
 type Goodbye struct {
 	T      string `cbor:"t"`
@@ -323,6 +377,11 @@ func MarshalPing(m Ping) ([]byte, error)             { m.T = TypePing; return cb
 func MarshalPong(m Pong) ([]byte, error)             { m.T = TypePong; return cborMarshal(m) }
 func MarshalGoodbye(m Goodbye) ([]byte, error)       { m.T = TypeGoodbye; return cborMarshal(m) }
 func MarshalRTTNotify(m RTTNotify) ([]byte, error) { m.T = TypeRTTNotify; return cborMarshal(m) }
+func MarshalReplay(m Replay) ([]byte, error)       { m.T = TypeReplay; return cborMarshal(m) }
+func MarshalReplayMark(m ReplayMark) ([]byte, error) {
+	m.T = TypeReplayMark
+	return cborMarshal(m)
+}
 func MarshalEchoConfirm(m EchoConfirm) ([]byte, error) {
 	m.T = TypeEchoConfirm
 	return cborMarshal(m)

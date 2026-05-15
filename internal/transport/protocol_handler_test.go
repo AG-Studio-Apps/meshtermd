@@ -351,3 +351,155 @@ func TestProtocolHandlerReplaysBufferedOutputOnReattach(t *testing.T) {
 		t.Errorf("replay missing %q; got %q", missed, got)
 	}
 }
+
+// readUntilReplayMark drains frames from `stream`, collecting any
+// stdout payloads it sees, and returns once a ReplayMark control
+// frame arrives. Other control frames (EchoConfirm, RTTNotify) are
+// silently skipped. Fails the test if a frame arrives that isn't a
+// stdout or control frame.
+func readUntilReplayMark(t *testing.T, stream *quic.Stream) (protocol.ReplayMark, []byte) {
+	t.Helper()
+	var stdoutPayload []byte
+	for {
+		frameType, body, err := protocol.ReadTaggedFrame(stream)
+		if err != nil {
+			t.Fatalf("read tagged frame: %v", err)
+		}
+		switch frameType {
+		case protocol.FrameTypeStdout:
+			_, payload, err := protocol.DecodeStdoutBody(body)
+			if err != nil {
+				t.Fatalf("decode stdout body: %v", err)
+			}
+			stdoutPayload = append(stdoutPayload, payload...)
+		case protocol.FrameTypeControl:
+			ty, err := protocol.PeekType(body)
+			if err != nil {
+				t.Fatalf("peek control type: %v", err)
+			}
+			if ty != protocol.TypeReplayMark {
+				continue // EchoConfirm, RTTNotify, etc. — irrelevant here
+			}
+			var mark protocol.ReplayMark
+			if err := cbor.Unmarshal(body, &mark); err != nil {
+				t.Fatalf("decode ReplayMark: %v", err)
+			}
+			return mark, stdoutPayload
+		default:
+			t.Fatalf("unexpected frame type %d", frameType)
+		}
+	}
+}
+
+func TestProtocolHandlerReplayHappyPath(t *testing.T) {
+	t.Parallel()
+	h := newHandlerHarness(t)
+	defer h.cleanup()
+
+	tok, err := h.reg.IssueAttachToken(h.sess.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, stream, ack := dialAndAttach(t, h, h.sess.ID(), tok)
+	defer conn.CloseWithError(0, "")
+	defer stream.Close()
+	if !ack.OK {
+		t.Fatalf("attach failed: %s %s", ack.Err, ack.Msg)
+	}
+
+	// Push a known payload and drain it via the live stdout pump
+	// so the buffer has the bytes AND the pump has caught up. We
+	// don't want stale pre-replay live frames confusing the
+	// assertions.
+	const live = "first-pass-content"
+	h.pty.push([]byte(live))
+	gotLive := make([]byte, 0, len(live))
+	for len(gotLive) < len(live) {
+		_, payload := readNextStdoutFrame(t, stream)
+		gotLive = append(gotLive, payload...)
+	}
+	if !bytes.Contains(gotLive, []byte(live)) {
+		t.Fatalf("live drain didn't reach payload; got %q want contains %q", gotLive, live)
+	}
+
+	// Send a Replay request from the start of the buffer.
+	req, err := protocol.MarshalReplay(protocol.Replay{FromSeq: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := protocol.WriteTaggedFrame(stream, protocol.FrameTypeControl, req); err != nil {
+		t.Fatalf("write Replay: %v", err)
+	}
+
+	mark, stdoutPayload := readUntilReplayMark(t, stream)
+	if mark.Trunc {
+		t.Errorf("Trunc = true; want false (request from seq 0, buffer hasn't overflowed)")
+	}
+	if mark.FromSeq != 0 {
+		t.Errorf("FromSeq = %d, want 0", mark.FromSeq)
+	}
+
+	// Drain stdout frames until we've collected at least len(live)
+	// bytes from the rewound stream. The first stdout frames we
+	// read here may be the replay-window frames, OR they may have
+	// preceded the ReplayMark (we collected them into stdoutPayload
+	// above already). Continue reading the post-mark frames.
+	got := stdoutPayload
+	deadline := time.Now().Add(2 * time.Second)
+	for len(got) < len(live) && time.Now().Before(deadline) {
+		_, payload := readNextStdoutFrame(t, stream)
+		got = append(got, payload...)
+	}
+	if !bytes.Contains(got, []byte(live)) {
+		t.Errorf("replay did not redeliver payload; got %q want contains %q", got, live)
+	}
+}
+
+func TestProtocolHandlerReplayTruncatesWhenOlderThanTail(t *testing.T) {
+	t.Parallel()
+	h := newHandlerHarness(t)
+	defer h.cleanup()
+
+	tok, err := h.reg.IssueAttachToken(h.sess.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, stream, ack := dialAndAttach(t, h, h.sess.ID(), tok)
+	defer conn.CloseWithError(0, "")
+	defer stream.Close()
+	if !ack.OK {
+		t.Fatalf("attach failed: %s %s", ack.Err, ack.Msg)
+	}
+
+	// Overflow the 4KiB ring (harness default). 6KiB pushes the
+	// tail past zero — a Replay{FromSeq: 0} must come back with
+	// Trunc=true and FromSeq clamped to the new tail.
+	chunk := bytes.Repeat([]byte("X"), 1024)
+	for i := 0; i < 6; i++ {
+		h.pty.push(chunk)
+	}
+	// Drain the live frames so the pump catches up before we send
+	// the Replay request.
+	drained := 0
+	deadline := time.Now().Add(2 * time.Second)
+	for drained < 6*1024 && time.Now().Before(deadline) {
+		_, payload := readNextStdoutFrame(t, stream)
+		drained += len(payload)
+	}
+
+	req, err := protocol.MarshalReplay(protocol.Replay{FromSeq: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := protocol.WriteTaggedFrame(stream, protocol.FrameTypeControl, req); err != nil {
+		t.Fatalf("write Replay: %v", err)
+	}
+
+	mark, _ := readUntilReplayMark(t, stream)
+	if !mark.Trunc {
+		t.Errorf("Trunc = false; want true (requested seq 0, ring tail has advanced past it)")
+	}
+	if mark.FromSeq == 0 {
+		t.Errorf("FromSeq = 0; want non-zero (tail-clamped to current ring tail)")
+	}
+}

@@ -163,6 +163,64 @@ func handleControlFrame(sess *session.Session, body []byte, write frameWriter, m
 			return err
 		}
 		return write(protocol.FrameTypeControl, pong)
+	case protocol.TypeReplay:
+		// v0.8.0+ scrollback-replay request. Client (typically iOS
+		// on rotation) wants the daemon to re-emit the byte stream
+		// from FromSeq onward so SwiftTerm can repaint scrollback
+		// at the new column count. Emit ReplayMark first (the
+		// client's reset boundary), then re-stream the requested
+		// window via the same FrameTypeStdout frames the output
+		// pump uses. Live PTY output continues to flow through the
+		// pump concurrently — the client's reset on ReplayMark
+		// handles any seq overlap by discarding pre-mark state.
+		var m protocol.Replay
+		if err := protocol.StrictDecMode.Unmarshal(body, &m); err != nil {
+			return nil // malformed; ignore rather than tear down
+		}
+		buf := sess.Buffer()
+		if buf == nil {
+			return nil // session closed
+		}
+		headSeq := buf.HeadSeq()
+		tailSeq := buf.TailSeq()
+		actualFrom := m.FromSeq
+		trunc := false
+		if actualFrom < tailSeq {
+			actualFrom = tailSeq
+			trunc = true
+		}
+		if actualFrom > headSeq {
+			actualFrom = headSeq
+		}
+		mark, err := protocol.MarshalReplayMark(protocol.ReplayMark{
+			FromSeq: actualFrom,
+			Trunc:   trunc,
+		})
+		if err != nil {
+			return err
+		}
+		if err := write(protocol.FrameTypeControl, mark); err != nil {
+			return err
+		}
+		// Re-stream the window. Each frame is at most
+		// MaxOutputFramePayload bytes; we loop until the requested
+		// window is exhausted. The output pump may interleave its
+		// own live frames between ours — the frameWriter mutex
+		// keeps each frame atomic on the wire, and the client's
+		// reset on ReplayMark handles any overlap.
+		seq := actualFrom
+		for seq < headSeq {
+			data, newSeq, _ := buf.ReadSince(seq, protocol.MaxOutputFramePayload)
+			if len(data) == 0 {
+				break
+			}
+			out := protocol.EncodeStdoutBody(seq, data)
+			if err := write(protocol.FrameTypeStdout, out); err != nil {
+				return err
+			}
+			seq = newSeq
+		}
+		return nil
 	case protocol.TypeGoodbye:
 		return io.EOF // signal graceful close to readPump
 	default:

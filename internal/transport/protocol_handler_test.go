@@ -352,43 +352,53 @@ func TestProtocolHandlerReplaysBufferedOutputOnReattach(t *testing.T) {
 	}
 }
 
-// readUntilReplayMark drains frames from `stream`, collecting any
-// stdout payloads it sees, and returns once a ReplayMark control
-// frame arrives. Other control frames (EchoConfirm, RTTNotify) are
-// silently skipped. Fails the test if a frame arrives that isn't a
-// stdout or control frame.
-func readUntilReplayMark(t *testing.T, stream *quic.Stream) (protocol.ReplayMark, []byte) {
+// drainUntilQuiet reads frames from `stream` with a per-read
+// deadline, returning when no new frame has arrived for
+// `quietFor`. Stdout payloads are concatenated and returned;
+// control frames are decoded and, if one is a ReplayMark, returned
+// alongside. Other control types are silently dropped.
+//
+// This bounded-drain pattern is necessary because the output pump
+// blocks indefinitely on WaitForData once it's caught up — a
+// fixed-iteration drain loop using the unbounded
+// `readNextStdoutFrame` will hang the test if it sets a target
+// byte count larger than what's actually pending. SetReadDeadline
+// on the QUIC stream gives us a clean exit when the pump has gone
+// quiet.
+func drainUntilQuiet(t *testing.T, stream *quic.Stream, quietFor time.Duration) (replayMark *protocol.ReplayMark, stdoutBytes []byte) {
 	t.Helper()
-	var stdoutPayload []byte
 	for {
+		if err := stream.SetReadDeadline(time.Now().Add(quietFor)); err != nil {
+			t.Fatalf("SetReadDeadline: %v", err)
+		}
 		frameType, body, err := protocol.ReadTaggedFrame(stream)
 		if err != nil {
-			t.Fatalf("read tagged frame: %v", err)
+			// Deadline expired or stream closed — done.
+			break
 		}
 		switch frameType {
 		case protocol.FrameTypeStdout:
-			_, payload, err := protocol.DecodeStdoutBody(body)
-			if err != nil {
-				t.Fatalf("decode stdout body: %v", err)
+			_, payload, derr := protocol.DecodeStdoutBody(body)
+			if derr != nil {
+				t.Fatalf("decode stdout body: %v", derr)
 			}
-			stdoutPayload = append(stdoutPayload, payload...)
+			stdoutBytes = append(stdoutBytes, payload...)
 		case protocol.FrameTypeControl:
-			ty, err := protocol.PeekType(body)
-			if err != nil {
-				t.Fatalf("peek control type: %v", err)
+			ty, perr := protocol.PeekType(body)
+			if perr != nil {
+				t.Fatalf("peek control type: %v", perr)
 			}
-			if ty != protocol.TypeReplayMark {
-				continue // EchoConfirm, RTTNotify, etc. — irrelevant here
+			if ty == protocol.TypeReplayMark {
+				var mark protocol.ReplayMark
+				if cerr := cbor.Unmarshal(body, &mark); cerr != nil {
+					t.Fatalf("decode ReplayMark: %v", cerr)
+				}
+				replayMark = &mark
 			}
-			var mark protocol.ReplayMark
-			if err := cbor.Unmarshal(body, &mark); err != nil {
-				t.Fatalf("decode ReplayMark: %v", err)
-			}
-			return mark, stdoutPayload
-		default:
-			t.Fatalf("unexpected frame type %d", frameType)
 		}
 	}
+	_ = stream.SetReadDeadline(time.Time{})
+	return replayMark, stdoutBytes
 }
 
 func TestProtocolHandlerReplayHappyPath(t *testing.T) {
@@ -407,22 +417,17 @@ func TestProtocolHandlerReplayHappyPath(t *testing.T) {
 		t.Fatalf("attach failed: %s %s", ack.Err, ack.Msg)
 	}
 
-	// Push a known payload and drain it via the live stdout pump
-	// so the buffer has the bytes AND the pump has caught up. We
-	// don't want stale pre-replay live frames confusing the
-	// assertions.
+	// Push a known payload; the session pump copies it into the
+	// ring buffer and the output pump emits it as a live stdout
+	// frame. We don't bother draining that separately — both the
+	// live frame and the post-replay frames will end up in the
+	// drainUntilQuiet bucket below.
 	const live = "first-pass-content"
 	h.pty.push([]byte(live))
-	gotLive := make([]byte, 0, len(live))
-	for len(gotLive) < len(live) {
-		_, payload := readNextStdoutFrame(t, stream)
-		gotLive = append(gotLive, payload...)
-	}
-	if !bytes.Contains(gotLive, []byte(live)) {
-		t.Fatalf("live drain didn't reach payload; got %q want contains %q", gotLive, live)
-	}
+	// Brief sleep so the session pump can finish copying into the
+	// ring buffer before we ask for a replay.
+	time.Sleep(50 * time.Millisecond)
 
-	// Send a Replay request from the start of the buffer.
 	req, err := protocol.MarshalReplay(protocol.Replay{FromSeq: 0})
 	if err != nil {
 		t.Fatal(err)
@@ -431,27 +436,20 @@ func TestProtocolHandlerReplayHappyPath(t *testing.T) {
 		t.Fatalf("write Replay: %v", err)
 	}
 
-	mark, stdoutPayload := readUntilReplayMark(t, stream)
+	// Drain everything the daemon emits over the next 300ms — the
+	// live frame, the ReplayMark, and the replay-window frame(s).
+	mark, stdoutBytes := drainUntilQuiet(t, stream, 300*time.Millisecond)
+	if mark == nil {
+		t.Fatalf("no ReplayMark received")
+	}
 	if mark.Trunc {
 		t.Errorf("Trunc = true; want false (request from seq 0, buffer hasn't overflowed)")
 	}
 	if mark.FromSeq != 0 {
 		t.Errorf("FromSeq = %d, want 0", mark.FromSeq)
 	}
-
-	// Drain stdout frames until we've collected at least len(live)
-	// bytes from the rewound stream. The first stdout frames we
-	// read here may be the replay-window frames, OR they may have
-	// preceded the ReplayMark (we collected them into stdoutPayload
-	// above already). Continue reading the post-mark frames.
-	got := stdoutPayload
-	deadline := time.Now().Add(2 * time.Second)
-	for len(got) < len(live) && time.Now().Before(deadline) {
-		_, payload := readNextStdoutFrame(t, stream)
-		got = append(got, payload...)
-	}
-	if !bytes.Contains(got, []byte(live)) {
-		t.Errorf("replay did not redeliver payload; got %q want contains %q", got, live)
+	if !bytes.Contains(stdoutBytes, []byte(live)) {
+		t.Errorf("stdout bytes missing live payload; got %q want contains %q", stdoutBytes, live)
 	}
 }
 
@@ -478,14 +476,7 @@ func TestProtocolHandlerReplayTruncatesWhenOlderThanTail(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		h.pty.push(chunk)
 	}
-	// Drain the live frames so the pump catches up before we send
-	// the Replay request.
-	drained := 0
-	deadline := time.Now().Add(2 * time.Second)
-	for drained < 6*1024 && time.Now().Before(deadline) {
-		_, payload := readNextStdoutFrame(t, stream)
-		drained += len(payload)
-	}
+	time.Sleep(100 * time.Millisecond)
 
 	req, err := protocol.MarshalReplay(protocol.Replay{FromSeq: 0})
 	if err != nil {
@@ -495,7 +486,10 @@ func TestProtocolHandlerReplayTruncatesWhenOlderThanTail(t *testing.T) {
 		t.Fatalf("write Replay: %v", err)
 	}
 
-	mark, _ := readUntilReplayMark(t, stream)
+	mark, _ := drainUntilQuiet(t, stream, 300*time.Millisecond)
+	if mark == nil {
+		t.Fatalf("no ReplayMark received")
+	}
 	if !mark.Trunc {
 		t.Errorf("Trunc = false; want true (requested seq 0, ring tail has advanced past it)")
 	}

@@ -47,6 +47,8 @@ func TestEachMarshalStampsItsType(t *testing.T) {
 		{"Pong", func() ([]byte, error) { return MarshalPong(Pong{}) }, TypePong},
 		{"Goodbye", func() ([]byte, error) { return MarshalGoodbye(Goodbye{}) }, TypeGoodbye},
 		{"EchoConfirm", func() ([]byte, error) { return MarshalEchoConfirm(EchoConfirm{}) }, TypeEchoConfirm},
+		{"Replay", func() ([]byte, error) { return MarshalReplay(Replay{}) }, TypeReplay},
+		{"ReplayMark", func() ([]byte, error) { return MarshalReplayMark(ReplayMark{}) }, TypeReplayMark},
 	}
 	for _, c := range cases {
 		c := c
@@ -96,6 +98,60 @@ func TestAttachRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(got.SessionID, original.SessionID) {
 		t.Errorf("SessionID round-trip lost data")
+	}
+}
+
+func TestReplayRoundTrip(t *testing.T) {
+	t.Parallel()
+	original := Replay{FromSeq: 1024 * 64}
+	b, err := MarshalReplay(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Replay
+	if err := cbor.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.T != TypeReplay {
+		t.Errorf("T = %q, want %q", got.T, TypeReplay)
+	}
+	if got.FromSeq != original.FromSeq {
+		t.Errorf("FromSeq = %d, want %d", got.FromSeq, original.FromSeq)
+	}
+}
+
+func TestReplayMarkRoundTrip(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		input ReplayMark
+	}{
+		{"normal", ReplayMark{FromSeq: 4096, Trunc: false}},
+		{"truncated", ReplayMark{FromSeq: 0, Trunc: true}},
+		{"high-seq", ReplayMark{FromSeq: 1 << 40, Trunc: false}},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			b, err := MarshalReplayMark(c.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got ReplayMark
+			if err := cbor.Unmarshal(b, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.T != TypeReplayMark {
+				t.Errorf("T = %q, want %q", got.T, TypeReplayMark)
+			}
+			if got.FromSeq != c.input.FromSeq {
+				t.Errorf("FromSeq = %d, want %d", got.FromSeq, c.input.FromSeq)
+			}
+			if got.Trunc != c.input.Trunc {
+				t.Errorf("Trunc = %v, want %v", got.Trunc, c.input.Trunc)
+			}
+		})
 	}
 }
 

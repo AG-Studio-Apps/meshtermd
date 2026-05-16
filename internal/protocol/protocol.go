@@ -230,6 +230,18 @@ type AttachAck struct {
 	// non-restored common case.
 	Restored bool `cbor:"r,omitempty"`
 
+	// FreshlyCreated is true on the AttachAck for the very first
+	// successful attach to a session — i.e. the session was spawned
+	// during this same attach exchange (or earlier, with no successful
+	// attach yet). False on every subsequent reattach. Distinct from
+	// Restored: a session restored from disk reports Restored=true on
+	// its first post-restart attach, but its FreshlyCreated is false
+	// because the underlying session predates this attach. Clients use
+	// this to safely emit one-shot startup bytes (e.g. environment
+	// nudges) without race-checking buffer occupancy. v0.9.0+ field;
+	// older clients ignore it and fall back to their own heuristic.
+	FreshlyCreated bool `cbor:"fc,omitempty"`
+
 	// RTTNanos is the daemon's measured smoothed RTT to the client at
 	// attach time, in nanoseconds. Sourced from quic-go's
 	// ConnectionStats().SmoothedRTT. v0.7.0+ field; older clients

@@ -256,6 +256,15 @@ type Session struct {
 	// to a freshly-spawned one.
 	restoredFromDisk bool
 
+	// firstAttachPending is true until the first AttachAck with OK=true
+	// has been sent for this session. NewSession sets it; LoadPersisted
+	// explicitly clears it (a restored session has, by definition, been
+	// attached to before). The protocol_handler reads it via
+	// ConsumeFirstAttach and clears it atomically right before sending
+	// AttachAck so clients see FreshlyCreated=true on exactly one
+	// attach — the very first.
+	firstAttachPending bool
+
 	// flusherCancel and flusherDone are the lifecycle handles for
 	// the background snapshot goroutine. Non-nil while running.
 	// Cleared by stopFlusher (called from Close). Idempotent —
@@ -359,17 +368,35 @@ func NewSession(id SessionID, name string, pty PTY, rows, cols uint16, bufCapaci
 	}
 	now := time.Now()
 	return &Session{
-		id:           id,
-		name:         name,
-		created:      now,
-		cap:          bufCapacity,
-		buf:          buf,
-		pty:          pty,
-		rows:         rows,
-		cols:         cols,
-		idleTimeout:  idleTimeout,
-		lastActiveAt: now,
+		id:                 id,
+		name:               name,
+		created:            now,
+		cap:                bufCapacity,
+		buf:                buf,
+		pty:                pty,
+		rows:               rows,
+		cols:               cols,
+		idleTimeout:        idleTimeout,
+		lastActiveAt:       now,
+		firstAttachPending: true,
 	}, nil
+}
+
+// ConsumeFirstAttach atomically reads and clears the firstAttachPending
+// flag. Returns true on the first call for a given session and false on
+// every subsequent call. The protocol_handler invokes this immediately
+// before marshalling AttachAck so clients see FreshlyCreated=true on
+// exactly the AttachAck that follows the first successful Acquire.
+//
+// Restored sessions arrive with the flag already cleared (LoadPersisted
+// sets it to false) — a session reconstructed from disk has, by
+// definition, been attached before; Restored=true conveys that.
+func (s *Session) ConsumeFirstAttach() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v := s.firstAttachPending
+	s.firstAttachPending = false
+	return v
 }
 
 // Name returns the user-visible session label. Empty for anonymous

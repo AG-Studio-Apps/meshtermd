@@ -182,18 +182,19 @@ func TestWedgeWatcher_NoFlag_WhenNewGeometryLarger(t *testing.T) {
 }
 
 func TestWedgeWatcher_SilentWedge_AfterDeadline(t *testing.T) {
-	// Direct test of the silent-deadline path with a tight loop —
-	// we can't easily replace the package-level silentDeadline,
-	// but we can drive the watcher state and call the deadline body
-	// directly via a known-quiet ArmResize.
+	// Mature session: long-existing AND with enough cumulative output
+	// that the maturity gates in runSilentDeadline don't suppress the
+	// candidate. Then go silent across the deadline.
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "wedge-events.jsonl")
 	w := newWedgeWatcher()
 	w.SetLogPath(logPath)
-	created := time.Now()
+	created := time.Now().Add(-time.Hour)
+	// Push totalOutBytes past silentMinSessionBytes BEFORE ArmResize so
+	// bytesAtResize is captured above the floor.
+	w.ObserveBytes(make([]byte, silentMinSessionBytes+1000), created)
 	w.ArmResize(44, 23, 90, created)
-	// Don't observe any bytes. Wait out the silent deadline plus a
-	// small fudge for the goroutine to schedule and write.
+	// Wait out the silent deadline plus a small fudge.
 	deadline := time.After(silentDeadline + 500*time.Millisecond)
 	<-deadline
 
@@ -220,7 +221,10 @@ func TestWedgeWatcher_NoSilentWedge_WhenRedrawHappens(t *testing.T) {
 	logPath := filepath.Join(dir, "wedge-events.jsonl")
 	w := newWedgeWatcher()
 	w.SetLogPath(logPath)
-	created := time.Now()
+	created := time.Now().Add(-time.Hour)
+	// Mature: clear both gates so the test exercises the redraw-cleared
+	// path, not the suppression path.
+	w.ObserveBytes(make([]byte, silentMinSessionBytes+1000), created)
 	w.ArmResize(44, 23, 90, created)
 	// Simulate a healthy redraw: > silentByteFloor bytes within the
 	// deadline. None of them happen to be CUP > 23, so neither wedge
@@ -232,6 +236,67 @@ func TestWedgeWatcher_NoSilentWedge_WhenRedrawHappens(t *testing.T) {
 	events := readEvents(t, logPath)
 	if len(events) != 0 {
 		t.Fatalf("expected no events on healthy redraw; got %+v", events)
+	}
+}
+
+func TestWedgeWatcher_NoSilentWedge_OnFreshSession(t *testing.T) {
+	// Both maturity gates should suppress the silent path when the
+	// session is too young to be the long-session Claude bug. This
+	// pins the behaviour against the false-positive storm observed
+	// against bash's PS1 prompt redraw on a freshly-spawned shell:
+	// every keyboard toggle on a fresh session was firing silent
+	// wedges because bash's ~67-byte response was below the floor.
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "wedge-events.jsonl")
+	w := newWedgeWatcher()
+	w.SetLogPath(logPath)
+	created := time.Now() // fresh — within silentMinSessionAge
+	// Emit roughly bash's PS1 payload to mimic the real false-positive
+	// signature (post-resize bytes below the floor, but still > 0).
+	w.ArmResize(24, 20, 90, created)
+	w.ObserveBytes(make([]byte, 67), created)
+	time.Sleep(silentDeadline + 200*time.Millisecond)
+	events := readEvents(t, logPath)
+	if len(events) != 0 {
+		t.Fatalf("fresh session must not silent-wedge on idle bash; got %+v", events)
+	}
+}
+
+func TestWedgeWatcher_NoSilentWedge_OnLowOutputSession(t *testing.T) {
+	// Age clears (older than silentMinSessionAge) but cumulative output
+	// is below silentMinSessionBytes — i.e. the session has been sitting
+	// at a shell prompt for an hour, not hosting Claude. Silence here
+	// is normal; suppress.
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "wedge-events.jsonl")
+	w := newWedgeWatcher()
+	w.SetLogPath(logPath)
+	created := time.Now().Add(-time.Hour)
+	// 200 bytes — well under silentMinSessionBytes.
+	w.ObserveBytes(make([]byte, 200), created)
+	w.ArmResize(24, 20, 90, created)
+	time.Sleep(silentDeadline + 200*time.Millisecond)
+	events := readEvents(t, logPath)
+	if len(events) != 0 {
+		t.Fatalf("low-output session must not silent-wedge; got %+v", events)
+	}
+}
+
+func TestWedgeWatcher_CursorWedge_StillFiresOnFreshSession(t *testing.T) {
+	// Cursor-row detection is unconditional — a CUP referencing a row
+	// beyond new geometry is unambiguous evidence regardless of session
+	// age or cumulative output. Make sure the silent-path maturity gates
+	// haven't accidentally suppressed it.
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "wedge-events.jsonl")
+	w := newWedgeWatcher()
+	w.SetLogPath(logPath)
+	created := time.Now() // fresh
+	w.ArmResize(44, 23, 90, created)
+	w.ObserveBytes([]byte("\x1b[40;1Hhello"), created)
+	events := readEvents(t, logPath)
+	if len(events) != 1 || events[0].WedgeType != "cursor_row" {
+		t.Fatalf("cursor_row must still fire on fresh session; got %+v", events)
 	}
 }
 

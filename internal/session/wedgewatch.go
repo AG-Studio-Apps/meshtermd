@@ -92,10 +92,29 @@ type wedgeWatcher struct {
 // the JSONL with false positives during normal operation.
 const silentDeadline = 2 * time.Second
 
-// silentByteFloor is the minimum number of bytes we expect a healthy
-// redraw to emit within silentDeadline. Tuned conservatively — alt-
-// screen clears alone are tens of bytes; a real redraw is hundreds.
-const silentByteFloor = 100
+// silentByteFloor is the minimum post-resize byte count we treat as
+// evidence of a healthy redraw. Real wedged Claude emits zero bytes;
+// bash's PS1 prompt-redraw on SIGWINCH is ~60–80 bytes; an alt-screen
+// Claude redraw is hundreds-to-thousands. Setting the floor at 16
+// puts a wide gap on both sides of bash's idle redraw so the bash-
+// at-prompt case doesn't false-positive every keyboard toggle, while
+// still catching a truly zero-byte renderer wedge.
+const silentByteFloor = 16
+
+// silentMinSessionAge skips the silent-wedge path for sessions that
+// haven't existed long enough to plausibly hit the long-session bug
+// we're chasing. The renderer wedge we've seen needs a Claude process
+// that's accumulated real context — that can't happen in the first
+// 30 seconds after `claude` is launched.
+const silentMinSessionAge = 30 * time.Second
+
+// silentMinSessionBytes skips the silent-wedge path when the session
+// hasn't emitted enough output to be hosting a real TUI. A bare shell
+// at the prompt emits almost nothing; Claude's welcome screen alone
+// is >4 KB. So bytesAtResize below this floor means "this session
+// isn't a Claude session yet" — silence is the normal state, not
+// a wedge.
+const silentMinSessionBytes uint64 = 4096
 
 // scanWindow is how long after a resize we keep CSI scanning active.
 // Longer than silentDeadline because a sluggish-but-not-wedged Claude
@@ -165,6 +184,17 @@ func (w *wedgeWatcher) runSilentDeadline(cancel <-chan struct{}, oldRows, newRow
 	if delta >= silentByteFloor {
 		// Healthy: enough bytes flowed. Don't clear resizePending —
 		// we keep scanning for cursor-row violations during scanWindow.
+		w.mu.Unlock()
+		return
+	}
+	// Maturity gates: suppress silent-wedge candidates on sessions
+	// that are too young or too small to plausibly be the long-session
+	// renderer bug. Avoids the false-positive storm we saw against
+	// bash's PS1 prompt redraw (~67 bytes) on a freshly-spawned shell.
+	// Cursor-row detection is unaffected — that path stays armed even
+	// for fresh sessions because a CUP > new_rows is unambiguous
+	// regardless of session age.
+	if time.Since(sessionCreated) < silentMinSessionAge || w.bytesAtResize < silentMinSessionBytes {
 		w.mu.Unlock()
 		return
 	}

@@ -261,6 +261,12 @@ type Session struct {
 	flusherCancel context.CancelFunc
 	flusherDone   chan struct{}
 
+	// wedge runs the resize-wedge detector. Non-nil after NewSession;
+	// the daemon wires its JSONL log path via SetWedgeLogPath after
+	// stateDir is resolved. The watcher updates totalOutBytes from
+	// Pump and arms a deadline timer from Resize; see wedgewatch.go.
+	wedge *wedgeWatcher
+
 	closed bool
 }
 
@@ -368,7 +374,34 @@ func NewSession(id SessionID, name string, pty PTY, rows, cols uint16, bufCapaci
 		idleTimeout:        idleTimeout,
 		lastActiveAt:       now,
 		firstAttachPending: true,
+		wedge:              newWedgeWatcher(),
 	}, nil
+}
+
+// SetWedgeLogPath wires the JSONL path the wedge watcher appends to
+// when it detects a candidate resize wedge (see wedgewatch.go). Empty
+// path leaves slog-only logging in place. Called by the daemon after
+// stateDir is resolved; safe to call at any point after NewSession.
+func (s *Session) SetWedgeLogPath(path string) {
+	s.mu.Lock()
+	w := s.wedge
+	s.mu.Unlock()
+	if w != nil {
+		w.SetLogPath(path)
+	}
+}
+
+// WedgeSnapshot returns the per-session cumulative metrics tracked by
+// the wedge watcher. Used by `meshtermd wedge-report` to render a
+// summary table alongside the JSONL contents.
+func (s *Session) WedgeSnapshot() (totalOut, resizes, silent, cursor uint64) {
+	s.mu.Lock()
+	w := s.wedge
+	s.mu.Unlock()
+	if w == nil {
+		return 0, 0, 0, 0
+	}
+	return w.Snapshot()
 }
 
 // ConsumeFirstAttach atomically reads and clears the firstAttachPending
@@ -529,6 +562,14 @@ func (s *Session) Resize(rows, cols uint16) error {
 	} else {
 		slog.Debug("session.Resize: PTY SetSize OK — SIGWINCH should fire",
 			"sid", s.id.String(), "rows", rows, "cols", cols)
+	}
+	// Arm the wedge watcher only on a successful SetSize and only
+	// when the geometry actually changed. A no-op resize wouldn't
+	// trigger SIGWINCH, so there's no redraw to wait for.
+	if err == nil && (oldRows != rows || oldCols != cols) {
+		if s.wedge != nil {
+			s.wedge.ArmResize(oldRows, rows, cols, s.created)
+		}
 	}
 	return err
 }
@@ -998,6 +1039,14 @@ func (s *Session) Pump() {
 			filtered := filter.Process(data)
 			if len(filtered) > 0 {
 				_, _ = s.buf.Write(filtered)
+				// Feed the wedge watcher with the post-filter byte
+				// stream — the same bytes the client renders, so a
+				// CUP row that violates the geometry will be visible
+				// here too. QueryFilter only synthesises responses to
+				// terminal queries (DA/DSR); it doesn't strip CUPs.
+				if s.wedge != nil {
+					s.wedge.ObserveBytes(filtered, s.created)
+				}
 			}
 			if seqAware != nil {
 				// Watermark the highest sidecar seq we've durably

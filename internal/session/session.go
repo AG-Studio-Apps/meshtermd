@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -503,13 +504,33 @@ func (s *Session) Resize(rows, cols uint16) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
+		slog.Warn("session.Resize: session closed — dropping",
+			"sid", s.id.String(), "rows", rows, "cols", cols)
 		return ErrSessionClosed
 	}
+	oldRows, oldCols := s.rows, s.cols
 	s.rows, s.cols = rows, cols
 	pty := s.pty
 	s.lastActiveAt = time.Now()
 	s.mu.Unlock()
-	return pty.SetSize(rows, cols)
+	if oldRows == rows && oldCols == cols {
+		slog.Debug("session.Resize: dimensions unchanged — calling SetSize anyway",
+			"sid", s.id.String(), "rows", rows, "cols", cols)
+	} else {
+		slog.Info("session.Resize: dimensions changed",
+			"sid", s.id.String(),
+			"from", fmt.Sprintf("%dx%d", oldCols, oldRows),
+			"to", fmt.Sprintf("%dx%d", cols, rows))
+	}
+	err := pty.SetSize(rows, cols)
+	if err != nil {
+		slog.Warn("session.Resize: PTY SetSize failed",
+			"sid", s.id.String(), "err", err)
+	} else {
+		slog.Debug("session.Resize: PTY SetSize OK — SIGWINCH should fire",
+			"sid", s.id.String(), "rows", rows, "cols", cols)
+	}
+	return err
 }
 
 // WindowSize returns the latest known window size.

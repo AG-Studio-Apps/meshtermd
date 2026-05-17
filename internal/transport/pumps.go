@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 
 	"github.com/quic-go/quic-go"
 
@@ -137,10 +138,14 @@ func handleControlFrame(sess *session.Session, body []byte, write frameWriter, m
 		// geometry. Readonly and passive clients' Resize frames are
 		// dropped silently rather than tearing the connection down.
 		if mode != session.AttachExclusive {
+			slog.Debug("resize: dropped (non-exclusive client)",
+				"sid", sess.ID().String(), "mode", mode)
 			return nil
 		}
 		var m protocol.Resize
 		if err := protocol.StrictDecMode.Unmarshal(body, &m); err != nil {
+			slog.Warn("resize: malformed CBOR — dropped",
+				"sid", sess.ID().String(), "err", err)
 			return nil // skip malformed; don't tear the connection down
 		}
 		// Audit F-I (v0.0.2 review): defense-in-depth daemon-side
@@ -149,9 +154,16 @@ func handleControlFrame(sess *session.Session, body []byte, write frameWriter, m
 		// has no legitimate use and clamping here matches the iOS
 		// client's own pre-send sanity check.
 		if m.Rows < 3 || m.Cols < 10 || m.Rows > 1000 || m.Cols > 1000 {
+			slog.Warn("resize: out-of-range dimensions — dropped",
+				"sid", sess.ID().String(), "rows", m.Rows, "cols", m.Cols)
 			return nil
 		}
-		_ = sess.Resize(m.Rows, m.Cols)
+		slog.Info("resize: received from client",
+			"sid", sess.ID().String(), "rows", m.Rows, "cols", m.Cols)
+		if err := sess.Resize(m.Rows, m.Cols); err != nil {
+			slog.Warn("resize: session.Resize returned error",
+				"sid", sess.ID().String(), "err", err)
+		}
 		return nil
 	case protocol.TypePing:
 		var m protocol.Ping

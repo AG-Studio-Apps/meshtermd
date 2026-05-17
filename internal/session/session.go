@@ -405,6 +405,21 @@ func (s *Session) WedgeSnapshot() (totalOut, resizes, silent, cursor, verticalWa
 	return w.Snapshot()
 }
 
+// OnWedge wires (or clears, with nil) a callback the wedge watcher
+// invokes on every detection. The transport layer installs this when
+// an exclusive client attaches so the daemon can push a
+// protocol.WedgeDetected frame on the existing control stream.
+// Cleared on detach so a re-attach gets a fresh subscriber without
+// holding a stale closure that would write into a torn-down stream.
+func (s *Session) OnWedge(cb func(WedgeNotice)) {
+	s.mu.Lock()
+	w := s.wedge
+	s.mu.Unlock()
+	if w != nil {
+		w.SetOnWedge(cb)
+	}
+}
+
 // ConsumeFirstAttach atomically reads and clears the firstAttachPending
 // flag. Returns true on the first call for a given session and false on
 // every subsequent call. The protocol_handler invokes this immediately

@@ -41,6 +41,25 @@ import (
 // record carries only metrics — no session ID, no name, no PTY
 // content, no env, no paths — so the file is safe to attach to an
 // upstream bug report.
+// WedgeNotice is the cross-package value the wedge watcher pushes to
+// its onWedge subscriber on every detection. Mirrors the JSONL record
+// shape but lives in the session package so callers outside protocol/
+// don't depend on the wire types — the transport layer maps this to
+// protocol.WedgeDetected when it pushes to the attached client.
+type WedgeNotice struct {
+	Kind               string // "silent" | "cursor_row" | "vertical_walk"
+	SessionAgeSec      int64
+	TotalOutBytes      uint64
+	OldRows            uint16
+	NewRows            uint16
+	ResizesObserved    uint64
+	SilentWedges       uint64
+	CursorWedges       uint64
+	VerticalWalkWedges uint64
+	CudObserved        int
+	CursorRowSeen      int
+}
+
 type wedgeWatcher struct {
 	mu sync.Mutex
 
@@ -54,6 +73,16 @@ type wedgeWatcher struct {
 	// slog only" — the daemon's bringup path may construct a Session
 	// before the state dir is wired (tests, future code paths).
 	logPath string
+
+	// onWedge, if non-nil, is called on every wedge detection with a
+	// WedgeNotice value. The transport layer installs this when an
+	// exclusive client attaches so the daemon can push a
+	// protocol.WedgeDetected frame to surface a recovery banner in
+	// the client UI. Called outside the watcher's lock to keep the
+	// callback path off the hot detection path; the callback must
+	// itself be non-blocking (the transport implementation uses the
+	// existing serialised frameWriter, which is mutex-guarded).
+	onWedge func(WedgeNotice)
 
 	// Cumulative output volume since the session started. Surfaced in
 	// every wedge record so we can correlate session size with wedge
@@ -135,6 +164,16 @@ func newWedgeWatcher() *wedgeWatcher {
 func (w *wedgeWatcher) SetLogPath(path string) {
 	w.mu.Lock()
 	w.logPath = path
+	w.mu.Unlock()
+}
+
+// SetOnWedge installs (or clears, with nil) the per-watcher callback
+// invoked on every detection. The callback runs outside the watcher's
+// lock; callers must keep it non-blocking. Set by the transport layer
+// when an exclusive client attaches, cleared on detach.
+func (w *wedgeWatcher) SetOnWedge(cb func(WedgeNotice)) {
+	w.mu.Lock()
+	w.onWedge = cb
 	w.mu.Unlock()
 }
 
@@ -349,9 +388,13 @@ func (w *wedgeWatcher) Snapshot() (totalOut, resizes, silent, cursor, verticalWa
 	return w.totalOutBytes, w.resizesObserved, w.silentWedges, w.cursorWedges, w.verticalWalkWedges
 }
 
-// emit writes one record both to slog (always) and to the JSONL file
-// (when a path is configured). All write errors are swallowed — a
-// disk-full or permission failure mustn't crash the pump.
+// emit writes one record to slog (always), to the JSONL file (when
+// a path is configured), AND notifies the onWedge subscriber if one
+// is installed. All write errors are swallowed — a disk-full or
+// permission failure mustn't crash the pump. The subscriber call
+// happens outside the watcher's lock; the subscriber is expected to
+// be non-blocking (the transport layer's frameWriter is already
+// mutex-guarded so the QUIC stream write is serialised correctly).
 func (w *wedgeWatcher) emit(rec wedgeEvent, logPath string) {
 	slog.Warn("wedge: candidate detected",
 		"anon", rec.AnonSessionID,
@@ -365,20 +408,39 @@ func (w *wedgeWatcher) emit(rec wedgeEvent, logPath string) {
 		"cursor_row_seen", rec.CursorRowSeen,
 		"cud_observed", rec.CudObserved,
 	)
-	if logPath == "" {
-		return
+	if logPath != "" {
+		if line, err := json.Marshal(rec); err == nil {
+			f, ferr := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+			if ferr == nil {
+				_, _ = f.Write(line)
+				_, _ = f.Write([]byte{'\n'})
+				_ = f.Close()
+			}
+		}
 	}
-	line, err := json.Marshal(rec)
-	if err != nil {
-		return
+
+	// Notify any subscriber after the on-disk write so the receiver
+	// can rely on "JSONL has this record by the time my callback
+	// fires." Snapshot the callback under the lock to avoid racing
+	// with a concurrent SetOnWedge clear.
+	w.mu.Lock()
+	cb := w.onWedge
+	w.mu.Unlock()
+	if cb != nil {
+		cb(WedgeNotice{
+			Kind:               rec.WedgeType,
+			SessionAgeSec:      rec.SessionAgeSec,
+			TotalOutBytes:      rec.TotalOutBytes,
+			OldRows:            rec.OldRows,
+			NewRows:            rec.NewRows,
+			ResizesObserved:    rec.ResizesObserved,
+			SilentWedges:       rec.SilentWedges,
+			CursorWedges:       rec.CursorWedges,
+			VerticalWalkWedges: rec.VerticalWalkWedges,
+			CudObserved:        rec.CudObserved,
+			CursorRowSeen:      rec.CursorRowSeen,
+		})
 	}
-	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	_, _ = f.Write(line)
-	_, _ = f.Write([]byte{'\n'})
 }
 
 // wedgeEvent is one JSONL record. Every field is either a metric, a

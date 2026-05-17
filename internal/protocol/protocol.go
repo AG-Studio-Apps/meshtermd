@@ -110,6 +110,41 @@ const (
 	// branch, and clients time out their pending mark gracefully.
 	TypeReplay     = "Replay"
 	TypeReplayMark = "ReplayMark"
+
+	// TypeWedgeDetected (server → client) is emitted by the daemon
+	// when its per-session wedge watcher raises a candidate event
+	// (silent / cursor_row / vertical_walk — see
+	// internal/session/wedgewatch.go). Clients use it to surface a
+	// "Claude may be wedged — save & restart?" banner. Backward-
+	// compatible: clients that don't recognise the type ignore it.
+	TypeWedgeDetected = "WedgeDetected"
+
+	// TypeRecover (client → server) requests the daemon to drive the
+	// save-restart sequence on the session's PTY: inject Esc, then a
+	// natural-language save prompt + Enter, wait a grace window for
+	// any user-driven save (memory writes, file flushes), inject
+	// `/exit`, wait for the child to return to a shell prompt, then
+	// inject `claude --resume`. Stages are reported back via
+	// TypeRecoverProgress so the client banner can show progress.
+	TypeRecover = "Recover"
+
+	// TypeRecoverProgress (server → client) is the per-stage
+	// notification emitted during a Recover sequence. Stages:
+	// "started", "saving", "exiting", "restarting", "done", "error".
+	TypeRecoverProgress = "RecoverProgress"
+)
+
+// Recovery-progress stage constants — emitted on the wire as
+// RecoverProgress.Stage. Defined here so callers don't scatter raw
+// strings. The set is closed; new stages added here in lockstep with
+// the daemon-side sequencer.
+const (
+	RecoverStageStarted    = "started"
+	RecoverStageSaving     = "saving"
+	RecoverStageExiting    = "exiting"
+	RecoverStageRestarting = "restarting"
+	RecoverStageDone       = "done"
+	RecoverStageError      = "error"
 )
 
 // EchoState mirrors the tri-state value carried in EchoConfirm.
@@ -363,6 +398,56 @@ type Goodbye struct {
 	Reason string `cbor:"reason"`
 }
 
+// WedgeDetected is the daemon → client notification fired when the
+// wedge watcher raises a candidate event. The client uses it to
+// surface a recovery banner. All counters are cumulative for the
+// session; the same fields appear in the on-disk JSONL records so
+// operators see consistent values across surfaces.
+//
+// Kind is one of "silent" / "cursor_row" / "vertical_walk", matching
+// the wedge_type values in wedgewatch.go. Future kinds may be added
+// without bumping the protocol — clients should treat unknown kinds
+// as generic wedges.
+type WedgeDetected struct {
+	T                  string `cbor:"t"`
+	Kind               string `cbor:"k"`
+	SessionAgeSec      int64  `cbor:"age"`
+	TotalOutBytes      uint64 `cbor:"tob"`
+	OldRows            uint16 `cbor:"or"`
+	NewRows            uint16 `cbor:"nr"`
+	ResizesObserved    uint64 `cbor:"ro"`
+	SilentWedges       uint64 `cbor:"sw"`
+	CursorWedges       uint64 `cbor:"cw"`
+	VerticalWalkWedges uint64 `cbor:"vw"`
+	// CudObserved is only meaningful for kind=vertical_walk; zero
+	// otherwise. CursorRowSeen is only meaningful for kind=cursor_row.
+	CudObserved   int `cbor:"cud,omitempty"`
+	CursorRowSeen int `cbor:"crs,omitempty"`
+}
+
+// Recover requests the daemon-side save-restart sequencer. The
+// daemon owns the actual byte injection / timing; the client just
+// asks for the sequence to run. SavePrompt is optional — if empty
+// the daemon uses its default natural-language save instruction.
+// GraceMillis is the upper bound on the save window (default 30s);
+// the sequencer may complete sooner if it observes an alt-screen
+// exit on the PTY output stream.
+type Recover struct {
+	T           string `cbor:"t"`
+	SavePrompt  string `cbor:"sp,omitempty"`
+	GraceMillis uint32 `cbor:"gms,omitempty"`
+}
+
+// RecoverProgress is the per-stage notification stream emitted by
+// the daemon while the Recover sequence is in flight. Detail is a
+// free-form short string the client may surface verbatim in the
+// banner (e.g. "Waiting up to 30s for save…").
+type RecoverProgress struct {
+	T      string `cbor:"t"`
+	Stage  string `cbor:"s"`
+	Detail string `cbor:"d,omitempty"`
+}
+
 // RTTNotify is sent periodically by the daemon (every ~5 seconds) on
 // the control stream, carrying the current smoothed-RTT estimate from
 // quic-go. Clients use it to drive `--predict=adaptive` decisions
@@ -392,6 +477,15 @@ func MarshalRTTNotify(m RTTNotify) ([]byte, error) { m.T = TypeRTTNotify; return
 func MarshalReplay(m Replay) ([]byte, error)       { m.T = TypeReplay; return cborMarshal(m) }
 func MarshalReplayMark(m ReplayMark) ([]byte, error) {
 	m.T = TypeReplayMark
+	return cborMarshal(m)
+}
+func MarshalWedgeDetected(m WedgeDetected) ([]byte, error) {
+	m.T = TypeWedgeDetected
+	return cborMarshal(m)
+}
+func MarshalRecover(m Recover) ([]byte, error) { m.T = TypeRecover; return cborMarshal(m) }
+func MarshalRecoverProgress(m RecoverProgress) ([]byte, error) {
+	m.T = TypeRecoverProgress
 	return cborMarshal(m)
 }
 func MarshalEchoConfirm(m EchoConfirm) ([]byte, error) {

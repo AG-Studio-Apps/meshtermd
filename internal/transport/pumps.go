@@ -233,6 +233,37 @@ func handleControlFrame(sess *session.Session, body []byte, write frameWriter, m
 			seq = newSeq
 		}
 		return nil
+	case protocol.TypeRecover:
+		// Only exclusive clients can drive recovery — same posture as
+		// Resize (geometry-owning). Readonly / passive Recovers are
+		// silently dropped rather than tearing the connection down.
+		if mode != session.AttachExclusive {
+			slog.Debug("recover: dropped (non-exclusive client)",
+				"sid", sess.ID().String(), "mode", mode)
+			return nil
+		}
+		var m protocol.Recover
+		if err := protocol.StrictDecMode.Unmarshal(body, &m); err != nil {
+			slog.Warn("recover: malformed CBOR — dropped",
+				"sid", sess.ID().String(), "err", err)
+			return nil
+		}
+		slog.Info("recover: received request from client",
+			"sid", sess.ID().String(),
+			"grace_ms", m.GraceMillis,
+			"custom_prompt", m.SavePrompt != "")
+		// Run the sequencer in its own goroutine — it takes seconds
+		// to tens of seconds and we must NOT block readPump (which
+		// services keystrokes + future control frames).
+		// Detached context: a client disconnect mid-recovery should
+		// NOT abort the save/restart — the user typically wants the
+		// work preserved regardless of network state, and the
+		// post-recovery session is intact for the next attach. The
+		// per-stage RecoverProgress frames are best-effort; failures
+		// to write them (e.g. peer gone) are logged but don't abort
+		// the sequencer.
+		go runRecover(context.Background(), sess, m, write)
+		return nil
 	case protocol.TypeGoodbye:
 		return io.EOF // signal graceful close to readPump
 	default:

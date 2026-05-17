@@ -392,14 +392,15 @@ func (s *Session) SetWedgeLogPath(path string) {
 }
 
 // WedgeSnapshot returns the per-session cumulative metrics tracked by
-// the wedge watcher. Used by `meshtermd wedge-report` to render a
-// summary table alongside the JSONL contents.
-func (s *Session) WedgeSnapshot() (totalOut, resizes, silent, cursor uint64) {
+// the wedge watcher. Used by `meshtermd wedge-report` and
+// `meshtermd session-info` to render a summary alongside the
+// JSONL contents.
+func (s *Session) WedgeSnapshot() (totalOut, resizes, silent, cursor, verticalWalk uint64) {
 	s.mu.Lock()
 	w := s.wedge
 	s.mu.Unlock()
 	if w == nil {
-		return 0, 0, 0, 0
+		return 0, 0, 0, 0, 0
 	}
 	return w.Snapshot()
 }

@@ -62,23 +62,25 @@ type wedgeWatcher struct {
 	totalOutBytes uint64
 
 	// Cumulative count of resize events observed and wedges raised.
-	resizesObserved uint64
-	silentWedges    uint64
-	cursorWedges    uint64
+	resizesObserved    uint64
+	silentWedges       uint64
+	cursorWedges       uint64
+	verticalWalkWedges uint64
 
 	// resizePending is true between an ArmResize call and either
 	// (a) the silent-deadline timer firing or (b) the post-resize
 	// window having accumulated enough redraw bytes for us to clear
-	// it. While true, ObserveBytes scans for CUP rows > pendingRows.
+	// it. While true, ObserveBytes scans for CUP rows > pendingRows
+	// and for cumulative CUD motions exceeding pendingRows.
 	resizePending bool
 
-	resizeAt        time.Time
-	oldRows         uint16
-	pendingRows     uint16
-	pendingCols     uint16
-	bytesAtResize   uint64
-	pendingTimerCh  chan struct{} // closed when the silent-deadline timer should stop early
-	cursorWedgeSeen bool          // already raised cursor wedge for this resize; suppress duplicates
+	resizeAt       time.Time
+	oldRows        uint16
+	pendingRows    uint16
+	pendingCols    uint16
+	bytesAtResize  uint64
+	pendingTimerCh chan struct{} // closed when the silent-deadline timer should stop early
+	wedgeRaised    bool          // any wedge already raised for this resize; suppress duplicates
 
 	// CSI scanner state — feed continues across chunks. Only mutated
 	// inside ObserveBytes (which holds the lock).
@@ -156,7 +158,13 @@ func (w *wedgeWatcher) ArmResize(oldRows, newRows, newCols uint16, sessionCreate
 	w.pendingCols = newCols
 	w.bytesAtResize = w.totalOutBytes
 	w.resizesObserved++
-	w.cursorWedgeSeen = false
+	w.wedgeRaised = false
+	// Reset the CSI scanner's cumulative cursor-down counter so each
+	// resize gets its own walk budget. Without this, a long-running
+	// session would accumulate CUD across many resizes and the
+	// vertical_walk signal would false-positive on the first resize
+	// that happens after the cumulative count crossed the threshold.
+	w.scanner.reset()
 	ch := make(chan struct{})
 	w.pendingTimerCh = ch
 	w.mu.Unlock()
@@ -254,8 +262,9 @@ func (w *wedgeWatcher) ObserveBytes(data []byte, sessionCreated time.Time) {
 		w.mu.Unlock()
 		return
 	}
-	if w.cursorWedgeSeen {
-		// One report per resize is enough — we've already flagged.
+	if w.wedgeRaised {
+		// One report per resize is enough — we've already flagged a
+		// wedge of some flavour for this resize window.
 		w.mu.Unlock()
 		return
 	}
@@ -268,31 +277,65 @@ func (w *wedgeWatcher) ObserveBytes(data []byte, sessionCreated time.Time) {
 	anon := w.anonID
 	logPath := w.logPath
 
+	// Two complementary signals from one scanner pass:
+	//   - violatingRow > 0   → CUP/HVP with row > pendingRows.
+	//     Strong evidence Claude emits absolute moves for old geometry.
+	//   - cudCount > pendingRows → cumulative relative cursor-down walk
+	//     since the last resize already exceeds the new row count.
+	//     Matches the Ink-renderer mechanism diagnosed in the upstream
+	//     issue: relative-only redraw walks an old-geometry frame past
+	//     the new viewport.
 	violatingRow := w.scanner.feed(data, pendingRows)
-	if violatingRow == 0 {
+	cudCount := w.scanner.cudCount()
+
+	var (
+		wedgeType     string
+		note          string
+		cursorRowSeen int
+		cudObserved   int
+	)
+	switch {
+	case violatingRow > 0:
+		wedgeType = "cursor_row"
+		note = "CUP escape referenced row > new geometry — app is drawing for old size"
+		cursorRowSeen = violatingRow
+	case cudCount > int(pendingRows):
+		wedgeType = "vertical_walk"
+		note = "cumulative CUD motions exceed new row count — relative-only redraw painting past viewport"
+		cudObserved = cudCount
+	default:
 		w.mu.Unlock()
 		return
 	}
-	w.cursorWedges++
-	w.cursorWedgeSeen = true
+
+	switch wedgeType {
+	case "cursor_row":
+		w.cursorWedges++
+	case "vertical_walk":
+		w.verticalWalkWedges++
+	}
+	w.wedgeRaised = true
 	cursorWedges := w.cursorWedges
+	verticalWedges := w.verticalWalkWedges
 	w.mu.Unlock()
 
 	rec := wedgeEvent{
-		Timestamp:       time.Now().UTC().Format(time.RFC3339),
-		AnonSessionID:   anon,
-		WedgeType:       "cursor_row",
-		SessionAgeSec:   int64(time.Since(sessionCreated).Seconds()),
-		TotalOutBytes:   totalOut,
-		ResizesObserved: resizes,
-		SilentWedges:    silent,
-		CursorWedges:    cursorWedges,
-		OldRows:         oldRows,
-		NewRows:         pendingRows,
-		Cols:            cols,
-		CursorRowSeen:   violatingRow,
-		MsSinceResize:   int64(time.Since(w.resizeAt) / time.Millisecond),
-		Note:            "CUP escape referenced row > new geometry — app is drawing for old size",
+		Timestamp:          time.Now().UTC().Format(time.RFC3339),
+		AnonSessionID:      anon,
+		WedgeType:          wedgeType,
+		SessionAgeSec:      int64(time.Since(sessionCreated).Seconds()),
+		TotalOutBytes:      totalOut,
+		ResizesObserved:    resizes,
+		SilentWedges:       silent,
+		CursorWedges:       cursorWedges,
+		VerticalWalkWedges: verticalWedges,
+		OldRows:            oldRows,
+		NewRows:            pendingRows,
+		Cols:               cols,
+		CursorRowSeen:      cursorRowSeen,
+		CudObserved:        cudObserved,
+		MsSinceResize:      int64(time.Since(w.resizeAt) / time.Millisecond),
+		Note:               note,
 	}
 	w.emit(rec, logPath)
 }
@@ -300,10 +343,10 @@ func (w *wedgeWatcher) ObserveBytes(data []byte, sessionCreated time.Time) {
 // Snapshot returns a point-in-time copy of the watcher's counters.
 // Used by status / wedge-report subcommands to render cumulative
 // stats without touching internal state.
-func (w *wedgeWatcher) Snapshot() (totalOut, resizes, silent, cursor uint64) {
+func (w *wedgeWatcher) Snapshot() (totalOut, resizes, silent, cursor, verticalWalk uint64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.totalOutBytes, w.resizesObserved, w.silentWedges, w.cursorWedges
+	return w.totalOutBytes, w.resizesObserved, w.silentWedges, w.cursorWedges, w.verticalWalkWedges
 }
 
 // emit writes one record both to slog (always) and to the JSONL file
@@ -320,6 +363,7 @@ func (w *wedgeWatcher) emit(rec wedgeEvent, logPath string) {
 		"new_rows", rec.NewRows,
 		"bytes_post_resize", rec.BytesPostResize,
 		"cursor_row_seen", rec.CursorRowSeen,
+		"cud_observed", rec.CudObserved,
 	)
 	if logPath == "" {
 		return
@@ -343,36 +387,54 @@ func (w *wedgeWatcher) emit(rec wedgeEvent, logPath string) {
 // content — anyone receiving this file learns about geometry math
 // and Claude's redraw behaviour, nothing about the user.
 type wedgeEvent struct {
-	Timestamp       string `json:"ts"`
-	AnonSessionID   string `json:"anon_session"`
-	WedgeType       string `json:"wedge_type"` // "silent" or "cursor_row"
-	SessionAgeSec   int64  `json:"session_age_sec"`
-	TotalOutBytes   uint64 `json:"total_out_bytes"`
-	ResizesObserved uint64 `json:"resizes_observed"`
-	SilentWedges    uint64 `json:"silent_wedges_so_far"`
-	CursorWedges    uint64 `json:"cursor_wedges_so_far"`
-	OldRows         uint16 `json:"old_rows"`
-	NewRows         uint16 `json:"new_rows"`
-	Cols            uint16 `json:"cols"`
+	Timestamp          string `json:"ts"`
+	AnonSessionID      string `json:"anon_session"`
+	WedgeType          string `json:"wedge_type"` // "silent" | "cursor_row" | "vertical_walk"
+	SessionAgeSec      int64  `json:"session_age_sec"`
+	TotalOutBytes      uint64 `json:"total_out_bytes"`
+	ResizesObserved    uint64 `json:"resizes_observed"`
+	SilentWedges       uint64 `json:"silent_wedges_so_far"`
+	CursorWedges       uint64 `json:"cursor_wedges_so_far"`
+	VerticalWalkWedges uint64 `json:"vertical_walk_wedges_so_far"`
+	OldRows            uint16 `json:"old_rows"`
+	NewRows            uint16 `json:"new_rows"`
+	Cols               uint16 `json:"cols"`
 
 	// Silent-wedge fields.
 	BytesPostResize uint64 `json:"bytes_post_resize,omitempty"`
 	WindowMs        int64  `json:"window_ms,omitempty"`
 
 	// Cursor-row fields.
-	CursorRowSeen int   `json:"cursor_row_seen,omitempty"`
+	CursorRowSeen int `json:"cursor_row_seen,omitempty"`
+
+	// Vertical-walk fields. CudObserved is the cumulative CSI `B`
+	// (Cursor-Down) motion count since the last resize. Exceeding the
+	// new row count is the proof signal for an Ink-style relative-
+	// only redraw painting past the viewport.
+	CudObserved int `json:"cud_observed,omitempty"`
+
 	MsSinceResize int64 `json:"ms_since_resize,omitempty"`
 
 	Note string `json:"note,omitempty"`
 }
 
-// csiScanner is a tiny resumable parser for CSI sequences. We only
-// care about CUP (final `H`) and HVP (final `f`); every other CSI
-// final is read and discarded. State persists across chunks because
-// PTY reads can split an escape sequence anywhere.
+// csiScanner is a tiny resumable parser for CSI sequences. We track
+// three patterns:
+//   - CUP (final `H`) and HVP (final `f`): absolute cursor positioning.
+//     We compare the row argument against maxRows on each occurrence
+//     and return the offending row on the first violation.
+//   - CUD (final `B`): cursor-down motion. We accumulate the parameter
+//     (default 1) into cudAccumulated, exposed via cudCount(). Callers
+//     use this to detect the Ink-style relative-only redraw mode where
+//     the renderer walks down `N` rows of frame content past a smaller
+//     viewport (see the upstream issue we filed).
+//
+// State persists across chunks because PTY reads can split an escape
+// sequence anywhere.
 type csiScanner struct {
-	state  csiScanState
-	params []byte
+	state          csiScanState
+	params         []byte
+	cudAccumulated int
 }
 
 type csiScanState int
@@ -403,13 +465,19 @@ func (s *csiScanner) feed(buf []byte, maxRows uint16) int {
 			}
 		case csiParams:
 			if b >= 0x40 && b <= 0x7e {
-				if b == 'H' || b == 'f' {
+				switch b {
+				case 'H', 'f':
 					row, _ := parseCUPParams(s.params)
 					if row > int(maxRows) {
 						s.state = csiNone
 						s.params = s.params[:0]
 						return row
 					}
+				case 'B':
+					// CUD — Cursor Down by Ps lines (default 1).
+					// Accumulate so callers can detect a redraw that
+					// walks more vertical space than the new viewport.
+					s.cudAccumulated += parseSingleParam(s.params, 1)
 				}
 				s.state = csiNone
 				s.params = s.params[:0]
@@ -426,11 +494,40 @@ func (s *csiScanner) feed(buf []byte, maxRows uint16) int {
 	return 0
 }
 
+// cudCount returns the cumulative CSI `B` (cursor-down) motion units
+// accumulated since the last reset(). Used by the wedge watcher to
+// raise a vertical_walk wedge when the walk exceeds the current row
+// count.
+func (s *csiScanner) cudCount() int { return s.cudAccumulated }
+
 func (s *csiScanner) reset() {
 	s.state = csiNone
 	if s.params != nil {
 		s.params = s.params[:0]
 	}
+	s.cudAccumulated = 0
+}
+
+// parseSingleParam reads a CSI parameter block consisting of a single
+// numeric argument (the common form for CUD, CUF, CUU, CUB). Empty or
+// unparseable parameters return defaultVal, matching ECMA-48.
+func parseSingleParam(p []byte, defaultVal int) int {
+	if len(p) == 0 {
+		return defaultVal
+	}
+	// CUD only consults the first param; any trailing `;` are ignored.
+	end := bytes.IndexByte(p, ';')
+	if end < 0 {
+		end = len(p)
+	}
+	if end == 0 {
+		return defaultVal
+	}
+	v, err := strconv.Atoi(string(p[:end]))
+	if err != nil || v <= 0 {
+		return defaultVal
+	}
+	return v
 }
 
 // parseCUPParams reads the optional `<row>;<col>` parameter block of

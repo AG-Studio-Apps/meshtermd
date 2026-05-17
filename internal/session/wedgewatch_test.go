@@ -309,11 +309,183 @@ func TestWedgeWatcher_TotalBytes_AccumulateAcrossResizes(t *testing.T) {
 	w.ArmResize(44, 30, 90, created) // displaces the previous pending
 	w.ObserveBytes(make([]byte, 50), created)
 
-	total, resizes, _, _ := w.Snapshot()
+	total, resizes, _, _, _ := w.Snapshot()
 	if total != 350 {
 		t.Fatalf("totalOutBytes: want 350, got %d", total)
 	}
 	if resizes != 2 {
 		t.Fatalf("resizesObserved: want 2, got %d", resizes)
+	}
+}
+
+func TestCSIScanner_CUD_Accumulates(t *testing.T) {
+	var s csiScanner
+	// Three CUDs: default-1, explicit 5, default-1 → 7 total.
+	s.feed([]byte("\x1b[B\x1b[5B\x1b[B"), 100)
+	if got := s.cudCount(); got != 7 {
+		t.Fatalf("cudCount: want 7, got %d", got)
+	}
+}
+
+func TestCSIScanner_CUD_ResetClearsCount(t *testing.T) {
+	var s csiScanner
+	s.feed([]byte("\x1b[10B"), 100)
+	if got := s.cudCount(); got != 10 {
+		t.Fatalf("pre-reset cudCount: want 10, got %d", got)
+	}
+	s.reset()
+	if got := s.cudCount(); got != 0 {
+		t.Fatalf("post-reset cudCount: want 0, got %d", got)
+	}
+}
+
+func TestCSIScanner_CUD_IgnoresNonBFinals(t *testing.T) {
+	var s csiScanner
+	// CUF (right), CUU (up), CUB (left), SGR — none should add to CUD.
+	s.feed([]byte("\x1b[5C\x1b[3A\x1b[2D\x1b[38;5;231m"), 100)
+	if got := s.cudCount(); got != 0 {
+		t.Fatalf("non-B finals must not bump CUD; got %d", got)
+	}
+}
+
+func TestParseSingleParam(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		def  int
+		want int
+	}{
+		{"empty", "", 1, 1},
+		{"single", "5", 1, 5},
+		{"with trailing semi", "7;", 1, 7},
+		{"invalid", "abc", 1, 1},
+		{"zero", "0", 1, 1},  // 0 is non-positive → default
+		{"negative-ish", "-3", 1, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseSingleParam([]byte(tc.in), tc.def); got != tc.want {
+				t.Fatalf("parseSingleParam(%q,%d): want %d, got %d", tc.in, tc.def, tc.want, got)
+			}
+		})
+	}
+}
+
+func TestWedgeWatcher_VerticalWalk_FiresWhenCudExceedsNewRows(t *testing.T) {
+	// The Ink-renderer fingerprint: after a downward resize, the
+	// renderer emits a relative-only redraw that walks down more rows
+	// than the new viewport contains. CUD total > pendingRows fires
+	// wedge_type=vertical_walk.
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "wedge-events.jsonl")
+	w := newWedgeWatcher()
+	w.SetLogPath(logPath)
+	created := time.Now()
+	w.ArmResize(44, 23, 90, created)
+	// 25 cursor-down moves into a 23-row viewport — over by 2.
+	w.ObserveBytes([]byte("\x1b[25B"), created)
+
+	events := readEvents(t, logPath)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 vertical_walk event, got %d (%+v)", len(events), events)
+	}
+	got := events[0]
+	if got.WedgeType != "vertical_walk" {
+		t.Fatalf("type: want vertical_walk, got %q", got.WedgeType)
+	}
+	if got.CudObserved != 25 {
+		t.Fatalf("cud_observed: want 25, got %d", got.CudObserved)
+	}
+	if got.NewRows != 23 || got.OldRows != 44 {
+		t.Fatalf("rows: want 44→23, got %d→%d", got.OldRows, got.NewRows)
+	}
+}
+
+func TestWedgeWatcher_VerticalWalk_NoFireBelowThreshold(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "wedge-events.jsonl")
+	w := newWedgeWatcher()
+	w.SetLogPath(logPath)
+	created := time.Now()
+	w.ArmResize(44, 23, 90, created)
+	// 20 cursor-downs — under the 23-row viewport. Healthy redraw.
+	w.ObserveBytes([]byte("\x1b[20B"), created)
+	// Wait less than silentDeadline so the silent path doesn't fire.
+	events := readEvents(t, logPath)
+	if len(events) != 0 {
+		t.Fatalf("CUD under threshold must not flag; got %+v", events)
+	}
+}
+
+func TestWedgeWatcher_VerticalWalk_CountsAcrossMultipleChunks(t *testing.T) {
+	// Real PTY reads split escape sequences across chunks. Pattern from
+	// the captured byte stream: many small \x1b[1B emitted one-per-chunk.
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "wedge-events.jsonl")
+	w := newWedgeWatcher()
+	w.SetLogPath(logPath)
+	created := time.Now()
+	w.ArmResize(44, 23, 90, created)
+	// 24 single-line CUDs in 24 separate chunks. Total = 24 > 23.
+	for i := 0; i < 24; i++ {
+		w.ObserveBytes([]byte("\x1b[1B"), created)
+		// Stop pushing once the wedge has been raised; the watcher
+		// suppresses follow-up reports via wedgeRaised.
+	}
+	events := readEvents(t, logPath)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 vertical_walk event across chunks; got %d", len(events))
+	}
+	if events[0].CudObserved < 24 {
+		t.Fatalf("cud_observed should include all 24 walks; got %d", events[0].CudObserved)
+	}
+}
+
+func TestWedgeWatcher_VerticalWalk_ResetsBetweenResizes(t *testing.T) {
+	// Two consecutive resizes: each should get its own CUD budget,
+	// not carry state from the previous resize.
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "wedge-events.jsonl")
+	w := newWedgeWatcher()
+	w.SetLogPath(logPath)
+	created := time.Now()
+
+	// First resize: 18 CUDs into a 23-row viewport (under). No wedge.
+	w.ArmResize(44, 23, 90, created)
+	w.ObserveBytes([]byte("\x1b[18B"), created)
+	if events := readEvents(t, logPath); len(events) != 0 {
+		t.Fatalf("first resize must not flag; got %+v", events)
+	}
+
+	// Second resize: 25 fresh CUDs into a 20-row viewport. If the
+	// counter reset, only 25 gets compared (fires, 25 > 20). If it
+	// didn't reset, the cumulative would be 43 — also fires, but the
+	// cud_observed value would be 43 instead of 25.
+	w.ArmResize(44, 20, 90, created)
+	w.ObserveBytes([]byte("\x1b[25B"), created)
+	events := readEvents(t, logPath)
+	if len(events) != 1 {
+		t.Fatalf("second resize should fire one vertical_walk; got %d", len(events))
+	}
+	if events[0].CudObserved != 25 {
+		t.Fatalf("cud_observed: want 25 (reset between resizes), got %d", events[0].CudObserved)
+	}
+}
+
+func TestWedgeWatcher_CursorWedge_TakesPrecedenceOverVerticalWalk(t *testing.T) {
+	// If both signals would fire on the same chunk, cursor_row wins
+	// — it's the stronger evidence (absolute positioning is
+	// unambiguous; relative walk is consequence-of).
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "wedge-events.jsonl")
+	w := newWedgeWatcher()
+	w.SetLogPath(logPath)
+	created := time.Now()
+	w.ArmResize(44, 23, 90, created)
+	// CUP to row 40 (> 23) AND 25 CUDs in the same chunk.
+	w.ObserveBytes([]byte("\x1b[40;1H\x1b[25B"), created)
+	events := readEvents(t, logPath)
+	if len(events) != 1 || events[0].WedgeType != "cursor_row" {
+		t.Fatalf("cursor_row should win; got %+v", events)
 	}
 }

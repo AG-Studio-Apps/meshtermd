@@ -142,6 +142,19 @@ type SessionInfo struct {
 	IdleTimeoutNs  int64    `cbor:"itn,omitempty" json:"idle_timeout_ns,omitempty"`
 	Rows           uint16   `cbor:"rows,omitempty" json:"rows,omitempty"`
 	Cols           uint16   `cbor:"cols,omitempty" json:"cols,omitempty"`
+
+	// Wedge-watcher cumulative counters. Optional so older daemon
+	// builds (pre-v0.9.4) can round-trip with newer mtctl clients
+	// without protocol breakage. Populated for every live session;
+	// zero values are valid and indicate "no wedge events for this
+	// session yet". Surfaces in `meshtermd session-info` / `mtctl
+	// session-info` so operators can correlate session size + age
+	// with wedge frequency without grepping the JSONL.
+	WedgeTotalOutBytes      uint64 `cbor:"wto,omitempty" json:"wedge_total_out_bytes,omitempty"`
+	WedgeResizesObserved    uint64 `cbor:"wro,omitempty" json:"wedge_resizes_observed,omitempty"`
+	WedgeSilentWedges       uint64 `cbor:"wsw,omitempty" json:"wedge_silent,omitempty"`
+	WedgeCursorWedges       uint64 `cbor:"wcw,omitempty" json:"wedge_cursor_row,omitempty"`
+	WedgeVerticalWalkWedges uint64 `cbor:"wvw,omitempty" json:"wedge_vertical_walk,omitempty"`
 }
 
 // ListSessionsRequest enumerates every live session on the daemon.

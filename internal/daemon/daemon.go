@@ -444,16 +444,22 @@ func (d *Daemon) HandleListSessions(ctx context.Context, _ ipc.ListSessionsReque
 		}
 		rows, cols := sess.WindowSize()
 		modes := sess.AttachedModes()
+		totalOut, resizes, silent, cursor, vwalk := sess.WedgeSnapshot()
 		out = append(out, ipc.SessionInfo{
-			ID:             sess.ID().String(),
-			Name:           sess.Name(),
-			CreatedAtNs:    sess.Created().UnixNano(),
-			LastActiveAtNs: sess.LastActiveAt().UnixNano(),
-			AttachedNow:    len(modes) > 0,
-			AttachedModes:  modes,
-			IdleTimeoutNs:  int64(sess.IdleTimeout()),
-			Rows:           rows,
-			Cols:           cols,
+			ID:                      sess.ID().String(),
+			Name:                    sess.Name(),
+			CreatedAtNs:             sess.Created().UnixNano(),
+			LastActiveAtNs:          sess.LastActiveAt().UnixNano(),
+			AttachedNow:             len(modes) > 0,
+			AttachedModes:           modes,
+			IdleTimeoutNs:           int64(sess.IdleTimeout()),
+			Rows:                    rows,
+			Cols:                    cols,
+			WedgeTotalOutBytes:      totalOut,
+			WedgeResizesObserved:    resizes,
+			WedgeSilentWedges:       silent,
+			WedgeCursorWedges:       cursor,
+			WedgeVerticalWalkWedges: vwalk,
 		})
 	}
 	return ipc.ListSessionsResponse{Ok: true, Sessions: out}

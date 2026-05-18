@@ -1,0 +1,118 @@
+# One-off smoke test: open a fresh macOS host that the meshTerm iOS
+# app can SSH into, so we can manually exercise the daemon-install
+# flow against a Darwin target. Not a recurring guard — trigger via
+# `gh workflow run` when we want to validate the install path after
+# a release or a Darwin-specific change.
+#
+# Architecture:
+#   - macos-14 Apple Silicon runner (exercises meshtermd-darwin-arm64)
+#   - tmate-action exposes the runner over a public SSH URL the
+#     iOS app can connect to. Authorisation gate is the
+#     SSH_TEST_KEY repo secret (the user's meshTerm pubkey) wired
+#     into tmate-authorized-keys — limited to that one key, no
+#     URL-only-auth, no GitHub-actor key fan-out.
+#   - Workflow idles inside the tmate session for the configured
+#     timeout. The user drives the install manually from meshTerm
+#     (or from a manual shell session) — this is option A from the
+#     2026-05-18 discussion.
+
+name: macOS Install Smoke (one-off)
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeout-minutes:
+        description: Session lifetime cap (minutes)
+        default: "30"
+        required: true
+
+jobs:
+  expose:
+    runs-on: macos-14
+    timeout-minutes: 35
+    steps:
+      - name: Install minisign (used by the manual install flow)
+        run: brew install minisign
+
+      - name: Stage the SSH_TEST_KEY into tmate's authorized_keys
+        env:
+          SSH_TEST_KEY: ${{ secrets.SSH_TEST_KEY }}
+        run: |
+          if [ -z "${SSH_TEST_KEY:-}" ]; then
+            echo "::error::SSH_TEST_KEY secret is empty. Add the meshTerm public key to the meshtermd repo's Actions secrets."
+            exit 1
+          fi
+          mkdir -p ~/.tmate
+          printf '%s\n' "$SSH_TEST_KEY" > ~/.tmate/authorized_keys
+          chmod 600 ~/.tmate/authorized_keys
+          # tmate honours ~/.tmate.conf by default; the
+          # tmate-authorized-keys directive narrows the auth set from
+          # "anyone with the session URL" to "anyone holding a key
+          # listed in this file." Effectively pins access to the
+          # meshTerm device(s) you've enrolled in iOS.
+          cat > ~/.tmate.conf <<EOF
+          set -g tmate-authorized-keys "$HOME/.tmate/authorized_keys"
+          EOF
+          echo "--- authorized_keys preview ---"
+          cut -c -60 ~/.tmate/authorized_keys
+
+      - name: Show install hints (paste-able into the tmate shell)
+        run: |
+          cat <<'EOF'
+
+          ============================================================
+            macOS install smoke — manual flow
+          ============================================================
+
+          Once you're connected via meshTerm and dropped into the shell,
+          paste these commands one stage at a time to exercise the
+          install path the iOS app would normally run:
+
+          # 1. Probe
+          uname -s; uname -m; command -v launchctl; id -u
+
+          # 2. Download (replace v0.9.7 with the release you want to test)
+          TAG=v0.9.7
+          BASE=https://github.com/AG-Studio-Apps/meshtermd/releases/download/$TAG
+          curl -fL "$BASE/SHA256SUMS"          -o /tmp/SHA256SUMS
+          curl -fL "$BASE/SHA256SUMS.minisig"  -o /tmp/SHA256SUMS.minisig
+          curl -fL "$BASE/meshtermd-darwin-arm64" -o /tmp/meshtermd-darwin-arm64
+
+          # 3. Verify signature + hash
+          curl -fsSL https://raw.githubusercontent.com/AG-Studio-Apps/meshtermd/main/docs/release-public-key.txt -o /tmp/meshtermd-pub.txt
+          minisign -V -p /tmp/meshtermd-pub.txt -m /tmp/SHA256SUMS
+          (cd /tmp && shasum -a 256 -c SHA256SUMS --ignore-missing 2>&1 | grep meshtermd-darwin-arm64)
+
+          # 4. Install
+          mkdir -p ~/.local/bin
+          mv /tmp/meshtermd-darwin-arm64 ~/.local/bin/meshtermd
+          chmod 755 ~/.local/bin/meshtermd
+          xattr -d com.apple.quarantine ~/.local/bin/meshtermd 2>/dev/null || true
+          ~/.local/bin/meshtermd version
+
+          # 5. LaunchAgent + bootstrap
+          mkdir -p ~/Library/LaunchAgents
+          ~/.local/bin/meshtermd unit print > ~/Library/LaunchAgents/com.agstudio.meshtermd.plist
+          launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agstudio.meshtermd.plist || echo "bootstrap exit=$?"
+
+          # 6. Verify
+          ~/.local/bin/meshtermd version
+          ~/.local/bin/meshtermd status
+
+          OR: from meshTerm, on the new host, hit "Install daemon" and
+          let the iOS flow drive all six stages.
+
+          ============================================================
+          EOF
+
+      - name: Open tmate session (blocks until exit / timeout)
+        # detached: false → step blocks while the session is alive,
+        # which holds the runner job open for the user to connect.
+        # limit-access-to-actor: false → use our own
+        # tmate-authorized-keys (loaded from ~/.tmate.conf above)
+        # rather than fetching GitHub-account keys. The SSH_TEST_KEY
+        # is the single authorised key.
+        uses: mxschmitt/action-tmate@v3
+        with:
+          detached: false
+          limit-access-to-actor: false

@@ -112,6 +112,21 @@ func reattachOne(ctx context.Context, sess *session.Session, sessionDir string, 
 		return false, fmt.Errorf("stale pidfile (pid=%d not alive)", pid)
 	}
 
+	// Refuse to dial through a symlink. Mirrors the same guard the
+	// IPC server applies before binding its socket (internal/ipc/
+	// server.go:100-107). A same-uid attacker who can write into
+	// the session dir before this point would otherwise be able to
+	// redirect daemon I/O for the session to their own listener via
+	// a planted symlink at sidecar.sock. The 0o700 parent dir limits
+	// exposure to same-uid, but defence-in-depth at this layer too.
+	if info, lerr := os.Lstat(sockPath); lerr == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			_ = os.Remove(pidPath)
+			_ = os.Remove(sockPath)
+			return false, fmt.Errorf("refuse to dial: %s is a symlink", sockPath)
+		}
+	}
+
 	sock, derr := net.DialTimeout("unix", sockPath, dialDiscoveryTimeout)
 	if derr != nil {
 		// Process is alive but not serving — likely a crashed sidecar

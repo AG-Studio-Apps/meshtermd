@@ -49,6 +49,16 @@ const defaultGrace = 30 * time.Second
 // long enough that any reasonable shell startup will have settled.
 const shellSettleDelay = 3 * time.Second
 
+// postRecoveryCooldown is how long the wedge watcher stays silenced
+// after a successful save-restart. `claude --resume` repaints its
+// scrollback by emitting many CUDs in rapid succession (history
+// replay) — this matches the vertical_walk signature exactly and
+// would otherwise re-pop the recovery banner the moment recovery
+// finishes. 30s comfortably outlasts the longest restoration replay
+// we've observed; after that the watcher returns to normal
+// sensitivity and can catch a genuine fresh wedge.
+const postRecoveryCooldown = 30 * time.Second
+
 // submitSettleDelay is the gap between writing the body of a Claude
 // prompt and writing the trailing '\r'. Without this delay an
 // observed failure mode is Ink's input handler processing the
@@ -279,8 +289,17 @@ func runRecover(
 		return
 	}
 
+	// Post-recovery cooldown. claude --resume's scrollback replay
+	// emits many CUDs in rapid succession to repaint history;
+	// without this gate every restoration painted past the new
+	// viewport re-pops the wedge banner. Silence detections for
+	// postRecoveryCooldown so the fresh Claude has time to settle.
+	sess.SuppressWedgeUntil(time.Now().Add(postRecoveryCooldown))
+
 	emit(protocol.RecoverStageDone, "")
-	slog.Info("recover: sequence completed", "sid", sid)
+	slog.Info("recover: sequence completed",
+		"sid", sid,
+		"cooldown_until", time.Now().Add(postRecoveryCooldown).Format(time.RFC3339))
 }
 
 // injectAndCheckCtx writes data to the session's PTY stdin and

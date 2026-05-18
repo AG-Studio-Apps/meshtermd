@@ -443,6 +443,20 @@ func (s *Session) SetPTYByteObserver(cb func([]byte)) {
 	s.mu.Unlock()
 }
 
+// SuppressWedgeUntil silences all wedge detections on this session
+// until the given wall-clock time. Used by the recovery sequencer to
+// gate the false-positive storm from `claude --resume` scrollback
+// replay (lots of CUDs in milliseconds, no real wedge). Pass a
+// zero-value time.Time to clear suppression.
+func (s *Session) SuppressWedgeUntil(t time.Time) {
+	s.mu.Lock()
+	w := s.wedge
+	s.mu.Unlock()
+	if w != nil {
+		w.SuppressUntil(t)
+	}
+}
+
 // ConsumeFirstAttach atomically reads and clears the firstAttachPending
 // flag. Returns true on the first call for a given session and false on
 // every subsequent call. The protocol_handler invokes this immediately

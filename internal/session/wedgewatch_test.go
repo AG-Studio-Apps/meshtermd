@@ -494,6 +494,109 @@ func TestWedgeWatcher_VerticalWalk_SingleFramePastViewportStillFires(t *testing.
 	}
 }
 
+func TestWedgeWatcher_VerticalWalk_BeyondTimeWindowDoesNotFire(t *testing.T) {
+	// Real wedges fire sub-100ms after SIGWINCH; healthy multi-frame
+	// renders accumulate CUDs over seconds. The verticalWalkWindow
+	// guard (800 ms) splits them. After we sleep past the window,
+	// a CUD-over-threshold observation must NOT fire vertical_walk —
+	// the watcher trusts that a real wedge would have fired much
+	// earlier in the resize window.
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "wedge-events.jsonl")
+	w := newWedgeWatcher()
+	w.SetLogPath(logPath)
+	created := time.Now()
+	w.ArmResize(44, 23, 90, created)
+	// Sleep past the vertical-walk window before observing the CUDs.
+	time.Sleep(verticalWalkWindow + 100*time.Millisecond)
+	w.ObserveBytes([]byte("\x1b[40B"), created)
+
+	events := readEvents(t, logPath)
+	if len(events) != 0 {
+		t.Fatalf("vertical_walk must not fire past %v window; got %+v",
+			verticalWalkWindow, events)
+	}
+}
+
+func TestWedgeWatcher_CursorWedge_FiresRegardlessOfTimeWindow(t *testing.T) {
+	// cursor_row is the unambiguous signal — absolute CUP referencing
+	// a row > pendingRows is provably wrong regardless of when it
+	// arrives. It keeps the full scanWindow, not the tighter
+	// verticalWalkWindow.
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "wedge-events.jsonl")
+	w := newWedgeWatcher()
+	w.SetLogPath(logPath)
+	created := time.Now()
+	w.ArmResize(44, 23, 90, created)
+	time.Sleep(verticalWalkWindow + 200*time.Millisecond)
+	w.ObserveBytes([]byte("\x1b[40;1H"), created)
+
+	events := readEvents(t, logPath)
+	if len(events) != 1 || events[0].WedgeType != "cursor_row" {
+		t.Fatalf("cursor_row should fire across the full scanWindow regardless of timing; got %+v", events)
+	}
+}
+
+func TestWedgeWatcher_SuppressUntil_BlocksAllSignals(t *testing.T) {
+	// SuppressUntil is the recovery sequencer's "give Claude time to
+	// settle after --resume" guard. While the suppression clock is
+	// in the future, no signal — silent, cursor_row, or vertical_walk
+	// — may emit. Once the clock passes, normal detection resumes.
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "wedge-events.jsonl")
+	w := newWedgeWatcher()
+	w.SetLogPath(logPath)
+	created := time.Now()
+
+	// Suppress for 500ms.
+	w.SuppressUntil(time.Now().Add(500 * time.Millisecond))
+
+	w.ArmResize(44, 23, 90, created)
+	// Try to fire cursor_row — most aggressive signal. Should be
+	// blocked while suppression is active.
+	w.ObserveBytes([]byte("\x1b[40;1H"), created)
+	if events := readEvents(t, logPath); len(events) != 0 {
+		t.Fatalf("cursor_row must be suppressed while SuppressUntil is in future; got %+v", events)
+	}
+
+	// Wait past the suppression window. cursor_row should now fire on
+	// a fresh resize (the previous one's wedgeRaised flag is still set;
+	// arm again to clear).
+	time.Sleep(600 * time.Millisecond)
+	w.ArmResize(44, 23, 90, created)
+	w.ObserveBytes([]byte("\x1b[40;1H"), created)
+	events := readEvents(t, logPath)
+	if len(events) != 1 || events[0].WedgeType != "cursor_row" {
+		t.Fatalf("cursor_row should fire after suppression expires; got %+v", events)
+	}
+}
+
+func TestWedgeWatcher_SuppressUntil_BlocksSilentDeadline(t *testing.T) {
+	// Suppression also covers the silent path. Even on a mature
+	// session that would normally fire silent, the in-flight
+	// cooldown prevents the deadline timer from emitting.
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "wedge-events.jsonl")
+	w := newWedgeWatcher()
+	w.SetLogPath(logPath)
+	created := time.Now().Add(-time.Hour)
+	// Push past silentMinSessionBytes so the maturity gate doesn't
+	// also skip us. Only the suppression gate should be in play.
+	w.ObserveBytes(make([]byte, silentMinSessionBytes+1000), created)
+
+	w.SuppressUntil(time.Now().Add(silentDeadline + time.Second))
+	w.ArmResize(44, 23, 90, created)
+	// Wait past the silent deadline — the goroutine would normally
+	// fire by now, but suppression should silence it.
+	time.Sleep(silentDeadline + 500*time.Millisecond)
+
+	events := readEvents(t, logPath)
+	if len(events) != 0 {
+		t.Fatalf("silent must be suppressed while SuppressUntil active; got %+v", events)
+	}
+}
+
 func TestWedgeWatcher_CursorWedge_TakesPrecedenceOverVerticalWalk(t *testing.T) {
 	// If both signals would fire on the same chunk, cursor_row wins
 	// — it's the stronger evidence (absolute positioning is

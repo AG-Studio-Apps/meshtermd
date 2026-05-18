@@ -111,6 +111,16 @@ type wedgeWatcher struct {
 	pendingTimerCh chan struct{} // closed when the silent-deadline timer should stop early
 	wedgeRaised    bool          // any wedge already raised for this resize; suppress duplicates
 
+	// suppressUntil silences ALL wedge signals (silent, cursor_row,
+	// vertical_walk) until the wall-clock passes it. The recovery
+	// sequencer sets this at the end of a save-restart cycle to
+	// suppress the well-known false-positive storm caused by
+	// `claude --resume` replaying scrollback (lots of CUDs in
+	// milliseconds, no real wedge — just restoration replay). Zero
+	// value = no suppression. The watcher checks via
+	// time.Now().Before(suppressUntil).
+	suppressUntil time.Time
+
 	// CSI scanner state — feed continues across chunks. Only mutated
 	// inside ObserveBytes (which holds the lock).
 	scanner csiScanner
@@ -153,6 +163,20 @@ const silentMinSessionBytes uint64 = 4096
 // late-arriving cursor-row violation if it happens.
 const scanWindow = 10 * time.Second
 
+// verticalWalkWindow is the tighter time bound that gates the
+// vertical_walk signal specifically. Field-validated: real wedges
+// fire sub-100ms after SIGWINCH (Claude immediately redraws the
+// stale frame as a single contiguous CUD burst); healthy multi-frame
+// renders accumulate CUDs across many seconds (spinner ticks, status
+// bar updates, scrollback replay during `claude --resume`). 800ms
+// captures the real-wedge response window with generous headroom
+// without bleeding into the multi-frame false-positive territory.
+//
+// cursor_row keeps the full scanWindow — its threshold (CUP row
+// strictly > pendingRows) is unambiguous regardless of timing, so
+// the wider window doesn't bring in false positives.
+const verticalWalkWindow = 800 * time.Millisecond
+
 func newWedgeWatcher() *wedgeWatcher {
 	var b [4]byte
 	_, _ = rand.Read(b[:])
@@ -174,6 +198,17 @@ func (w *wedgeWatcher) SetLogPath(path string) {
 func (w *wedgeWatcher) SetOnWedge(cb func(WedgeNotice)) {
 	w.mu.Lock()
 	w.onWedge = cb
+	w.mu.Unlock()
+}
+
+// SuppressUntil silences ALL wedge detections until the given
+// wall-clock time. Used by the recovery sequencer to gate the false-
+// positive storm during `claude --resume` scrollback replay (lots of
+// rapid CUDs from re-painting history, no real wedge). Pass a
+// zero-value time.Time to clear suppression.
+func (w *wedgeWatcher) SuppressUntil(t time.Time) {
+	w.mu.Lock()
+	w.suppressUntil = t
 	w.mu.Unlock()
 }
 
@@ -245,6 +280,14 @@ func (w *wedgeWatcher) runSilentDeadline(cancel <-chan struct{}, oldRows, newRow
 		w.mu.Unlock()
 		return
 	}
+	// Post-recovery cooldown: the sequencer sets suppressUntil at
+	// the end of every save-restart cycle. While it's in the future
+	// every signal — including silent — is muted. Keeps the banner
+	// from re-popping during `claude --resume` scrollback replay.
+	if !w.suppressUntil.IsZero() && time.Now().Before(w.suppressUntil) {
+		w.mu.Unlock()
+		return
+	}
 	w.silentWedges++
 	totalOut := w.totalOutBytes
 	resizes := w.resizesObserved
@@ -307,6 +350,17 @@ func (w *wedgeWatcher) ObserveBytes(data []byte, sessionCreated time.Time) {
 		w.mu.Unlock()
 		return
 	}
+	// Post-recovery cooldown — same gate as the silent path. The
+	// recovery sequencer sets suppressUntil at the end of every
+	// save-restart so the false-positive storm during `claude
+	// --resume` scrollback replay (lots of rapid CUDs from history
+	// repaint) doesn't re-pop the banner the moment recovery
+	// finishes. Once the cooldown expires the watcher's back to
+	// normal sensitivity.
+	if !w.suppressUntil.IsZero() && time.Now().Before(w.suppressUntil) {
+		w.mu.Unlock()
+		return
+	}
 	pendingRows := w.pendingRows
 	oldRows := w.oldRows
 	cols := w.pendingCols
@@ -323,9 +377,12 @@ func (w *wedgeWatcher) ObserveBytes(data []byte, sessionCreated time.Time) {
 	//     since the last resize already exceeds the new row count.
 	//     Matches the Ink-renderer mechanism diagnosed in the upstream
 	//     issue: relative-only redraw walks an old-geometry frame past
-	//     the new viewport.
+	//     the new viewport. Tighter time window than cursor_row
+	//     because the cumulative-CUD signal is genuinely noisy on
+	//     long-tail healthy renders (spinner ticks + status updates).
 	violatingRow := w.scanner.feed(data, pendingRows)
 	cudCount := w.scanner.cudCount()
+	msSinceResize := time.Since(w.resizeAt)
 
 	var (
 		wedgeType     string
@@ -338,7 +395,7 @@ func (w *wedgeWatcher) ObserveBytes(data []byte, sessionCreated time.Time) {
 		wedgeType = "cursor_row"
 		note = "CUP escape referenced row > new geometry — app is drawing for old size"
 		cursorRowSeen = violatingRow
-	case cudCount > int(pendingRows):
+	case cudCount > int(pendingRows) && msSinceResize <= verticalWalkWindow:
 		wedgeType = "vertical_walk"
 		note = "cumulative CUD motions exceed new row count — relative-only redraw painting past viewport"
 		cudObserved = cudCount

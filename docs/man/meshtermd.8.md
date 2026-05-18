@@ -158,8 +158,11 @@ Common flags accepted by most subcommands:
 **~/Library/LaunchAgents/com.agstudio.meshtermd.plist** (macOS)
 :   Supervisor plist when launchd is the detected backend.
 
-**/tmp/meshtermd.log** (nohup fallback)
+**~/.local/share/meshtermd/meshtermd.log** (nohup fallback)
 :   Append-only log when neither systemd-user nor launchd is available.
+    Owner-only mode (0600). Pre-v1.0 versions wrote to /tmp/meshtermd.log;
+    if you upgrade an existing nohup deployment, the old file is
+    orphaned and may be safely deleted.
 
 # NETWORK
 

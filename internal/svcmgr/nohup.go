@@ -5,20 +5,30 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
+// nohupLogPath is the path the nohup backend redirects daemon
+// stdout/stderr into. Under the 0o700 state dir (matches every other
+// daemon artefact). Was /tmp/meshtermd.log pre-v1.0 — a fixed path
+// in a world-writable directory that allowed pre-create / symlink
+// races on multi-user hosts.
+func nohupLogPath() string {
+	return homePath(".local", "share", "meshtermd", "meshtermd.log")
+}
+
 // nohup is the fallback Manager for hosts without a reachable
-// systemd-user / launchd. It just exec's `setsid nohup <bin> serve
-// --socket ... </dev/null >/tmp/meshtermd.log 2>&1 &`, same as the
-// iOS installer does over SSH.
+// systemd-user / launchd. It exec's `setsid nohup <bin> serve
+// --socket ... </dev/null >>~/.local/share/meshtermd/meshtermd.log
+// 2>&1 &`, same as the iOS installer does over SSH.
 //
 // Remove is a no-op (nothing to clean up — no unit file). Stop uses
-// `pkill -u <uid> -f 'meshtermd serve'` so it catches any running
-// daemon regardless of how it was started.
+// `pkill -u <uid> -x meshtermd` so it catches any running daemon
+// regardless of how it was started.
 type nohup struct{}
 
 func (n *nohup) Name() string { return "nohup" }
@@ -88,7 +98,20 @@ func (n *nohup) Start(ctx context.Context, binPath string) error {
 	)
 	// New session so SIGHUP from our parent doesn't propagate.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	logFile, err := os.OpenFile("/tmp/meshtermd.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	logPath := nohupLogPath()
+	// Ensure the parent dir exists (the daemon would otherwise create
+	// it on first cert write, but we open the log before the daemon
+	// has run). 0o700 matches the rest of the state dir layout.
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		return fmt.Errorf("create log dir: %w", err)
+	}
+	// O_NOFOLLOW closes the symlink-attack vector that the prior
+	// /tmp/meshtermd.log path was vulnerable to. 0o600 matches every
+	// other daemon-private artefact. Existing file's mode is preserved
+	// (this only sets perms on first create).
+	logFile, err := os.OpenFile(logPath,
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND|syscall.O_NOFOLLOW,
+		0o600)
 	if err != nil {
 		return fmt.Errorf("open logfile: %w", err)
 	}

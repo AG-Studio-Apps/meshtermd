@@ -105,9 +105,12 @@ jobs:
         # RoamInstaller.swift too for restricted hosts.
         run: |
           set -eu
+          LOG_PATH="$HOME/.local/share/meshtermd/meshtermd.log"
           if ! ~/.local/bin/meshtermd status >/dev/null 2>&1; then
             echo "launchd path not active — spawning manually"
-            nohup ~/.local/bin/meshtermd serve --addr=127.0.0.1:0 >/tmp/meshtermd.log 2>&1 &
+            mkdir -p "$(dirname "$LOG_PATH")"
+            chmod 700 "$(dirname "$LOG_PATH")"
+            nohup ~/.local/bin/meshtermd serve --addr=127.0.0.1:0 >>"$LOG_PATH" 2>&1 &
             sleep 3
           fi
           echo "--- meshtermd version ---"
@@ -115,7 +118,7 @@ jobs:
           echo "--- meshtermd status ---"
           if ! ~/.local/bin/meshtermd status; then
             echo "--- meshtermd serve log ---"
-            cat /tmp/meshtermd.log || true
+            cat "$LOG_PATH" || true
             exit 1
           fi
           echo "--- meshtermd list --json ---"

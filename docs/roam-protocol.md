@@ -1,6 +1,6 @@
-# Roam Protocol — wire specification (v0)
+# Roam Protocol — wire specification
 
-**Status**: draft. Subject to breaking changes until v1.0. Do not implement against this expecting stability.
+**Status**: stable as of meshtermd v1.0.0. The wire format below is the v1 contract: future versions may add new control-message types or fields (forward-compatible — unknown types are ignored per §5), but existing types, field semantics, and constants will not change without bumping the ALPN to `meshterm/1`.
 
 ## 1. Goals
 

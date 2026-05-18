@@ -1,9 +1,10 @@
 package transport
 
 import (
+	"bytes"
 	"context"
-	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/AG-Studio-Apps/meshtermd/internal/protocol"
@@ -12,14 +13,28 @@ import (
 
 // defaultSavePrompt is the natural-language instruction the daemon
 // injects into Claude's stdin when the client doesn't supply one.
-// Phrased as a system-side message so Claude treats it as a directive
-// rather than a request to act on. Mentions the memory tool
-// specifically so Claude knows what surface to use for persistence;
-// "do not start new work" guards against an interrupted restart
-// kicking off a long-running response that gets killed mid-stream.
-const defaultSavePrompt = "System restart imminent — please save any " +
-	"in-flight context, decisions, or work-in-progress to memory using " +
-	"the memory tools, then exit. Do not start new work."
+// Bookend markers ("Commencing Save & Restore" / "Memory Updated,
+// restoring session...") are the load-bearing part — the sequencer
+// scans Claude's PTY output for these substrings and advances banner
+// stages on each match, falling back to the grace window if either
+// never arrives. Phrased as a numbered directive so Claude's
+// instruction-following stays on the rails. "Do not start new work"
+// guards against an interrupted restart kicking off a long-running
+// response that gets killed mid-stream.
+const defaultSavePrompt = "System restart imminent. Please do these three things in order:\n" +
+	"1. Print exactly this line and only this line, then a newline: Commencing Save & Restore\n" +
+	"2. Save any in-flight context, decisions, or work-in-progress to memory using the memory tools.\n" +
+	"3. Print exactly this line and only this line, then a newline: Memory Updated, restoring session...\n" +
+	"Do not start new work. Do not explain. After step 3, await the exit signal."
+
+// markerStart / markerEnd are the substrings the sequencer scans for
+// in Claude's PTY output during the save window. Substring (not full
+// line) match is forgiving against minor paraphrasing AND against
+// ANSI styling that wraps but doesn't interleave with the text bytes.
+var (
+	markerStart = []byte("Commencing Save")
+	markerEnd   = []byte("Memory Updated, restoring")
+)
 
 // defaultGrace is the upper bound on the save window when the client
 // doesn't specify one. 30 s is generous on purpose — a wedged Ink
@@ -45,6 +60,71 @@ const shellSettleDelay = 3 * time.Second
 // any plausible machine, and it's imperceptible inside a 30s save
 // window.
 const submitSettleDelay = 100 * time.Millisecond
+
+// markerStartTimeout caps how long the sequencer will wait for the
+// START marker before falling through. A healthy Claude that received
+// the prompt should print "Commencing Save & Restore" within a few
+// seconds. If we haven't seen it after this, Claude either ignored
+// the prompt (wedged input pipeline) or chose to paraphrase past our
+// substring match — either way, waiting longer doesn't help. The END
+// marker watch and grace cap still run.
+const markerStartTimeout = 10 * time.Second
+
+// markerScanCap bounds the rolling buffer the marker scanner keeps
+// around. Markers are short; we only need enough history to span a
+// chunk boundary. 8 KiB is generous and keeps allocator pressure on
+// the Pump goroutine negligible.
+const markerScanCap = 8 * 1024
+
+// watchSaveMarkers installs a PTY byte observer that scans for the
+// START / END markers Claude prints during a save. Returns two
+// signal channels (each closed at most once on first sight of its
+// marker) and a stop function the caller must invoke to clear the
+// observer when the sequencer is done.
+//
+// Concurrency: the observer fires from the session's Pump goroutine.
+// We snapshot accumulated bytes under a local mutex, do the substring
+// search outside the Pump lock, and close the result channels under
+// `sync.Once` guards so a noisy scan that matches multiple times in
+// the same chunk only fires each signal once.
+func watchSaveMarkers(sess *session.Session) (start, end <-chan struct{}, stop func()) {
+	startC := make(chan struct{})
+	endC := make(chan struct{})
+	var (
+		mu        sync.Mutex
+		accum     []byte
+		startOnce sync.Once
+		endOnce   sync.Once
+		started   bool
+	)
+
+	sess.SetPTYByteObserver(func(data []byte) {
+		mu.Lock()
+		accum = append(accum, data...)
+		// Keep accum bounded so a long save (lots of tool output)
+		// doesn't grow it unbounded. Trim from the front but keep
+		// enough tail history to span a chunk boundary.
+		if len(accum) > markerScanCap {
+			accum = accum[len(accum)-markerScanCap/2:]
+		}
+		hitStart := !started && bytes.Contains(accum, markerStart)
+		if hitStart {
+			started = true
+		}
+		hitEnd := started && bytes.Contains(accum, markerEnd)
+		mu.Unlock()
+
+		if hitStart {
+			startOnce.Do(func() { close(startC) })
+		}
+		if hitEnd {
+			endOnce.Do(func() { close(endC) })
+		}
+	})
+
+	stop = func() { sess.SetPTYByteObserver(nil) }
+	return startC, endC, stop
+}
 
 // runRecover drives the save-restart sequence on a session's PTY.
 //
@@ -116,12 +196,18 @@ func runRecover(
 		return
 	}
 
+	// Install the marker scanner BEFORE we inject the prompt so we
+	// don't miss the start marker if Claude responds faster than the
+	// SetPTYByteObserver call returns. Cleared via defer so a future
+	// recovery starts with a fresh observer pointed at a fresh stream.
+	startCh, endCh, stopWatch := watchSaveMarkers(sess)
+	defer stopWatch()
+
 	// Save prompt + Enter. The trailing '\r' submits the line in raw
 	// mode (Claude's stdin doesn't translate \n → \r). The
 	// submitSettleDelay between the body and the carriage return is
 	// load-bearing — see the constant's docstring.
-	emit(protocol.RecoverStageSaving,
-		fmt.Sprintf("Waiting up to %s for save…", roundDuration(grace)))
+	emit(protocol.RecoverStageSaving, "Asking Claude to save…")
 	if err := injectAndCheckCtx(ctx, sess, []byte(prompt)); err != nil {
 		emit(protocol.RecoverStageError, "save prompt write failed: "+err.Error())
 		return
@@ -134,9 +220,40 @@ func runRecover(
 		emit(protocol.RecoverStageError, "save prompt enter failed: "+err.Error())
 		return
 	}
-	if !sleepCtx(ctx, grace) {
-		emit(protocol.RecoverStageError, "cancelled during grace window")
+
+	// Marker watch — primary timing signal for v0.9.7+.
+	//
+	// Phase 1: wait for the START marker (Claude acknowledged the
+	// prompt). If we don't see it within markerStartTimeout, Claude
+	// likely never parsed the instruction (wedged input pipeline,
+	// already mid-tool-call ignoring stdin, etc.). Skip ahead to the
+	// grace-only fallback rather than waiting the full window.
+	graceDeadline := time.After(grace)
+	select {
+	case <-ctx.Done():
+		emit(protocol.RecoverStageError, "cancelled while awaiting save start")
 		return
+	case <-startCh:
+		emit(protocol.RecoverStageSaving, "Claude is saving memory…")
+	case <-time.After(markerStartTimeout):
+		slog.Info("recover: start marker not seen — falling through to grace window",
+			"sid", sid, "timeout", markerStartTimeout)
+	case <-graceDeadline:
+		slog.Info("recover: grace expired before start marker", "sid", sid)
+	}
+
+	// Phase 2: wait for the END marker, capped by the remaining
+	// grace window. End marker = "save complete, ready to exit."
+	// If grace expires first, fire /exit anyway — Claude has had
+	// long enough.
+	select {
+	case <-ctx.Done():
+		emit(protocol.RecoverStageError, "cancelled while awaiting save end")
+		return
+	case <-endCh:
+		emit(protocol.RecoverStageSaving, "Save complete — exiting…")
+	case <-graceDeadline:
+		slog.Info("recover: grace expired before end marker — exiting anyway", "sid", sid)
 	}
 
 	// /exit. Claude Code listens for this slash-command and shuts down
@@ -194,12 +311,3 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// roundDuration trims sub-second precision off a duration for
-// user-facing detail strings ("Waiting up to 30s for save…", not
-// "Waiting up to 30.000000123s for save…").
-func roundDuration(d time.Duration) time.Duration {
-	if d >= time.Second {
-		return d.Round(time.Second)
-	}
-	return d.Round(time.Millisecond)
-}

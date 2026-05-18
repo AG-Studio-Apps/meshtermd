@@ -267,6 +267,16 @@ type Session struct {
 	// Pump and arms a deadline timer from Resize; see wedgewatch.go.
 	wedge *wedgeWatcher
 
+	// ptyByteObserver, if set, receives every chunk Pump reads from
+	// the PTY (post-QueryFilter, same bytes the client renders).
+	// Installed by the recovery sequencer to detect bookend markers
+	// Claude prints during the save phase ("Commencing Save…" /
+	// "Memory Updated, restoring…"). Cleared by the sequencer on
+	// exit so a future recovery starts fresh. The observer runs in
+	// the Pump goroutine; callers must keep it non-blocking and
+	// thread-safe.
+	ptyByteObserver func([]byte)
+
 	closed bool
 }
 
@@ -418,6 +428,19 @@ func (s *Session) OnWedge(cb func(WedgeNotice)) {
 	if w != nil {
 		w.SetOnWedge(cb)
 	}
+}
+
+// SetPTYByteObserver installs (or clears, with nil) a callback that
+// receives every chunk Pump reads from the PTY. Used by the recovery
+// sequencer to scan for the bookend markers Claude prints during a
+// save ("Commencing Save…" / "Memory Updated, restoring…"). The
+// callback fires from the Pump goroutine — keep it non-blocking and
+// internally thread-safe. Only one observer at a time; setting a
+// non-nil callback replaces any previous one. Cleared via nil.
+func (s *Session) SetPTYByteObserver(cb func([]byte)) {
+	s.mu.Lock()
+	s.ptyByteObserver = cb
+	s.mu.Unlock()
 }
 
 // ConsumeFirstAttach atomically reads and clears the firstAttachPending
@@ -1062,6 +1085,16 @@ func (s *Session) Pump() {
 				// terminal queries (DA/DSR); it doesn't strip CUPs.
 				if s.wedge != nil {
 					s.wedge.ObserveBytes(filtered, s.created)
+				}
+				// Fire the PTY byte observer (recovery sequencer's
+				// marker detection). Snapshot under the lock so a
+				// concurrent SetPTYByteObserver(nil) doesn't race
+				// with the dereference.
+				s.mu.Lock()
+				obs := s.ptyByteObserver
+				s.mu.Unlock()
+				if obs != nil {
+					obs(filtered)
 				}
 			}
 			if seqAware != nil {

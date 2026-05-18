@@ -383,6 +383,10 @@ func TestWedgeWatcher_VerticalWalk_FiresWhenCudExceedsNewRows(t *testing.T) {
 	w := newWedgeWatcher()
 	w.SetLogPath(logPath)
 	created := time.Now()
+	// Enter alt-screen first — vertical_walk only fires when the pty is
+	// on the alternate buffer (gate added v0.9.10 to suppress default-mode
+	// false positives on iOS-keyboard-driven resizes).
+	w.ObserveBytes([]byte("\x1b[?1049h"), created)
 	w.ArmResize(44, 23, 90, created)
 	// 25 cursor-down moves into a 23-row viewport — over by 2.
 	w.ObserveBytes([]byte("\x1b[25B"), created)
@@ -409,6 +413,9 @@ func TestWedgeWatcher_VerticalWalk_NoFireBelowThreshold(t *testing.T) {
 	w := newWedgeWatcher()
 	w.SetLogPath(logPath)
 	created := time.Now()
+	// Enter alt-screen — we want the threshold (not the alt-screen gate)
+	// to be what's blocking the fire here.
+	w.ObserveBytes([]byte("\x1b[?1049h"), created)
 	w.ArmResize(44, 23, 90, created)
 	// 20 cursor-downs — under the 23-row viewport. Healthy redraw.
 	w.ObserveBytes([]byte("\x1b[20B"), created)
@@ -427,6 +434,7 @@ func TestWedgeWatcher_VerticalWalk_CountsAcrossMultipleChunks(t *testing.T) {
 	w := newWedgeWatcher()
 	w.SetLogPath(logPath)
 	created := time.Now()
+	w.ObserveBytes([]byte("\x1b[?1049h"), created)
 	w.ArmResize(44, 23, 90, created)
 	// 24 single-line CUDs in 24 separate chunks. Total = 24 > 23.
 	for i := 0; i < 24; i++ {
@@ -451,6 +459,7 @@ func TestWedgeWatcher_VerticalWalk_ResetsBetweenResizes(t *testing.T) {
 	w := newWedgeWatcher()
 	w.SetLogPath(logPath)
 	created := time.Now()
+	w.ObserveBytes([]byte("\x1b[?1049h"), created)
 
 	// First resize: 18 CUDs into a 23-row viewport (under). No wedge.
 	w.ArmResize(44, 23, 90, created)
@@ -484,6 +493,7 @@ func TestWedgeWatcher_VerticalWalk_SingleFramePastViewportStillFires(t *testing.
 	w := newWedgeWatcher()
 	w.SetLogPath(logPath)
 	created := time.Now()
+	w.ObserveBytes([]byte("\x1b[?1049h"), created)
 	w.ArmResize(40, 23, 90, created)
 	// One frame: home + 30 cursor-downs (well past 23).
 	w.ObserveBytes([]byte("\x1b[H\x1b[30B"), created)
@@ -508,6 +518,9 @@ func TestWedgeWatcher_VerticalWalk_BeyondTimeWindowDoesNotFire(t *testing.T) {
 	w := newWedgeWatcher()
 	w.SetLogPath(logPath)
 	created := time.Now()
+	// Enter alt-screen so the time-window gate (not the alt-screen gate)
+	// is what's being tested.
+	w.ObserveBytes([]byte("\x1b[?1049h"), created)
 	w.ArmResize(44, 23, 90, created)
 	// Sleep past the vertical-walk window before observing the CUDs.
 	time.Sleep(verticalWalkWindow + 100*time.Millisecond)
@@ -659,11 +672,103 @@ func TestWedgeWatcher_CursorWedge_TakesPrecedenceOverVerticalWalk(t *testing.T) 
 	w := newWedgeWatcher()
 	w.SetLogPath(logPath)
 	created := time.Now()
+	// Alt-screen on so vertical_walk WOULD fire absent the precedence
+	// rule — without this the precedence claim is vacuous (the alt-screen
+	// gate alone would block vertical_walk regardless of cursor_row).
+	w.ObserveBytes([]byte("\x1b[?1049h"), created)
 	w.ArmResize(44, 23, 90, created)
 	// CUP to row 40 (> 23) AND 25 CUDs in the same chunk.
 	w.ObserveBytes([]byte("\x1b[40;1H\x1b[25B"), created)
 	events := readEvents(t, logPath)
 	if len(events) != 1 || events[0].WedgeType != "cursor_row" {
 		t.Fatalf("cursor_row should win; got %+v", events)
+	}
+}
+
+func TestWedgeWatcher_VerticalWalk_SuppressedOnMainScreen(t *testing.T) {
+	// The v0.9.10 alt-screen gate. Default-mode shells (no `\x1b[?1049h`
+	// observed) legitimately emit CUDs after a resize — most painfully,
+	// Claude in non-/tui mode every time the iOS keyboard appears and
+	// shrinks the pty from ~40 rows to ~18. The bytes look like a wedge
+	// but the user isn't actually wedged. Suppress vertical_walk in this
+	// configuration.
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "wedge-events.jsonl")
+	w := newWedgeWatcher()
+	w.SetLogPath(logPath)
+	created := time.Now()
+	// NO alt-screen enter — staying on main screen.
+	w.ArmResize(44, 18, 90, created)
+	// 26 CUDs into an 18-row viewport — would fire vertical_walk if
+	// the alt-screen gate weren't in place. Matches the field log
+	// signature kind=vertical_walk cud=26 rows=35→18 the user reported.
+	w.ObserveBytes([]byte("\x1b[26B"), created)
+
+	events := readEvents(t, logPath)
+	if len(events) != 0 {
+		t.Fatalf("vertical_walk must be suppressed on main screen; got %+v", events)
+	}
+}
+
+func TestWedgeWatcher_VerticalWalk_FiresAfterAltScreenEnter(t *testing.T) {
+	// Positive case for the alt-screen gate: once the pty enters alt
+	// (Claude /tui, htop, vim, less), vertical_walk should fire on the
+	// same byte pattern that was suppressed on the main screen.
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "wedge-events.jsonl")
+	w := newWedgeWatcher()
+	w.SetLogPath(logPath)
+	created := time.Now()
+	w.ObserveBytes([]byte("\x1b[?1049h"), created)
+	w.ArmResize(44, 18, 90, created)
+	w.ObserveBytes([]byte("\x1b[26B"), created)
+
+	events := readEvents(t, logPath)
+	if len(events) != 1 || events[0].WedgeType != "vertical_walk" {
+		t.Fatalf("vertical_walk must fire once alt-screen is active; got %+v", events)
+	}
+}
+
+func TestWedgeWatcher_VerticalWalk_AltScreenExitGatesOffAgain(t *testing.T) {
+	// Round-trip: alt-screen enter then exit should toggle the gate back
+	// off, so an alt-screen TUI's exit (e.g. user quits vim) doesn't
+	// leave the watcher in a permanently-armed state across the
+	// session's main-screen tail.
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "wedge-events.jsonl")
+	w := newWedgeWatcher()
+	w.SetLogPath(logPath)
+	created := time.Now()
+	w.ObserveBytes([]byte("\x1b[?1049h"), created)
+	w.ObserveBytes([]byte("\x1b[?1049l"), created)
+	w.ArmResize(44, 18, 90, created)
+	w.ObserveBytes([]byte("\x1b[26B"), created)
+
+	events := readEvents(t, logPath)
+	if len(events) != 0 {
+		t.Fatalf("vertical_walk must be suppressed after alt-screen exit; got %+v", events)
+	}
+}
+
+func TestWedgeWatcher_AltScreen_TracksChunkedSequence(t *testing.T) {
+	// The DECSET ?1049h may arrive split across PTY reads. Confirm the
+	// tracker accumulates parameter bytes across chunks before evaluating
+	// the final 'h'.
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "wedge-events.jsonl")
+	w := newWedgeWatcher()
+	w.SetLogPath(logPath)
+	created := time.Now()
+	// Same byte stream as `\x1b[?1049h`, split across four chunks
+	// at byte boundaries the real PTY pump might land on.
+	for _, c := range [][]byte{[]byte("\x1b["), []byte("?10"), []byte("49"), []byte("h")} {
+		w.ObserveBytes(c, created)
+	}
+	w.ArmResize(44, 18, 90, created)
+	w.ObserveBytes([]byte("\x1b[26B"), created)
+
+	events := readEvents(t, logPath)
+	if len(events) != 1 || events[0].WedgeType != "vertical_walk" {
+		t.Fatalf("alt-screen state must survive chunked DECSET; got %+v", events)
 	}
 }

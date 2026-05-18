@@ -153,6 +153,15 @@ type wedgeWatcher struct {
 	// CSI scanner state — feed continues across chunks. Only mutated
 	// inside ObserveBytes (which holds the lock).
 	scanner csiScanner
+
+	// altScreen tracks whether the pty is currently on the alternate
+	// screen buffer. Fed on every ObserveBytes chunk regardless of
+	// resizePending, since apps enter alt-screen (Claude /tui, htop,
+	// less, vim) at startup — long before the first iOS-driven resize.
+	// The vertical_walk signal is gated on this so default-mode shells
+	// don't false-positive on keyboard-induced resizes. See the
+	// altScreenTracker doc comment for the full reasoning.
+	altScreen altScreenTracker
 }
 
 // silentDeadline is the post-resize window we wait for redraw bytes
@@ -364,6 +373,10 @@ func (w *wedgeWatcher) ObserveBytes(data []byte, sessionCreated time.Time) {
 	}
 	w.mu.Lock()
 	w.totalOutBytes += uint64(len(data))
+	// Always update alt-screen state — apps may enter/exit alt-screen
+	// outside any resize window (Claude /tui starts on app launch).
+	// Cheap state-machine scan; ignores everything except ?1049/?1047/?47.
+	w.altScreen.feed(data)
 	if !w.resizePending {
 		w.mu.Unlock()
 		return
@@ -446,7 +459,16 @@ func (w *wedgeWatcher) ObserveBytes(data []byte, sessionCreated time.Time) {
 		wedgeType = "cursor_row"
 		note = "CUP escape referenced row > new geometry — app is drawing for old size"
 		cursorRowSeen = violatingRow
-	case cudCount > int(pendingRows) && msSinceResize <= verticalWalkWindow:
+	case cudCount > int(pendingRows) && msSinceResize <= verticalWalkWindow && w.altScreen.isActive():
+		// Alt-screen gate (added v0.9.10): vertical_walk only holds for
+		// renderers driving the alternate screen (Claude /tui, htop,
+		// less, vim). Default-mode shells legitimately emit bursts of
+		// CUDs after a resize — Claude in non-/tui mode walks its
+		// streaming output area every time the iOS keyboard appears
+		// and shrinks the pty from ~40 rows to ~18, which previously
+		// fired vertical_walk constantly with no underlying wedge.
+		// cursor_row stays ungated; an absolute CUP > rows is wrong
+		// in any mode.
 		wedgeType = "vertical_walk"
 		note = "cumulative CUD motions exceed new row count — relative-only redraw painting past viewport"
 		cudObserved = cudCount
@@ -612,7 +634,7 @@ type wedgeEvent struct {
 }
 
 // csiScanner is a tiny resumable parser for CSI sequences. We track
-// three patterns:
+// two patterns:
 //   - CUP (final `H`) and HVP (final `f`): absolute cursor positioning.
 //     We compare the row argument against maxRows on each occurrence
 //     and return the offending row on the first violation.
@@ -621,6 +643,9 @@ type wedgeEvent struct {
 //     use this to detect the Ink-style relative-only redraw mode where
 //     the renderer walks down `N` rows of frame content past a smaller
 //     viewport (see the upstream issue we filed).
+//
+// Alt-screen state is tracked separately by altScreenTracker — see
+// the comment there for why it can't be folded into this scanner.
 //
 // State persists across chunks because PTY reads can split an escape
 // sequence anywhere.
@@ -703,6 +728,92 @@ func (s *csiScanner) feed(buf []byte, maxRows uint16) int {
 // raise a vertical_walk wedge when the walk exceeds the current row
 // count.
 func (s *csiScanner) cudCount() int { return s.cudAccumulated }
+
+// altScreenTracker watches the PTY byte stream for DECSET/DECRST
+// private-mode toggles that switch between the main and alternate
+// screen buffer:
+//
+//   - ?1049 — modern (save cursor + switch + clear) — Claude, htop, less, vim
+//   - ?1047 — older switch + clear, no cursor save
+//   - ?47   — original alternate buffer
+//
+// Kept separate from csiScanner because:
+//  1. csiScanner is fed only during the post-resize scan window (the
+//     watcher returns early when !resizePending). Alt-screen toggles
+//     usually happen at app startup, long before any resize — we'd
+//     miss them.
+//  2. csiScanner.feed() may early-return on a CUP violation, leaving
+//     the rest of the chunk unparsed. We want alt-screen tracking to
+//     always observe every byte regardless of other signals.
+//
+// The tracker is fed unconditionally on every ObserveBytes chunk,
+// runs a minimal state machine that ignores everything except the
+// three alt-screen DECSET markers, and exposes its current state
+// to the vertical_walk gate. State persists across chunks because
+// escape sequences can split anywhere in the byte stream.
+type altScreenTracker struct {
+	state  csiScanState
+	params []byte
+	active bool
+}
+
+// feed processes one byte chunk. Side effect only — flips `active`
+// when an alt-screen DECSET/DECRST is observed.
+func (a *altScreenTracker) feed(buf []byte) {
+	for _, b := range buf {
+		switch a.state {
+		case csiNone:
+			if b == 0x1b {
+				a.state = csiEsc
+			}
+		case csiEsc:
+			if b == '[' {
+				a.state = csiParams
+				a.params = a.params[:0]
+			} else {
+				a.state = csiNone
+			}
+		case csiParams:
+			if b >= 0x40 && b <= 0x7e {
+				if b == 'h' && isAltScreenMode(a.params) {
+					a.active = true
+				} else if b == 'l' && isAltScreenMode(a.params) {
+					a.active = false
+				}
+				a.state = csiNone
+				a.params = a.params[:0]
+			} else {
+				a.params = append(a.params, b)
+				if len(a.params) > 64 {
+					a.state = csiNone
+					a.params = a.params[:0]
+				}
+			}
+		}
+	}
+}
+
+// isActive reports whether the most recent observed DECSET/DECRST put
+// the pty on the alternate screen. Default-false on a fresh tracker —
+// sessions start on the main screen.
+func (a *altScreenTracker) isActive() bool { return a.active }
+
+// isAltScreenMode reports whether the given CSI parameter slice
+// corresponds to one of the alternate-screen DECSET private modes.
+// Multi-param sequences (e.g. `?1049;1006h`) are not handled here:
+// real-world alt-screen apps issue ?1049 in isolation. If that changes
+// we'd split on ';' and check each segment.
+func isAltScreenMode(params []byte) bool {
+	return bytes.Equal(params, altScreenMode1049) ||
+		bytes.Equal(params, altScreenMode1047) ||
+		bytes.Equal(params, altScreenMode47)
+}
+
+var (
+	altScreenMode1049 = []byte("?1049")
+	altScreenMode1047 = []byte("?1047")
+	altScreenMode47   = []byte("?47")
+)
 
 func (s *csiScanner) reset() {
 	s.state = csiNone

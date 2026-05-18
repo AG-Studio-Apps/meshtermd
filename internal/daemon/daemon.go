@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"path/filepath"
 	"regexp"
 	"sync"
 	"time"
@@ -30,12 +29,6 @@ import (
 	"github.com/AG-Studio-Apps/meshtermd/internal/session"
 	"github.com/AG-Studio-Apps/meshtermd/internal/transport"
 )
-
-// WedgeReportFilename is the basename of the JSONL file where the
-// per-session wedge watcher appends de-identified records. Lives
-// alongside the daemon's other persistence state under stateDir.
-// Stable so `meshtermd wedge-report` can find it without flags.
-const WedgeReportFilename = "wedge-events.jsonl"
 
 // Config is the daemon's runtime configuration. Defaults are
 // applied for any zero / unset fields.
@@ -234,15 +227,8 @@ func New(cfg Config) (*Daemon, error) {
 	if restored > 0 {
 		logger.Info("session.persistence.restored", "count", restored)
 	}
-	wedgeLogPath := ""
-	if stateDir != "" {
-		wedgeLogPath = filepath.Join(stateDir, WedgeReportFilename)
-	}
 	for _, sid := range reg.IDs() {
 		if s, lookupErr := reg.Lookup(sid); lookupErr == nil {
-			if wedgeLogPath != "" {
-				s.SetWedgeLogPath(wedgeLogPath)
-			}
 			if s.Persist() {
 				s.StartFlusher(stateDir, cfg.PersistenceFlushInterval, logger)
 			}
@@ -448,22 +434,16 @@ func (d *Daemon) HandleListSessions(ctx context.Context, _ ipc.ListSessionsReque
 		}
 		rows, cols := sess.WindowSize()
 		modes := sess.AttachedModes()
-		totalOut, resizes, silent, cursor, vwalk := sess.WedgeSnapshot()
 		out = append(out, ipc.SessionInfo{
-			ID:                      sess.ID().String(),
-			Name:                    sess.Name(),
-			CreatedAtNs:             sess.Created().UnixNano(),
-			LastActiveAtNs:          sess.LastActiveAt().UnixNano(),
-			AttachedNow:             len(modes) > 0,
-			AttachedModes:           modes,
-			IdleTimeoutNs:           int64(sess.IdleTimeout()),
-			Rows:                    rows,
-			Cols:                    cols,
-			WedgeTotalOutBytes:      totalOut,
-			WedgeResizesObserved:    resizes,
-			WedgeSilentWedges:       silent,
-			WedgeCursorWedges:       cursor,
-			WedgeVerticalWalkWedges: vwalk,
+			ID:             sess.ID().String(),
+			Name:           sess.Name(),
+			CreatedAtNs:    sess.Created().UnixNano(),
+			LastActiveAtNs: sess.LastActiveAt().UnixNano(),
+			AttachedNow:    len(modes) > 0,
+			AttachedModes:  modes,
+			IdleTimeoutNs:  int64(sess.IdleTimeout()),
+			Rows:           rows,
+			Cols:           cols,
 		})
 	}
 	return ipc.ListSessionsResponse{Ok: true, Sessions: out}
@@ -791,13 +771,6 @@ func (d *Daemon) spawnSession(req ipc.AllocateRequest) (*session.Session, error)
 		_ = ptyHandle.Close()
 		return nil, &allocateErr{Code: ipc.ErrInternal, Msg: err.Error()}
 	}
-	// Wire the wedge-watcher's JSONL output to the daemon's state dir.
-	// File is created lazily by the watcher (O_APPEND|O_CREATE) on
-	// the first detected wedge.
-	if d.stateDir != "" {
-		sess.SetWedgeLogPath(filepath.Join(d.stateDir, WedgeReportFilename))
-	}
-
 	// Resolve persistence tri-state. nil → daemon default
 	// (`--persistence-default`, default-on). Wire the flag before
 	// the session enters the registry so a Sweep or Remove that

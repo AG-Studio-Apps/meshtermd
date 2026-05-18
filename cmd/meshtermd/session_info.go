@@ -109,45 +109,8 @@ func runSessionInfo(args []string) int {
 			fmt.Fprintf(w, "  client #%d\t%s\n", i+1, m)
 		}
 	}
-	// Wedge-watcher cumulative counters. Suppress the whole section
-	// when the session has never resized — keeps the common-case
-	// output clean. Once any resize has been observed we always show
-	// the full set so operators can read "no wedges" as positive
-	// evidence rather than absence-of-line.
-	if match.WedgeResizesObserved > 0 {
-		fmt.Fprintln(w, "Wedge watch\t")
-		fmt.Fprintf(w, "  Output bytes\t%s\n", formatBytes(match.WedgeTotalOutBytes))
-		fmt.Fprintf(w, "  Resizes seen\t%d\n", match.WedgeResizesObserved)
-		fmt.Fprintf(w, "  Wedges (silent / cursor_row / vertical_walk)\t%d / %d / %d\n",
-			match.WedgeSilentWedges,
-			match.WedgeCursorWedges,
-			match.WedgeVerticalWalkWedges)
-	}
 	_ = w.Flush()
 	return infoExitOK
-}
-
-// formatBytes renders a byte count with a one-decimal SI suffix when
-// it's large enough to make raw bytes hard to scan. We intentionally
-// use 1000-based units (KB / MB) rather than 1024-based — operators
-// reading wedge-watch output want order-of-magnitude at a glance, not
-// precise allocator accounting.
-func formatBytes(n uint64) string {
-	const (
-		kb = 1000
-		mb = kb * 1000
-		gb = mb * 1000
-	)
-	switch {
-	case n >= gb:
-		return fmt.Sprintf("%.1f GB", float64(n)/gb)
-	case n >= mb:
-		return fmt.Sprintf("%.1f MB", float64(n)/mb)
-	case n >= kb:
-		return fmt.Sprintf("%.1f KB", float64(n)/kb)
-	default:
-		return fmt.Sprintf("%d B", n)
-	}
 }
 
 // pickSessionInfo: same shape as mtctl's pickSession. Kept duplicated

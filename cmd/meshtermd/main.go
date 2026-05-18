@@ -64,8 +64,6 @@ func main() {
 		os.Exit(runPtySidecar(args))
 	case "unit":
 		os.Exit(runUnit(args))
-	case "wedge-report":
-		os.Exit(runWedgeReport(args))
 	case "help", "--help", "-h":
 		usage(os.Stdout)
 	default:
@@ -95,7 +93,6 @@ Subcommands:
   restart            cycle the daemon via the detected supervisor (sessions survive)
   uninstall          remove the daemon, supervisor unit, and (optionally) state
   unit               emit / manage the systemd-user unit file
-  wedge-report       dump the de-identified resize-wedge event log (safe to share upstream)
 
 Run 'meshtermd <subcommand> --help' for subcommand-specific flags.
 `, build.Version)

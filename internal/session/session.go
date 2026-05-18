@@ -261,22 +261,6 @@ type Session struct {
 	flusherCancel context.CancelFunc
 	flusherDone   chan struct{}
 
-	// wedge runs the resize-wedge detector. Non-nil after NewSession;
-	// the daemon wires its JSONL log path via SetWedgeLogPath after
-	// stateDir is resolved. The watcher updates totalOutBytes from
-	// Pump and arms a deadline timer from Resize; see wedgewatch.go.
-	wedge *wedgeWatcher
-
-	// ptyByteObserver, if set, receives every chunk Pump reads from
-	// the PTY (post-QueryFilter, same bytes the client renders).
-	// Installed by the recovery sequencer to detect bookend markers
-	// Claude prints during the save phase ("Commencing Save…" /
-	// "Memory Updated, restoring…"). Cleared by the sequencer on
-	// exit so a future recovery starts fresh. The observer runs in
-	// the Pump goroutine; callers must keep it non-blocking and
-	// thread-safe.
-	ptyByteObserver func([]byte)
-
 	closed bool
 }
 
@@ -384,77 +368,7 @@ func NewSession(id SessionID, name string, pty PTY, rows, cols uint16, bufCapaci
 		idleTimeout:        idleTimeout,
 		lastActiveAt:       now,
 		firstAttachPending: true,
-		wedge:              newWedgeWatcher(),
 	}, nil
-}
-
-// SetWedgeLogPath wires the JSONL path the wedge watcher appends to
-// when it detects a candidate resize wedge (see wedgewatch.go). Empty
-// path leaves slog-only logging in place. Called by the daemon after
-// stateDir is resolved; safe to call at any point after NewSession.
-func (s *Session) SetWedgeLogPath(path string) {
-	s.mu.Lock()
-	w := s.wedge
-	s.mu.Unlock()
-	if w != nil {
-		w.SetLogPath(path)
-	}
-}
-
-// WedgeSnapshot returns the per-session cumulative metrics tracked by
-// the wedge watcher. Used by `meshtermd wedge-report` and
-// `meshtermd session-info` to render a summary alongside the
-// JSONL contents.
-func (s *Session) WedgeSnapshot() (totalOut, resizes, silent, cursor, verticalWalk uint64) {
-	s.mu.Lock()
-	w := s.wedge
-	s.mu.Unlock()
-	if w == nil {
-		return 0, 0, 0, 0, 0
-	}
-	return w.Snapshot()
-}
-
-// OnWedge wires (or clears, with nil) a callback the wedge watcher
-// invokes on every detection. The transport layer installs this when
-// an exclusive client attaches so the daemon can push a
-// protocol.WedgeDetected frame on the existing control stream.
-// Cleared on detach so a re-attach gets a fresh subscriber without
-// holding a stale closure that would write into a torn-down stream.
-func (s *Session) OnWedge(cb func(WedgeNotice)) {
-	s.mu.Lock()
-	w := s.wedge
-	s.mu.Unlock()
-	if w != nil {
-		w.SetOnWedge(cb)
-	}
-}
-
-// SetPTYByteObserver installs (or clears, with nil) a callback that
-// receives every chunk Pump reads from the PTY. Used by the recovery
-// sequencer to scan for the bookend markers Claude prints during a
-// save ("Commencing Save…" / "Memory Updated, restoring…"). The
-// callback fires from the Pump goroutine — keep it non-blocking and
-// internally thread-safe. Only one observer at a time; setting a
-// non-nil callback replaces any previous one. Cleared via nil.
-func (s *Session) SetPTYByteObserver(cb func([]byte)) {
-	s.mu.Lock()
-	s.ptyByteObserver = cb
-	s.mu.Unlock()
-}
-
-// SuppressWedgeUntil silences all wedge detections on this session
-// until the given wall-clock time. Used by the recovery sequencer to
-// gate the false-positive storm from `claude --resume` scrollback
-// replay (lots of CUDs in milliseconds, no real wedge). Pass a
-// zero-value time.Time to clear suppression.
-func (s *Session) SuppressWedgeUntil(t time.Time) {
-	s.mu.Lock()
-	w := s.wedge
-	s.mu.Unlock()
-	if w != nil {
-		w.SuppressUntil(t)
-	}
 }
 
 // ConsumeFirstAttach atomically reads and clears the firstAttachPending
@@ -615,14 +529,6 @@ func (s *Session) Resize(rows, cols uint16) error {
 	} else {
 		slog.Debug("session.Resize: PTY SetSize OK — SIGWINCH should fire",
 			"sid", s.id.String(), "rows", rows, "cols", cols)
-	}
-	// Arm the wedge watcher only on a successful SetSize and only
-	// when the geometry actually changed. A no-op resize wouldn't
-	// trigger SIGWINCH, so there's no redraw to wait for.
-	if err == nil && (oldRows != rows || oldCols != cols) {
-		if s.wedge != nil {
-			s.wedge.ArmResize(oldRows, rows, cols, s.created)
-		}
 	}
 	return err
 }
@@ -1092,24 +998,6 @@ func (s *Session) Pump() {
 			filtered := filter.Process(data)
 			if len(filtered) > 0 {
 				_, _ = s.buf.Write(filtered)
-				// Feed the wedge watcher with the post-filter byte
-				// stream — the same bytes the client renders, so a
-				// CUP row that violates the geometry will be visible
-				// here too. QueryFilter only synthesises responses to
-				// terminal queries (DA/DSR); it doesn't strip CUPs.
-				if s.wedge != nil {
-					s.wedge.ObserveBytes(filtered, s.created)
-				}
-				// Fire the PTY byte observer (recovery sequencer's
-				// marker detection). Snapshot under the lock so a
-				// concurrent SetPTYByteObserver(nil) doesn't race
-				// with the dereference.
-				s.mu.Lock()
-				obs := s.ptyByteObserver
-				s.mu.Unlock()
-				if obs != nil {
-					obs(filtered)
-				}
 			}
 			if seqAware != nil {
 				// Watermark the highest sidecar seq we've durably

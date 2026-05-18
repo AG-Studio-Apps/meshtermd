@@ -99,52 +99,6 @@ const (
 	TypeGoodbye     = "Goodbye"
 	TypeEchoConfirm = "EchoConfirm"
 	TypeRTTNotify   = "RTTNotify"
-	// TypeReplay (client → server) and TypeReplayMark (server →
-	// client) implement the v0.8.0 scrollback-replay flow used by
-	// iOS clients on device rotation. The client asks for a rewind
-	// of the output stream so SwiftTerm can repaint scrollback at
-	// the new column count. The daemon emits a ReplayMark
-	// immediately (the client's "reset boundary"), then re-streams
-	// the requested byte window. Backward-compatible: daemons that
-	// don't recognise TypeReplay fall through to the default ignore
-	// branch, and clients time out their pending mark gracefully.
-	TypeReplay     = "Replay"
-	TypeReplayMark = "ReplayMark"
-
-	// TypeWedgeDetected (server → client) is emitted by the daemon
-	// when its per-session wedge watcher raises a candidate event
-	// (silent / cursor_row / vertical_walk — see
-	// internal/session/wedgewatch.go). Clients use it to surface a
-	// "Claude may be wedged — save & restart?" banner. Backward-
-	// compatible: clients that don't recognise the type ignore it.
-	TypeWedgeDetected = "WedgeDetected"
-
-	// TypeRecover (client → server) requests the daemon to drive the
-	// save-restart sequence on the session's PTY: inject Esc, then a
-	// natural-language save prompt + Enter, wait a grace window for
-	// any user-driven save (memory writes, file flushes), inject
-	// `/exit`, wait for the child to return to a shell prompt, then
-	// inject `claude --resume`. Stages are reported back via
-	// TypeRecoverProgress so the client banner can show progress.
-	TypeRecover = "Recover"
-
-	// TypeRecoverProgress (server → client) is the per-stage
-	// notification emitted during a Recover sequence. Stages:
-	// "started", "saving", "exiting", "restarting", "done", "error".
-	TypeRecoverProgress = "RecoverProgress"
-)
-
-// Recovery-progress stage constants — emitted on the wire as
-// RecoverProgress.Stage. Defined here so callers don't scatter raw
-// strings. The set is closed; new stages added here in lockstep with
-// the daemon-side sequencer.
-const (
-	RecoverStageStarted    = "started"
-	RecoverStageSaving     = "saving"
-	RecoverStageExiting    = "exiting"
-	RecoverStageRestarting = "restarting"
-	RecoverStageDone       = "done"
-	RecoverStageError      = "error"
 )
 
 // EchoState mirrors the tri-state value carried in EchoConfirm.
@@ -349,103 +303,10 @@ type EchoConfirm struct {
 	CanonMode bool   `cbor:"cm,omitempty"`
 }
 
-// Replay is sent by the client (typically iOS on rotation) to ask
-// the daemon to re-emit the output byte stream starting at
-// FromSeq. The daemon responds with a ReplayMark immediately (the
-// client's reset boundary), then re-streams the byte window via
-// the normal FrameTypeStdout pump. If FromSeq is older than the
-// ring buffer's TailSeq, the daemon clamps to TailSeq and reports
-// Trunc=true on the ReplayMark — older scrollback was already
-// dropped from the buffer and can't be recovered.
-//
-// Concurrent live PTY output continues to flow during the replay;
-// the client may receive overlapping seqs (the rewound window
-// plus any bytes the pump emitted between the rotation and the
-// replay frame's arrival). The client's terminal reset on
-// ReplayMark handles this — anything before the mark is
-// invalidated, anything after is what gets rendered.
-//
-// v0.8.0+ wire type. Old daemons fall through to the default
-// ignore branch in handleControlFrame; old clients never send it.
-type Replay struct {
-	T       string `cbor:"t"`
-	FromSeq uint64 `cbor:"from"`
-}
-
-// ReplayMark is the daemon's response to a Replay request, sent
-// IMMEDIATELY before any rewound bytes appear on the stdout
-// stream. The client uses receipt of this frame as the boundary
-// at which to reset its terminal state — everything before the
-// mark is invalidated, everything after is the post-reset
-// repaint.
-//
-//   - FromSeq echoes the seq the daemon actually honoured
-//     (post-clamp; equals the requested seq when nothing was
-//     truncated, equals the ring tail when it was).
-//   - Trunc is true when FromSeq was clamped from below — i.e.
-//     the client asked for older bytes than the ring still
-//     held. Clients can surface a "older scrollback dropped"
-//     hint or just log it.
-type ReplayMark struct {
-	T       string `cbor:"t"`
-	FromSeq uint64 `cbor:"from"`
-	Trunc   bool   `cbor:"trunc,omitempty"`
-}
-
 // Goodbye is the last message either side sends before closing.
 type Goodbye struct {
 	T      string `cbor:"t"`
 	Reason string `cbor:"reason"`
-}
-
-// WedgeDetected is the daemon → client notification fired when the
-// wedge watcher raises a candidate event. The client uses it to
-// surface a recovery banner. All counters are cumulative for the
-// session; the same fields appear in the on-disk JSONL records so
-// operators see consistent values across surfaces.
-//
-// Kind is one of "silent" / "cursor_row" / "vertical_walk", matching
-// the wedge_type values in wedgewatch.go. Future kinds may be added
-// without bumping the protocol — clients should treat unknown kinds
-// as generic wedges.
-type WedgeDetected struct {
-	T                  string `cbor:"t"`
-	Kind               string `cbor:"k"`
-	SessionAgeSec      int64  `cbor:"age"`
-	TotalOutBytes      uint64 `cbor:"tob"`
-	OldRows            uint16 `cbor:"or"`
-	NewRows            uint16 `cbor:"nr"`
-	ResizesObserved    uint64 `cbor:"ro"`
-	SilentWedges       uint64 `cbor:"sw"`
-	CursorWedges       uint64 `cbor:"cw"`
-	VerticalWalkWedges uint64 `cbor:"vw"`
-	// CudObserved is only meaningful for kind=vertical_walk; zero
-	// otherwise. CursorRowSeen is only meaningful for kind=cursor_row.
-	CudObserved   int `cbor:"cud,omitempty"`
-	CursorRowSeen int `cbor:"crs,omitempty"`
-}
-
-// Recover requests the daemon-side save-restart sequencer. The
-// daemon owns the actual byte injection / timing; the client just
-// asks for the sequence to run. SavePrompt is optional — if empty
-// the daemon uses its default natural-language save instruction.
-// GraceMillis is the upper bound on the save window (default 30s);
-// the sequencer may complete sooner if it observes an alt-screen
-// exit on the PTY output stream.
-type Recover struct {
-	T           string `cbor:"t"`
-	SavePrompt  string `cbor:"sp,omitempty"`
-	GraceMillis uint32 `cbor:"gms,omitempty"`
-}
-
-// RecoverProgress is the per-stage notification stream emitted by
-// the daemon while the Recover sequence is in flight. Detail is a
-// free-form short string the client may surface verbatim in the
-// banner (e.g. "Waiting up to 30s for save…").
-type RecoverProgress struct {
-	T      string `cbor:"t"`
-	Stage  string `cbor:"s"`
-	Detail string `cbor:"d,omitempty"`
 }
 
 // RTTNotify is sent periodically by the daemon (every ~5 seconds) on
@@ -474,20 +335,6 @@ func MarshalPing(m Ping) ([]byte, error)             { m.T = TypePing; return cb
 func MarshalPong(m Pong) ([]byte, error)             { m.T = TypePong; return cborMarshal(m) }
 func MarshalGoodbye(m Goodbye) ([]byte, error)       { m.T = TypeGoodbye; return cborMarshal(m) }
 func MarshalRTTNotify(m RTTNotify) ([]byte, error) { m.T = TypeRTTNotify; return cborMarshal(m) }
-func MarshalReplay(m Replay) ([]byte, error)       { m.T = TypeReplay; return cborMarshal(m) }
-func MarshalReplayMark(m ReplayMark) ([]byte, error) {
-	m.T = TypeReplayMark
-	return cborMarshal(m)
-}
-func MarshalWedgeDetected(m WedgeDetected) ([]byte, error) {
-	m.T = TypeWedgeDetected
-	return cborMarshal(m)
-}
-func MarshalRecover(m Recover) ([]byte, error) { m.T = TypeRecover; return cborMarshal(m) }
-func MarshalRecoverProgress(m RecoverProgress) ([]byte, error) {
-	m.T = TypeRecoverProgress
-	return cborMarshal(m)
-}
 func MarshalEchoConfirm(m EchoConfirm) ([]byte, error) {
 	m.T = TypeEchoConfirm
 	return cborMarshal(m)

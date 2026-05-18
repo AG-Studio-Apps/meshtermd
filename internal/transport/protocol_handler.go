@@ -204,40 +204,6 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 		return protocol.WriteTaggedFrame(ctrl, t, body)
 	}
 
-	// Wedge push: the wedge watcher fires a callback on every
-	// detection; we translate to a protocol.WedgeDetected frame and
-	// send it on the existing control stream. Installed only for
-	// exclusive attaches — readonly / passive clients shouldn't
-	// trigger recovery UI in the user's app, and only the exclusive
-	// client owns the resize path that produces wedge candidates in
-	// the first place. Cleared on attach exit (deferred below) so a
-	// re-attach gets a fresh closure pointed at the new stream.
-	if attachMode == session.AttachExclusive {
-		sess.OnWedge(func(n session.WedgeNotice) {
-			body, err := protocol.MarshalWedgeDetected(protocol.WedgeDetected{
-				Kind:               n.Kind,
-				SessionAgeSec:      n.SessionAgeSec,
-				TotalOutBytes:      n.TotalOutBytes,
-				OldRows:            n.OldRows,
-				NewRows:            n.NewRows,
-				ResizesObserved:    n.ResizesObserved,
-				SilentWedges:       n.SilentWedges,
-				CursorWedges:       n.CursorWedges,
-				VerticalWalkWedges: n.VerticalWalkWedges,
-				CudObserved:        n.CudObserved,
-				CursorRowSeen:      n.CursorRowSeen,
-			})
-			if err != nil {
-				return
-			}
-			// Write errors are silent — the stream may be tearing
-			// down. The wedge JSONL on disk is the durable record;
-			// the client push is a UX hint.
-			_ = writeFrame(protocol.FrameTypeControl, body)
-		})
-		defer sess.OnWedge(nil)
-	}
-
 	resolvedMode := protocol.AttachModeExclusive
 	switch attachMode {
 	case session.AttachReadonly:

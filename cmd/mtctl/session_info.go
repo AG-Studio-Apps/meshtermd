@@ -106,42 +106,8 @@ func runSessionInfo(args []string) int {
 			fmt.Fprintf(w, "  client #%d\t%s\n", i+1, m)
 		}
 	}
-	// Wedge-watcher cumulative counters, mirroring the daemon-side
-	// session-info renderer. Hidden until the first resize lands so
-	// the common-case output stays terse.
-	if match.WedgeResizesObserved > 0 {
-		fmt.Fprintln(w, "Wedge watch\t")
-		fmt.Fprintf(w, "  Output bytes\t%s\n", formatBytes(match.WedgeTotalOutBytes))
-		fmt.Fprintf(w, "  Resizes seen\t%d\n", match.WedgeResizesObserved)
-		fmt.Fprintf(w, "  Wedges (silent / cursor_row / vertical_walk)\t%d / %d / %d\n",
-			match.WedgeSilentWedges,
-			match.WedgeCursorWedges,
-			match.WedgeVerticalWalkWedges)
-	}
 	_ = w.Flush()
 	return exitOK
-}
-
-// formatBytes renders a byte count with an SI suffix when large enough
-// to make raw bytes hard to scan. Mirrors the daemon-side renderer so
-// both `meshtermd session-info` and `mtctl session-info` produce
-// identical wedge-watch output.
-func formatBytes(n uint64) string {
-	const (
-		kb = 1000
-		mb = kb * 1000
-		gb = mb * 1000
-	)
-	switch {
-	case n >= gb:
-		return fmt.Sprintf("%.1f GB", float64(n)/gb)
-	case n >= mb:
-		return fmt.Sprintf("%.1f MB", float64(n)/mb)
-	case n >= kb:
-		return fmt.Sprintf("%.1f KB", float64(n)/kb)
-	default:
-		return fmt.Sprintf("%d B", n)
-	}
 }
 
 // pickSession scans `sessions` for one matching `selector`. Match

@@ -497,3 +497,90 @@ func TestProtocolHandlerReplayTruncatesWhenOlderThanTail(t *testing.T) {
 		t.Errorf("FromSeq = 0; want non-zero (tail-clamped to current ring tail)")
 	}
 }
+
+// drainCountReplayMarks reads frames from `stream` for the given
+// duration and returns the total number of ReplayMark control frames
+// observed. Used by the Replay rate-limit test where we care about
+// "how many of N requests were served" rather than the marks'
+// contents.
+func drainCountReplayMarks(t *testing.T, stream *quic.Stream, window time.Duration) int {
+	t.Helper()
+	count := 0
+	deadline := time.Now().Add(window)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		if err := stream.SetReadDeadline(time.Now().Add(remaining)); err != nil {
+			t.Fatalf("SetReadDeadline: %v", err)
+		}
+		frameType, body, err := protocol.ReadTaggedFrame(stream)
+		if err != nil {
+			break // deadline or close
+		}
+		if frameType != protocol.FrameTypeControl {
+			continue
+		}
+		ty, perr := protocol.PeekType(body)
+		if perr != nil {
+			continue
+		}
+		if ty == protocol.TypeReplayMark {
+			count++
+		}
+	}
+	_ = stream.SetReadDeadline(time.Time{})
+	return count
+}
+
+func TestProtocolHandlerReplayRateLimited(t *testing.T) {
+	t.Parallel()
+	h := newHandlerHarness(t)
+	defer h.cleanup()
+
+	tok, err := h.reg.IssueAttachToken(h.sess.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, stream, ack := dialAndAttach(t, h, h.sess.ID(), tok)
+	defer conn.CloseWithError(0, "")
+	defer stream.Close()
+	if !ack.OK {
+		t.Fatalf("attach failed: %s %s", ack.Err, ack.Msg)
+	}
+
+	h.pty.push([]byte("seed"))
+	time.Sleep(50 * time.Millisecond)
+
+	// Send five Replay requests back-to-back. Only the first should
+	// be served — the others fall inside the replayMinInterval
+	// (1 second) and are silently dropped. Drain a window shorter
+	// than the interval so the rate limit is still in effect when
+	// we count marks.
+	req, err := protocol.MarshalReplay(protocol.Replay{FromSeq: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if werr := protocol.WriteTaggedFrame(stream, protocol.FrameTypeControl, req); werr != nil {
+			t.Fatalf("write Replay #%d: %v", i, werr)
+		}
+	}
+
+	got := drainCountReplayMarks(t, stream, 600*time.Millisecond)
+	if got != 1 {
+		t.Fatalf("rate limit didn't engage: got %d ReplayMarks, want 1", got)
+	}
+
+	// Confirm that AFTER the interval elapses, a fresh Replay is
+	// served — proves the rate limit isn't permanent for the attach.
+	time.Sleep(replayMinInterval + 100*time.Millisecond)
+	if werr := protocol.WriteTaggedFrame(stream, protocol.FrameTypeControl, req); werr != nil {
+		t.Fatalf("write post-interval Replay: %v", werr)
+	}
+	got = drainCountReplayMarks(t, stream, 400*time.Millisecond)
+	if got != 1 {
+		t.Fatalf("post-interval Replay not served: got %d ReplayMarks, want 1", got)
+	}
+}

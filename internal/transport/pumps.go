@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"time"
 
 	"github.com/quic-go/quic-go"
 
@@ -80,6 +81,10 @@ func outputPump(ctx context.Context, sess *session.Session, s *quic.Stream, writ
 // QUIC's idle timeout. We watch ctx in a sidecar (audit F11).
 func readPump(ctx context.Context, sess *session.Session, s *quic.Stream, write frameWriter, mode session.AttachMode) error {
 	cancelOnDone(ctx, func() { s.CancelRead(0) })
+	// Per-attach mutable state for handleControlFrame. Lives on this
+	// goroutine's stack; readPump processes frames serially so no
+	// locking is required.
+	var st attachState
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -102,7 +107,7 @@ func readPump(ctx context.Context, sess *session.Session, s *quic.Stream, write 
 				}
 			}
 		case protocol.FrameTypeControl:
-			if err := handleControlFrame(sess, body, write, mode); err != nil {
+			if err := handleControlFrame(sess, body, write, mode, &st); err != nil {
 				return err
 			}
 		default:
@@ -115,6 +120,30 @@ func readPump(ctx context.Context, sess *session.Session, s *quic.Stream, write 
 	}
 }
 
+// attachState holds per-attach mutable state threaded through
+// handleControlFrame. Allocated on readPump's stack; readPump
+// processes frames serially, so no synchronisation is required.
+//
+// Today only the Replay rate limiter uses this; future per-attach
+// counters (Resize coalescing, Recover throttle) can land here too.
+type attachState struct {
+	// lastReplayAt is the wall-clock time the most recent Replay
+	// request from this attach was served (zero-value means "none
+	// yet"). The Replay handler refuses a follow-up within
+	// replayMinInterval to defend against bandwidth amplification —
+	// each Replay can re-emit up to RingBuffer capacity (4 MiB) of
+	// downlink data from a ~30-byte uplink frame.
+	lastReplayAt time.Time
+}
+
+// replayMinInterval is the minimum wall-clock gap the daemon enforces
+// between successive Replay requests on the same attach. Legitimate
+// use cases (orientation change → reflow on iOS) fire one Replay per
+// device rotation, far below this rate. Anything faster is treated
+// as a flood attempt and silently dropped (matches the posture for
+// other policy violations — readonly Stdin, readonly Resize, etc.).
+const replayMinInterval = 1 * time.Second
+
 // handleControlFrame dispatches one CBOR control message read off
 // the single stream. Mirrors the previous controlPump body, except
 // outbound responses (Pong) go through the shared frameWriter so
@@ -124,7 +153,7 @@ func readPump(ctx context.Context, sess *session.Session, s *quic.Stream, write 
 // the ring buffer below the ack point yet (the buffer's FIFO drop
 // policy already bounds memory). Future versions may use Ack to
 // keep the buffer larger when network is healthy and clients keep up.
-func handleControlFrame(sess *session.Session, body []byte, write frameWriter, mode session.AttachMode) error {
+func handleControlFrame(sess *session.Session, body []byte, write frameWriter, mode session.AttachMode, st *attachState) error {
 	t, err := protocol.PeekType(body)
 	if err != nil {
 		return err
@@ -186,6 +215,21 @@ func handleControlFrame(sess *session.Session, body []byte, write frameWriter, m
 		// pump uses. Live PTY output continues to flow through the
 		// pump concurrently — the client's reset on ReplayMark
 		// handles any seq overlap by discarding pre-mark state.
+		//
+		// Pre-v1.0 hardening (audit Finding M5): an authenticated
+		// peer can otherwise flood TypeReplay{FromSeq:0} and force
+		// the daemon to re-emit up to RingBuffer capacity (4 MiB)
+		// per ~30-byte uplink — ~140,000× bandwidth amplification.
+		// Throttle to one Replay per second per attach; silently
+		// drop the excess (codebase convention for policy drops).
+		now := time.Now()
+		if !st.lastReplayAt.IsZero() && now.Sub(st.lastReplayAt) < replayMinInterval {
+			slog.Debug("replay: dropped (rate limit)",
+				"sid", sess.ID().String(),
+				"since_last_ms", now.Sub(st.lastReplayAt).Milliseconds())
+			return nil
+		}
+		st.lastReplayAt = now
 		var m protocol.Replay
 		if err := protocol.StrictDecMode.Unmarshal(body, &m); err != nil {
 			return nil // malformed; ignore rather than tear down

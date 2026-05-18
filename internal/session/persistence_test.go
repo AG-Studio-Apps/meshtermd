@@ -98,6 +98,50 @@ func TestSaveToAndLoadPersistedRoundTrip(t *testing.T) {
 	}
 }
 
+// TestWedgeWatcherInitialisedOnRestore pins a regression: an early
+// version of LoadPersisted constructed Session via a direct struct
+// literal that omitted the `wedge` field. Restored sessions ended up
+// with `wedge == nil`, and every nil-guarded call site (Resize →
+// ArmResize, Pump → ObserveBytes, OnWedge subscriber install)
+// silently no-opped. The result: any session that survived a daemon
+// restart lost detection for the rest of its lifetime — visible to
+// operators only as "session-info shows zero resizes despite many
+// resize control frames in journalctl."
+func TestWedgeWatcherInitialisedOnRestore(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	original := makePersistedSession(t, []byte("y"))
+	if err := original.SaveTo(dir); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+
+	reg := NewRegistry(0, time.Hour, time.Hour, 0)
+	if _, err := LoadPersisted(dir, reg, nullLogger()); err != nil {
+		t.Fatalf("LoadPersisted: %v", err)
+	}
+	restored, err := reg.Lookup(original.ID())
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+
+	// Restored sessions have lazy PTY (pty == nil until first
+	// attach), so calling Resize from a test panics on nil
+	// pty.SetSize. Drop into package-internal field access for the
+	// proof: the watcher must be a live struct, not nil. Behaviour
+	// is then exercised by feeding bytes directly — that path is
+	// PTY-independent, increments totalOutBytes, and proves the
+	// watcher is functional end-to-end.
+	if restored.wedge == nil {
+		t.Fatal("restored session has nil wedge watcher — " +
+			"regression: loadSessionFromDir must initialise it")
+	}
+	restored.wedge.ObserveBytes([]byte("xxxx"), restored.Created())
+	total, _, _, _, _ := restored.WedgeSnapshot()
+	if total != 4 {
+		t.Fatalf("watcher should count bytes from ObserveBytes; got %d, want 4", total)
+	}
+}
+
 // TestLastSidecarSeqRoundTrip checks that Session.lastSidecarSeq is
 // persisted to meta.cbor and restored across LoadPersisted — the
 // daemon needs this watermark to send FrameResume(from_seq) on

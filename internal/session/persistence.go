@@ -276,6 +276,16 @@ func loadSessionFromDir(dir string, now time.Time, logger *slog.Logger) (*Sessio
 		lastSnapshotSeq:  meta.HeadSeq,
 		lastSidecarSeq:   meta.LastConsumedSidecarSeq,
 		restoredFromDisk: true,
+		// Without this the wedge watcher is nil on restored sessions
+		// and every nil-guarded call site (Resize → ArmResize, Pump →
+		// ObserveBytes, OnWedge subscriber install) silently no-ops.
+		// Any session that survives a daemon restart loses detection
+		// for the rest of its lifetime. The watcher is per-Session
+		// state by design (no on-disk persistence of counters — those
+		// are diagnostic, not durable) so a fresh one is correct: we
+		// start counting resizes / bytes / wedges from the moment the
+		// session is rehydrated, not retroactively.
+		wedge:            newWedgeWatcher(),
 	}
 	return s, nil
 }

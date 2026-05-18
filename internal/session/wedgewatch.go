@@ -530,22 +530,6 @@ func (s *csiScanner) feed(buf []byte, maxRows uint16) int {
 				switch b {
 				case 'H', 'f':
 					row, _ := parseCUPParams(s.params)
-					// Frame-start reset. Ink (and most alt-screen
-					// renderers) starts every frame by positioning the
-					// cursor at the top. A CUP / HVP to row 1 is the
-					// canonical marker; resetting cudAccumulated here
-					// keeps the vertical_walk signal per-frame rather
-					// than cumulative-across-frames. Without this, a
-					// healthy renderer that draws N frames in the 10s
-					// scan window (welcome screen + spinner ticks +
-					// status bar updates) accumulates ~N×rows of
-					// downward walk and false-positives on the
-					// (rows-1)-or-greater threshold. With this, only
-					// a SINGLE frame walking past its viewport — the
-					// actual wedge fingerprint — trips.
-					if row <= 1 {
-						s.cudAccumulated = 0
-					}
 					if row > int(maxRows) {
 						s.state = csiNone
 						s.params = s.params[:0]
@@ -555,6 +539,17 @@ func (s *csiScanner) feed(buf []byte, maxRows uint16) int {
 					// CUD — Cursor Down by Ps lines (default 1).
 					// Accumulate so callers can detect a redraw that
 					// walks more vertical space than the new viewport.
+					//
+					// NO per-frame reset on row=1 CUP. v0.9.7 added one
+					// to avoid false-positives on healthy multi-frame
+					// renders, but field-tested as too aggressive:
+					// Claude emits `\x1b[H` mid-render more often than
+					// modelled (status updates, cursor positioning
+					// between content blocks), so every such CUP reset
+					// the counter and silenced real wedges entirely.
+					// Better an occasional false-positive the user
+					// dismisses than a missed wedge with no banner.
+					// Reverted in v0.9.8.
 					s.cudAccumulated += parseSingleParam(s.params, 1)
 				}
 				s.state = csiNone

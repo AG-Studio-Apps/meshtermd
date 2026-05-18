@@ -302,7 +302,22 @@ func (c *Conn) handleStdout(firstSeq uint64, flags byte, payload []byte) {
 		// The dropped span is [lastAppendedSeq, firstSeq) — count
 		// those bytes for the Pump to apply via AdvanceWithGap on its
 		// next iteration.
-		c.pendingGapBytes += firstSeq - c.lastAppendedSeq
+		//
+		// Pre-v1.0 hardening: guard against a malicious or buggy
+		// sidecar sending firstSeq < lastAppendedSeq. Without this
+		// the subtraction underflows to a huge uint64, which then
+		// drives RingBuffer.AdvanceWithGap to clear the entire ring
+		// and skew headSeq forever — a session-stuck-truncated
+		// state every reattach observes. Drop the flag on
+		// underflow; the sidecar is reporting impossible state.
+		if firstSeq >= c.lastAppendedSeq {
+			c.pendingGapBytes += firstSeq - c.lastAppendedSeq
+		} else if c.logger != nil {
+			c.logger.Warn("ptyclient.trunc_underflow",
+				"first_seq", firstSeq,
+				"last_appended_seq", c.lastAppendedSeq,
+			)
+		}
 	}
 	if !c.seqValid {
 		// First FrameStdout we've ever seen: anchor both watermarks

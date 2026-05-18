@@ -295,6 +295,38 @@ func TestConnTruncFlagSurfacesViaConsumeTrunc(t *testing.T) {
 	}
 }
 
+func TestConnTruncFlagWithUnderflowFirstSeqIgnored(t *testing.T) {
+	// A malicious or buggy sidecar sending StdoutFlagTruncBefore with
+	// firstSeq < lastAppendedSeq must NOT underflow the gap counter.
+	// The pre-v1.0 guard drops the trunc-flag accounting in this case
+	// rather than letting RingBuffer.AdvanceWithGap rotate the entire
+	// ring against a uint64-underflowed value.
+	conn, sidecar := pipePair(t)
+	go func() {
+		// Establish lastAppendedSeq = 100.
+		_ = ptysidecar.WriteFrame(sidecar, ptysidecar.FrameStdout,
+			ptysidecar.EncodeStdoutBody(10, 0, []byte("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"))) // 90 bytes → ends at seq 100
+		// Now send a trunc flag with firstSeq=50 (< lastAppendedSeq=100).
+		// Healthy sidecars never produce this; the daemon should
+		// observe gap=0 (drop, not underflow).
+		_ = ptysidecar.WriteFrame(sidecar, ptysidecar.FrameStdout,
+			ptysidecar.EncodeStdoutBody(50, ptysidecar.StdoutFlagTruncBefore, []byte("yyyy")))
+	}()
+	buf := make([]byte, 256)
+	deadline := time.Now().Add(2 * time.Second)
+	var got []byte
+	for time.Now().Before(deadline) && len(got) < 94 {
+		n, err := conn.Read(buf)
+		if err != nil && err != io.EOF {
+			t.Fatalf("Read err: %v", err)
+		}
+		got = append(got, buf[:n]...)
+	}
+	if gap := conn.ConsumeTrunc(); gap != 0 {
+		t.Errorf("ConsumeTrunc on backwards-seq trunc: want 0 (underflow dropped), got %d", gap)
+	}
+}
+
 func TestConnSendResumeEncodesFrameResume(t *testing.T) {
 	conn, sidecar := pipePair(t)
 	done := make(chan struct{})

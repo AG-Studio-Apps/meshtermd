@@ -3,6 +3,7 @@ package session
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"log/slog"
@@ -11,6 +12,23 @@ import (
 	"sync"
 	"time"
 )
+
+// wedgeCaptureBytesEnvVar opts the watcher into recording the
+// post-resize PTY byte stream in each JSONL record (base64-encoded).
+// Off by default because the captured bytes can include rendered
+// terminal content — application UI, chat messages, command output —
+// and the JSONL is otherwise de-identified-by-construction. Set
+// `MESHTERMD_WEDGE_CAPTURE_BYTES=1` in the daemon's env to enable for
+// detection-refinement data collection. Sample the JSONL contents
+// before sharing externally if the env var is on.
+const wedgeCaptureBytesEnvVar = "MESHTERMD_WEDGE_CAPTURE_BYTES"
+
+// wedgeCaptureBufferCap caps the rolling buffer of post-resize bytes
+// the watcher retains for inclusion in a JSONL record on a fire.
+// 4 KiB is enough to span a single typical Claude redraw frame plus
+// some leading context. Per-session memory cost is negligible; we
+// trim from the front as new bytes arrive past the cap.
+const wedgeCaptureBufferCap = 4 * 1024
 
 // wedgeWatcher detects the "Claude TUI ignored SIGWINCH" failure mode
 // non-invasively from the daemon's outbound PTY pipeline. The bug
@@ -121,6 +139,17 @@ type wedgeWatcher struct {
 	// time.Now().Before(suppressUntil).
 	suppressUntil time.Time
 
+	// captureBytes mirrors the MESHTERMD_WEDGE_CAPTURE_BYTES env at
+	// construction time so the hot ObserveBytes path doesn't pay the
+	// cost of an os.Getenv every chunk. When true, captureBuffer
+	// accumulates post-ArmResize bytes (capped at wedgeCaptureBufferCap)
+	// and the watcher includes a base64 slice in every JSONL record
+	// on a fire. Used for detection-refinement data collection; off
+	// by default because the captured bytes can include rendered
+	// terminal content.
+	captureBytes  bool
+	captureBuffer []byte
+
 	// CSI scanner state — feed continues across chunks. Only mutated
 	// inside ObserveBytes (which holds the lock).
 	scanner csiScanner
@@ -180,7 +209,10 @@ const verticalWalkWindow = 800 * time.Millisecond
 func newWedgeWatcher() *wedgeWatcher {
 	var b [4]byte
 	_, _ = rand.Read(b[:])
-	return &wedgeWatcher{anonID: hex.EncodeToString(b[:])}
+	return &wedgeWatcher{
+		anonID:       hex.EncodeToString(b[:]),
+		captureBytes: os.Getenv(wedgeCaptureBytesEnvVar) == "1",
+	}
 }
 
 // SetLogPath wires the JSONL output destination. Idempotent; safe to
@@ -239,6 +271,11 @@ func (w *wedgeWatcher) ArmResize(oldRows, newRows, newCols uint16, sessionCreate
 	// vertical_walk signal would false-positive on the first resize
 	// that happens after the cumulative count crossed the threshold.
 	w.scanner.reset()
+	// Reset the capture buffer too: each resize is its own diagnostic
+	// frame. Allocated lazily on first append in ObserveBytes.
+	if w.captureBytes {
+		w.captureBuffer = w.captureBuffer[:0]
+	}
 	ch := make(chan struct{})
 	w.pendingTimerCh = ch
 	w.mu.Unlock()
@@ -337,6 +374,20 @@ func (w *wedgeWatcher) ObserveBytes(data []byte, sessionCreated time.Time) {
 		w.mu.Unlock()
 		return
 	}
+	// Capture-bytes diagnostic mode: accumulate the raw post-resize
+	// byte stream so we can inspect what Claude actually emitted when
+	// a wedge fires. Sliding window — keep the most recent
+	// wedgeCaptureBufferCap bytes so a long pre-fire history doesn't
+	// blow the cap. Skipped entirely when the env var is off, so the
+	// hot path stays zero-allocation in the default release.
+	if w.captureBytes {
+		w.captureBuffer = append(w.captureBuffer, data...)
+		if len(w.captureBuffer) > wedgeCaptureBufferCap {
+			// Trim from the front, keep the tail (most recent context).
+			w.captureBuffer = append(w.captureBuffer[:0],
+				w.captureBuffer[len(w.captureBuffer)-wedgeCaptureBufferCap:]...)
+		}
+	}
 	// Only scan when the new geometry is strictly smaller — that's the
 	// only configuration where a stale CUP row is provably illegal.
 	// (A larger window would still accept old row numbers as valid.)
@@ -413,6 +464,15 @@ func (w *wedgeWatcher) ObserveBytes(data []byte, sessionCreated time.Time) {
 	w.wedgeRaised = true
 	cursorWedges := w.cursorWedges
 	verticalWedges := w.verticalWalkWedges
+	// Snapshot the capture buffer under the lock so the emit path
+	// outside the lock works on a stable slice. Off when capture
+	// is disabled — keeps the JSONL field empty and out of the
+	// way (`omitempty` on the struct tag handles serialisation).
+	var captureSnapshot []byte
+	if w.captureBytes && len(w.captureBuffer) > 0 {
+		captureSnapshot = make([]byte, len(w.captureBuffer))
+		copy(captureSnapshot, w.captureBuffer)
+	}
 	w.mu.Unlock()
 
 	rec := wedgeEvent{
@@ -432,6 +492,9 @@ func (w *wedgeWatcher) ObserveBytes(data []byte, sessionCreated time.Time) {
 		CudObserved:        cudObserved,
 		MsSinceResize:      int64(time.Since(w.resizeAt) / time.Millisecond),
 		Note:               note,
+	}
+	if captureSnapshot != nil {
+		rec.RecentOutputB64 = base64.StdEncoding.EncodeToString(captureSnapshot)
 	}
 	w.emit(rec, logPath)
 }
@@ -535,6 +598,17 @@ type wedgeEvent struct {
 	MsSinceResize int64 `json:"ms_since_resize,omitempty"`
 
 	Note string `json:"note,omitempty"`
+
+	// RecentOutputB64 is the base64-encoded post-resize byte stream
+	// captured up to the moment of firing, when the watcher was
+	// constructed with MESHTERMD_WEDGE_CAPTURE_BYTES=1. Used for
+	// detection-refinement analysis — a real wedge looks like a
+	// single ~N-row CUD burst, scrollback replay looks like rapid
+	// runs of CUDs interleaved with cell content, healthy multi-
+	// frame renders look like multiple home-prefixed walks. The
+	// field is `omitempty`, so default deployments emit no bytes
+	// and the JSONL stays de-identified.
+	RecentOutputB64 string `json:"recent_output_b64,omitempty"`
 }
 
 // csiScanner is a tiny resumable parser for CSI sequences. We track

@@ -2,6 +2,8 @@ package session
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -594,6 +596,57 @@ func TestWedgeWatcher_SuppressUntil_BlocksSilentDeadline(t *testing.T) {
 	events := readEvents(t, logPath)
 	if len(events) != 0 {
 		t.Fatalf("silent must be suppressed while SuppressUntil active; got %+v", events)
+	}
+}
+
+func TestWedgeWatcher_CaptureBytes_IncludedOnFireWhenEnvSet(t *testing.T) {
+	// MESHTERMD_WEDGE_CAPTURE_BYTES=1 → JSONL record carries a
+	// base64-encoded slice of post-resize bytes. Used for detection-
+	// refinement collection. Default (env unset) leaves the field
+	// empty so the JSONL stays de-identified.
+	t.Setenv("MESHTERMD_WEDGE_CAPTURE_BYTES", "1")
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "wedge-events.jsonl")
+	w := newWedgeWatcher()
+	w.SetLogPath(logPath)
+	created := time.Now()
+	w.ArmResize(44, 23, 90, created)
+	// Send a CUP > new_rows so we deterministically fire cursor_row.
+	w.ObserveBytes([]byte("\x1b[40;1Hbody-content"), created)
+
+	events := readEvents(t, logPath)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event; got %d", len(events))
+	}
+	if events[0].RecentOutputB64 == "" {
+		t.Fatalf("recent_output_b64 must be populated when env is set")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(events[0].RecentOutputB64)
+	if err != nil {
+		t.Fatalf("recent_output_b64 must decode: %v", err)
+	}
+	if !bytes.Contains(decoded, []byte("body-content")) {
+		t.Fatalf("captured bytes should include the post-resize payload; got %q", decoded)
+	}
+}
+
+func TestWedgeWatcher_CaptureBytes_OmittedByDefault(t *testing.T) {
+	// Default deployment (env unset) emits no bytes.
+	t.Setenv("MESHTERMD_WEDGE_CAPTURE_BYTES", "")
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "wedge-events.jsonl")
+	w := newWedgeWatcher()
+	w.SetLogPath(logPath)
+	created := time.Now()
+	w.ArmResize(44, 23, 90, created)
+	w.ObserveBytes([]byte("\x1b[40;1H"), created)
+
+	events := readEvents(t, logPath)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event; got %d", len(events))
+	}
+	if events[0].RecentOutputB64 != "" {
+		t.Fatalf("recent_output_b64 must be empty by default; got %q", events[0].RecentOutputB64)
 	}
 }
 

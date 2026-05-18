@@ -552,7 +552,15 @@ func (w *wedgeWatcher) emit(rec wedgeEvent, logPath string) {
 	)
 	if logPath != "" {
 		if line, err := json.Marshal(rec); err == nil {
-			f, ferr := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+			// Owner-only mode. Pre-v1.0 hardening: match every other
+			// daemon-private artefact (cert key, scrollback.bin,
+			// meta.cbor, sidecar.sock, ipc socket, pidfile) which
+			// all live at 0o600 inside the 0o700 state dir. The
+			// JSONL is read only by `meshtermd wedge-report` running
+			// as the daemon uid; nothing else should ever open it.
+			// Existing files keep their pre-existing mode (this only
+			// affects first-write).
+			f, ferr := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 			if ferr == nil {
 				_, _ = f.Write(line)
 				_, _ = f.Write([]byte{'\n'})

@@ -34,6 +34,18 @@ const defaultGrace = 30 * time.Second
 // long enough that any reasonable shell startup will have settled.
 const shellSettleDelay = 3 * time.Second
 
+// submitSettleDelay is the gap between writing the body of a Claude
+// prompt and writing the trailing '\r'. Without this delay an
+// observed failure mode is Ink's input handler processing the
+// carriage return before the full prompt body has landed in the
+// text field — Enter fires on an empty / partial buffer, Claude
+// silently drops it, and the user is left with unsubmitted text
+// they have to send manually. 100ms is more than enough for the
+// prompt bytes to traverse PTY → terminal → Ink's stdin reader on
+// any plausible machine, and it's imperceptible inside a 30s save
+// window.
+const submitSettleDelay = 100 * time.Millisecond
+
 // runRecover drives the save-restart sequence on a session's PTY.
 //
 // Wire flow:
@@ -105,11 +117,17 @@ func runRecover(
 	}
 
 	// Save prompt + Enter. The trailing '\r' submits the line in raw
-	// mode (Claude's stdin doesn't translate \n → \r).
+	// mode (Claude's stdin doesn't translate \n → \r). The
+	// submitSettleDelay between the body and the carriage return is
+	// load-bearing — see the constant's docstring.
 	emit(protocol.RecoverStageSaving,
 		fmt.Sprintf("Waiting up to %s for save…", roundDuration(grace)))
 	if err := injectAndCheckCtx(ctx, sess, []byte(prompt)); err != nil {
 		emit(protocol.RecoverStageError, "save prompt write failed: "+err.Error())
+		return
+	}
+	if !sleepCtx(ctx, submitSettleDelay) {
+		emit(protocol.RecoverStageError, "cancelled before save prompt submit")
 		return
 	}
 	if err := injectAndCheckCtx(ctx, sess, []byte{'\r'}); err != nil {

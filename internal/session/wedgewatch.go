@@ -530,6 +530,22 @@ func (s *csiScanner) feed(buf []byte, maxRows uint16) int {
 				switch b {
 				case 'H', 'f':
 					row, _ := parseCUPParams(s.params)
+					// Frame-start reset. Ink (and most alt-screen
+					// renderers) starts every frame by positioning the
+					// cursor at the top. A CUP / HVP to row 1 is the
+					// canonical marker; resetting cudAccumulated here
+					// keeps the vertical_walk signal per-frame rather
+					// than cumulative-across-frames. Without this, a
+					// healthy renderer that draws N frames in the 10s
+					// scan window (welcome screen + spinner ticks +
+					// status bar updates) accumulates ~N×rows of
+					// downward walk and false-positives on the
+					// (rows-1)-or-greater threshold. With this, only
+					// a SINGLE frame walking past its viewport — the
+					// actual wedge fingerprint — trips.
+					if row <= 1 {
+						s.cudAccumulated = 0
+					}
 					if row > int(maxRows) {
 						s.state = csiNone
 						s.params = s.params[:0]

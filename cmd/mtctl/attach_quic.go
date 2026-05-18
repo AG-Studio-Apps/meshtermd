@@ -50,6 +50,12 @@ func dialDaemonQUIC(
 		// rules out post-quantum hybrid here — the daemon's
 		// internal/transport/server.go has the rationale.
 		CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256},
+		// Do NOT add a ClientSessionCache here. Go's TLS 1.3 skips
+		// VerifyPeerCertificate on a resumed handshake, which would
+		// silently bypass the fingerprint pin below. The server sets
+		// SessionTicketsDisabled defensively, but leaving this nil
+		// keeps the client side honest too. If you ever need session
+		// reuse, also re-run the fingerprint check in VerifyConnection.
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			if len(rawCerts) == 0 {
 				return errors.New("server presented no certificate")

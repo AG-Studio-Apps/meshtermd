@@ -118,6 +118,14 @@ func New(cfg Config) (*Server, error) {
 		// identified by fingerprint not name. Refuse any handshake
 		// that tries to negotiate down from TLS 1.3.
 		ClientAuth: tls.NoClientCert,
+		// Disable TLS session tickets. Go's TLS 1.3 implementation does
+		// not invoke VerifyPeerCertificate on a resumed session — the
+		// server's leaf cert isn't presented again. The client side
+		// (cmd/mtctl/attach_quic.go) has no ClientSessionCache today, so
+		// resumption is already inhibited; this server-side flag closes
+		// the latent path that a future client-cache addition would
+		// reopen, bypassing fingerprint pinning on resumption.
+		SessionTicketsDisabled: true,
 		// Pin classical ECDHE only. Go 1.24+ enables X25519MLKEM768
 		// (post-quantum hybrid) by default for TLS 1.3 key exchange.
 		// iOS Network.framework's QUIC stack negotiates the group but

@@ -152,8 +152,9 @@ func handleControlFrame(sess *session.Session, body []byte, write frameWriter, m
 		// floor + ceiling on PTY dimensions. The kernel ioctl rejects
 		// most pathological values, but a peer-supplied 1×1 or 65535
 		// has no legitimate use and clamping here matches the iOS
-		// client's own pre-send sanity check.
-		if m.Rows < 3 || m.Cols < 10 || m.Rows > 1000 || m.Cols > 1000 {
+		// client's own pre-send sanity check. Bounds live in limits.go
+		// and are shared with the Attach-frame path in protocol_handler.
+		if !dimsInBounds(m.Rows, m.Cols) {
 			slog.Warn("resize: out-of-range dimensions — dropped",
 				"sid", sess.ID().String(), "rows", m.Rows, "cols", m.Cols)
 			return nil

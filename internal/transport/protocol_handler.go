@@ -169,7 +169,15 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 	// driving, even if mismatched. Honouring readonly resize would
 	// fight the exclusive client's geometry and cause SIGWINCH
 	// thrashing.
-	if attachMode == session.AttachExclusive && att.Rows > 0 && att.Cols > 0 {
+	//
+	// Pre-v1.0 hardening (audit Finding 7.1): mirror the F-I bounds
+	// check from handleControlFrame's Resize path so the two entry
+	// points to sess.Resize are symmetric. An exclusive client could
+	// previously supply Rows=1 or Rows=65535 on Attach and bypass the
+	// clamp; out-of-range dims are now silently ignored (the prior
+	// >0 gate kept zero-dim Attaches from resizing, but accepted
+	// everything above zero).
+	if attachMode == session.AttachExclusive && dimsInBounds(att.Rows, att.Cols) {
 		_ = sess.Resize(att.Rows, att.Cols)
 	}
 

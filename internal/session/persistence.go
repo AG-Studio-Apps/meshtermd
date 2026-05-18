@@ -267,10 +267,16 @@ func loadSessionFromDir(dir string, now time.Time, logger *slog.Logger) (*Sessio
 	if meta.IdleTimeoutNs > 0 {
 		lastActive := time.Unix(0, meta.LastActiveNs)
 		if now.Sub(lastActive) >= time.Duration(meta.IdleTimeoutNs) {
+			var sid SessionID
+			copy(sid[:], meta.SessionID)
 			logger.Info("session.persistence.expired_on_load",
 				"session", fmt.Sprintf("%x", meta.SessionID),
-				"name", meta.Name,
+				"name_hash", NameHash(sid, meta.Name),
 				"idle_for", now.Sub(lastActive).String(),
+			)
+			logger.Debug("session.persistence.expired_on_load.name",
+				"session", fmt.Sprintf("%x", meta.SessionID),
+				"name", meta.Name,
 			)
 			return nil, nil
 		}

@@ -164,9 +164,13 @@ func reattachOne(ctx context.Context, sess *session.Session, sessionDir string, 
 
 	logger.Info("session.sidecar.reattached",
 		"session", sess.ID().String(),
-		"name", sess.Name(),
+		"name_hash", session.NameHash(sess.ID(), sess.Name()),
 		"sidecar_pid", pid,
 		"resume_from", sess.LastSidecarSeq(),
+	)
+	logger.Debug("session.sidecar.reattached.name",
+		"session", sess.ID().String(),
+		"name", sess.Name(),
 	)
 	return true, nil
 }

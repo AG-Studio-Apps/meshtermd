@@ -278,16 +278,20 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 	// counts without grepping through free-text log lines.
 	log.InfoContext(ctx, "session.attach",
 		"session", sess.ID().String(),
-		"name", sess.Name(),
+		"name_hash", session.NameHash(sess.ID(), sess.Name()),
 		"mode", resolvedMode,
 		"gen", attachGen,
 		"peers", len(sess.PeerModes(attachGen)),
 		"replay_start", start,
 		"replay_truncated", trunc,
 	)
-	defer log.InfoContext(ctx, "session.detach",
+	log.DebugContext(ctx, "session.attach.name",
 		"session", sess.ID().String(),
 		"name", sess.Name(),
+	)
+	defer log.InfoContext(ctx, "session.detach",
+		"session", sess.ID().String(),
+		"name_hash", session.NameHash(sess.ID(), sess.Name()),
 		"mode", resolvedMode,
 		"gen", attachGen,
 	)
@@ -427,9 +431,13 @@ func (h *ProtocolHandler) lazySpawnRestoredPTY(ctx context.Context, sess *sessio
 	go sess.Pump()
 	log.InfoContext(ctx, "session.restored.lazy_spawn",
 		"session", sess.ID().String(),
-		"name", sess.Name(),
+		"name_hash", session.NameHash(sess.ID(), sess.Name()),
 		"rows", rows,
 		"cols", cols,
+	)
+	log.DebugContext(ctx, "session.restored.lazy_spawn.name",
+		"session", sess.ID().String(),
+		"name", sess.Name(),
 	)
 	return nil
 }

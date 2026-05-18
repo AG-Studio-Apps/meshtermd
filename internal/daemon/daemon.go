@@ -186,6 +186,10 @@ func New(cfg Config) (*Daemon, error) {
 	reg.OnReap = func(s *session.Session) {
 		logger.Info("session.reaped",
 			"session", s.ID().String(),
+			"name_hash", session.NameHash(s.ID(), s.Name()),
+		)
+		logger.Debug("session.reaped.name",
+			"session", s.ID().String(),
 			"name", s.Name(),
 		)
 	}
@@ -523,7 +527,14 @@ func (d *Daemon) HandleRenameSession(ctx context.Context, req ipc.RenameSessionR
 		}
 		return ipc.RenameSessionResponse{Ok: false, Err: code, Msg: err.Error()}
 	}
-	d.logger.Info("session renamed", "session", sid.String(), "name", req.NewName)
+	d.logger.Info("session renamed",
+		"session", sid.String(),
+		"name_hash", session.NameHash(sid, req.NewName),
+	)
+	d.logger.Debug("session.renamed.name",
+		"session", sid.String(),
+		"name", req.NewName,
+	)
 	return ipc.RenameSessionResponse{Ok: true, Name: req.NewName}
 }
 
@@ -554,7 +565,15 @@ func (d *Daemon) HandleKillSession(ctx context.Context, req ipc.KillSessionReque
 	}
 	id := sess.ID()
 	d.registry.Remove(id)
-	d.logger.Info("session killed", "session", id.String(), "name", req.Sel, "by", "name")
+	d.logger.Info("session killed",
+		"session", id.String(),
+		"name_hash", session.NameHash(id, req.Sel),
+		"by", "name",
+	)
+	d.logger.Debug("session.killed.name",
+		"session", id.String(),
+		"name", req.Sel,
+	)
 	return ipc.KillSessionResponse{Ok: true}
 }
 
@@ -697,9 +716,13 @@ func (d *Daemon) applyIdleTimeoutOnReattach(sess *session.Session, req ipc.Alloc
 	sess.SetIdleTimeout(resolved)
 	d.logger.Info("session.idle_timeout_updated",
 		"session", sess.ID().String(),
-		"name", sess.Name(),
+		"name_hash", session.NameHash(sess.ID(), sess.Name()),
 		"prev", prev.String(),
 		"new", resolved.String(),
+	)
+	d.logger.Debug("session.idle_timeout_updated.name",
+		"session", sess.ID().String(),
+		"name", sess.Name(),
 	)
 }
 
@@ -805,9 +828,13 @@ func (d *Daemon) spawnSession(req ipc.AllocateRequest) (*session.Session, error)
 	go sess.Pump()
 	d.logger.Info("session spawned",
 		"session", sid.String(),
-		"name", name,
+		"name_hash", session.NameHash(sid, name),
 		"rows", rows, "cols", cols,
 		"persist", persist,
+	)
+	d.logger.Debug("session.spawned.name",
+		"session", sid.String(),
+		"name", name,
 	)
 	return sess, nil
 }

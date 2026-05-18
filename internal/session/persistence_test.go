@@ -531,3 +531,62 @@ func badFormatMeta(t *testing.T, s *Session, version int) []byte {
 	}
 	return out
 }
+
+// metaWithBufCapacity returns a meta.cbor whose BufCapacity field is
+// set to the supplied value. Used to verify the pre-v1.0 cap rejects
+// crafted entries before NewRingBuffer attempts a huge allocation.
+func metaWithBufCapacity(t *testing.T, s *Session, capacity int) []byte {
+	t.Helper()
+	_, writePos, headSeq, full := s.buf.Snapshot()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	meta := persistedSessionMeta{
+		FormatVersion: persistenceFormatVersion,
+		SessionID:     append([]byte(nil), s.id[:]...),
+		Name:          s.name,
+		CreatedNs:     s.created.UnixNano(),
+		LastActiveNs:  s.lastActiveAt.UnixNano(),
+		Rows:          s.rows,
+		Cols:          s.cols,
+		IdleTimeoutNs: int64(s.idleTimeout),
+		Persist:       s.persist,
+		BufCapacity:   capacity,
+		HeadSeq:       headSeq,
+		WritePos:      writePos,
+		Full:          full,
+	}
+	out, err := cbor.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestLoadPersistedDropsOversizedBufCapacity(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	s := makePersistedSession(t, []byte("hi"))
+	if err := s.SaveTo(dir); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// Rewrite meta with a BufCapacity over the cap. Defends against a
+	// crafted meta.cbor that would crash daemon startup at the
+	// `make([]byte, meta.BufCapacity)` inside NewRingBuffer.
+	sessionDir := filepath.Join(dir, sessionsSubdir, s.ID().String())
+	metaPath := filepath.Join(sessionDir, metaFilename)
+	if err := os.WriteFile(metaPath,
+		metaWithBufCapacity(t, s, maxPersistedBufCapacity+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reg := NewRegistry(0, time.Hour, time.Hour, 0)
+	n, _ := LoadPersisted(dir, reg, nullLogger())
+	if n != 0 {
+		t.Errorf("loaded %d sessions, want 0 (BufCapacity over cap)", n)
+	}
+	if _, err := os.Stat(sessionDir); !os.IsNotExist(err) {
+		t.Errorf("oversized-BufCapacity dir wasn't cleaned up")
+	}
+}

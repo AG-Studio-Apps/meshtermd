@@ -10,7 +10,18 @@ import (
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
+
+	"github.com/AG-Studio-Apps/meshtermd/internal/protocol"
 )
+
+// maxPersistedBufCapacity caps the BufCapacity field in a persisted
+// meta.cbor at 100× the daemon's default. Defence-in-depth against a
+// hostile state-dir writer crafting a meta.cbor with BufCapacity = 2^31
+// which would crash daemon startup via an OOM on
+// `make([]byte, meta.BufCapacity)`. The ceiling is generous enough
+// that legitimate large-buffer deployments stay below it; the floor
+// (BufCapacity > 0) is already enforced.
+const maxPersistedBufCapacity = 100 * DefaultBufferCapacity
 
 // persistenceFormatVersion identifies the on-disk schema. Bumped
 // whenever the meta.cbor / scrollback.bin layout changes in a way
@@ -209,7 +220,13 @@ func loadSessionFromDir(dir string, now time.Time, logger *slog.Logger) (*Sessio
 		return nil, fmt.Errorf("read meta: %w", err)
 	}
 	var meta persistedSessionMeta
-	if err := cbor.Unmarshal(metaBytes, &meta); err != nil {
+	// Decode via the wire-protocol's StrictDecMode (CBOR limits:
+	// MaxArrayElements=256, MaxMapPairs=64, MaxNestedLevels=8). The
+	// raw cbor.Unmarshal default is unbounded — a malformed meta.cbor
+	// from a hostile state-dir writer could otherwise drive a CPU /
+	// memory exhaust during daemon startup before the schema-version
+	// check runs.
+	if err := protocol.StrictDecMode.Unmarshal(metaBytes, &meta); err != nil {
 		return nil, fmt.Errorf("decode meta: %w", err)
 	}
 	if meta.FormatVersion != persistenceFormatVersion {
@@ -221,6 +238,15 @@ func loadSessionFromDir(dir string, now time.Time, logger *slog.Logger) (*Sessio
 	}
 	if meta.BufCapacity <= 0 {
 		return nil, fmt.Errorf("invalid buffer capacity %d", meta.BufCapacity)
+	}
+	if meta.BufCapacity > maxPersistedBufCapacity {
+		// Pre-v1.0 hardening: a crafted meta.cbor with BufCapacity
+		// = 2^31 would crash daemon startup at NewRingBuffer's
+		// make([]byte, …) via an out-of-memory panic. Reject up
+		// front; the calling LoadPersisted treats this as a
+		// dropped session (logs + removes the dir).
+		return nil, fmt.Errorf("buffer capacity %d exceeds maximum %d",
+			meta.BufCapacity, maxPersistedBufCapacity)
 	}
 
 	scrollBytes, err := os.ReadFile(filepath.Join(dir, scrollbackFilename))

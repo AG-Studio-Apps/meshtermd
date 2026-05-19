@@ -376,7 +376,27 @@ func (w *wedgeWatcher) ObserveBytes(data []byte, sessionCreated time.Time) {
 	// Always update alt-screen state — apps may enter/exit alt-screen
 	// outside any resize window (Claude /tui starts on app launch).
 	// Cheap state-machine scan; ignores everything except ?1049/?1047/?47.
-	w.altScreen.feed(data)
+	altSummary := w.altScreen.feed(data)
+	// Log every actual edge transition. We need this because the
+	// vertical_walk detector silences when alt-screen tracker is
+	// inactive — if Claude's renderer drift causes a spurious DECRST
+	// 1049l (or worse, a bounce-with-no-re-entry), the detector goes
+	// dark for the session and no banners can fire downstream. The
+	// log lets us correlate against user reports of "pill disappeared
+	// and no banner fired" without needing iOS-side instrumentation
+	// of SwiftTerm's buffer state. Added 2026-05-19.
+	if altSummary.enteredFromInactive || altSummary.exitedFromActive {
+		nowActive := w.altScreen.isActive()
+		anon := w.anonID
+		w.mu.Unlock()
+		slog.Info("wedge: altscreen toggle",
+			"anon", anon,
+			"entered", altSummary.enteredFromInactive,
+			"exited", altSummary.exitedFromActive,
+			"now_active", nowActive,
+		)
+		w.mu.Lock()
+	}
 	if !w.resizePending {
 		w.mu.Unlock()
 		return
@@ -765,9 +785,35 @@ type altScreenTracker struct {
 	active bool
 }
 
-// feed processes one byte chunk. Side effect only — flips `active`
-// when an alt-screen DECSET/DECRST is observed.
-func (a *altScreenTracker) feed(buf []byte) {
+// altScreenFeedSummary describes which DECSET/DECRST toggles were
+// observed during a single feed() call. Used by callers to log
+// transitions WITH session context (sid, anonID, etc.) that the
+// tracker itself has no access to.
+//
+// `enteredFromInactive` is true if at least one ?1049h/?1047h/?47h
+// was observed AND the tracker was inactive at the moment that DECSET
+// was applied — i.e., the chunk caused an actual main→alt transition.
+//
+// `exitedFromActive` is the inverse: at least one ?1049l/?1047l/?47l
+// applied while the tracker was active — i.e., the chunk caused an
+// actual alt→main transition.
+//
+// Both can be true for a single chunk if the byte stream contains
+// "exit then enter" sequences (a renderer reset / bounce pattern).
+// Diagnostic value: a sustained-true `exitedFromActive` without a
+// follow-up enter is the load-bearing failure for the wedge detector
+// going silent mid-session.
+type altScreenFeedSummary struct {
+	enteredFromInactive bool
+	exitedFromActive    bool
+}
+
+// feed processes one byte chunk. Mutates `active` on DECSET/DECRST
+// of any alt-screen private mode. Returns a summary that the caller
+// can use to log transitions; the tracker itself has no session
+// context for slog attribution.
+func (a *altScreenTracker) feed(buf []byte) altScreenFeedSummary {
+	var summary altScreenFeedSummary
 	for _, b := range buf {
 		switch a.state {
 		case csiNone:
@@ -784,8 +830,14 @@ func (a *altScreenTracker) feed(buf []byte) {
 		case csiParams:
 			if b >= 0x40 && b <= 0x7e {
 				if b == 'h' && isAltScreenMode(a.params) {
+					if !a.active {
+						summary.enteredFromInactive = true
+					}
 					a.active = true
 				} else if b == 'l' && isAltScreenMode(a.params) {
+					if a.active {
+						summary.exitedFromActive = true
+					}
 					a.active = false
 				}
 				a.state = csiNone
@@ -799,6 +851,7 @@ func (a *altScreenTracker) feed(buf []byte) {
 			}
 		}
 	}
+	return summary
 }
 
 // isActive reports whether the most recent observed DECSET/DECRST put

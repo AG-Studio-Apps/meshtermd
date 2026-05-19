@@ -19,6 +19,8 @@ The protocol's security perimeter is the **iOS client → daemon** channel. Insi
 ## What we trust
 
 - **The user's SSH host key chain.** Bootstrap happens over an existing SSH session. If the user's known_hosts trusts the host, we inherit that trust. If SSH is being MITM'd at bootstrap time, every secret SSH carries is already compromised — this protocol cannot improve on that.
+
+  ⚠️ **First-use caveat (TOFU).** `mtctl` sets `StrictHostKeyChecking=accept-new` for usability — a host fingerprint that isn't in the user's `~/.ssh/known_hosts` is auto-trusted on first connection. If a network MITM is positioned at the moment of that very first SSH dial, they can supply their own host key, return a fake `MTRM_QUIC` bootstrap line, and surface a cert fingerprint that the QUIC client then pins. Subsequent connections are protected (the spoofed key gets stored in known_hosts and any later real host triggers a verification failure), but the window exists. Users on hostile first-use networks should populate `known_hosts` out-of-band (e.g. `ssh-keyscan` from a trusted location, or copy from a known-good machine) before running `mtctl` for the first time. Codex audit 2026-05-19 LOW.
 - **Apple's `Security.framework` (TLS 1.3 implementation).** Used by `Network.framework` for all QUIC TLS operations on the iOS client.
 - **Go's `crypto/tls` (TLS 1.3 implementation).** Used by `quic-go` on the daemon.
 - **Apple's `CryptoKit` (SHA-256, P-256).** Used by the iOS client for fingerprint computation.

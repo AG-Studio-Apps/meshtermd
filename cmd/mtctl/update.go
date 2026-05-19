@@ -140,6 +140,13 @@ func performUpdate(ctx context.Context, fetcher *release.Fetcher, tag string) in
 		fmt.Fprintf(os.Stderr, "update: signature: %v\n", err)
 		return 3
 	}
+	// Bind the signature to the requested tag — see the matching
+	// comment in cmd/meshtermd/update.go for the rationale (Codex
+	// audit 2026-05-19, HIGH finding).
+	if err := release.EnforceTrustedComment(result.TrustedComment, tag); err != nil {
+		fmt.Fprintf(os.Stderr, "update: %v\n", err)
+		return 3
+	}
 	fmt.Printf("  signed by key %d (%s)\n", result.KeyIndex, result.TrustedComment)
 	if result.KeyIndex == 1 {
 		fmt.Fprintln(os.Stderr,

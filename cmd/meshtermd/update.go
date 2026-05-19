@@ -157,6 +157,16 @@ func performUpdate(ctx context.Context, fetcher *release.Fetcher, tag string) in
 		fmt.Fprintf(os.Stderr, "update: signature: %v\n", err)
 		return 3
 	}
+	// Bind the signature to the requested tag — minisign verifies the
+	// SHA list was signed by our key, but not WHICH release it belongs
+	// to. Without this, a re-published older SHA256SUMS would still
+	// verify and the anti-rollback semver check would still accept the
+	// "newer" target, letting an older (potentially vulnerable) binary
+	// in. See internal/release/trusted_comment.go for the contract.
+	if err := release.EnforceTrustedComment(result.TrustedComment, tag); err != nil {
+		fmt.Fprintf(os.Stderr, "update: %v\n", err)
+		return 3
+	}
 	fmt.Printf("  signed by key %d (%s)\n", result.KeyIndex, result.TrustedComment)
 	if result.KeyIndex == 1 {
 		fmt.Fprintln(os.Stderr,

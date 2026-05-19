@@ -70,3 +70,37 @@ func TestResolveHostErrorsWhenUnset(t *testing.T) {
 		t.Errorf("error message missing guidance: %v", err)
 	}
 }
+
+// TestValidateSSHHostRejectsOptionInjection guards against the Codex
+// audit 2026-05-19 MEDIUM finding: a host beginning with `-` could
+// otherwise be parsed by OpenSSH as an option element, e.g.
+// `-oProxyCommand=evil-script` → local-command execution.
+func TestValidateSSHHostRejectsOptionInjection(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		host    string
+		wantErr bool
+	}{
+		{"normal user@host", "alice@example.com", false},
+		{"bare host", "example.com", false},
+		{"host with port (.ssh/config style)", "myserver", false},
+		{"empty", "", true},
+		{"leading dash short opt", "-l alice", true},
+		{"leading dash long opt", "-oProxyCommand=evil-script", true},
+		{"leading dash F config", "-F /attacker.cfg", true},
+		{"just a dash", "-", true},
+		{"double dash literal", "--", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateSSHHost(tc.host)
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected error for %q", tc.host)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error for %q: %v", tc.host, err)
+			}
+		})
+	}
+}

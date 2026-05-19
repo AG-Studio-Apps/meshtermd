@@ -263,6 +263,7 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 		FreshlyCreated:  freshlyCreated,
 		RTTNanos:        conn.ConnectionStats().SmoothedRTT.Nanoseconds(),
 		AltScreenActive: sess.WedgeAltScreenActive(),
+		LastTitle:       sess.LastTitle(),
 	})
 	if err != nil {
 		log.WarnContext(ctx, "marshal AttachAck", "err", err)

@@ -82,6 +82,17 @@ type persistedSessionMeta struct {
 	// silent for the rest of the session. Pre-v1.1.2 snapshots
 	// default to false; the next observed toggle reconciles state.
 	AltScreenActive bool `cbor:"alt_active,omitempty"`
+
+	// LastTitle snapshots oscTitleTracker.title at save time. Restored
+	// on load so a client that reattaches after the original OSC 0/2
+	// title-setting sequence has been evicted from the 4 MiB ring
+	// still receives the title via AttachAck.LastTitle. iOS uses it
+	// to prime SwiftTerm's terminal title before replay, which is
+	// what the TUI-pill detection consults to distinguish Claude
+	// (orange) from Codex from generic alt-screen apps. Pre-v1.1.5
+	// snapshots default to empty; the next observed OSC reconciles
+	// state. v1.1.5+ field.
+	LastTitle string `cbor:"last_title,omitempty"`
 }
 
 // SaveTo writes the session's metadata + ring-buffer bytes to a
@@ -110,6 +121,11 @@ func (s *Session) SaveTo(parentDir string) error {
 	// order is safe in both directions. Captured before the meta init
 	// to keep s.mu's critical section pure-session.
 	altActive := s.wedge.AltScreenActive()
+	// Same idea for the OSC title tracker.
+	lastTitle := ""
+	if s.titleTracker != nil {
+		lastTitle = s.titleTracker.Title()
+	}
 
 	s.mu.Lock()
 	meta := persistedSessionMeta{
@@ -128,6 +144,7 @@ func (s *Session) SaveTo(parentDir string) error {
 		Full:                   full,
 		LastConsumedSidecarSeq: s.lastSidecarSeq,
 		AltScreenActive:        altActive,
+		LastTitle:              lastTitle,
 	}
 	s.mu.Unlock()
 
@@ -337,6 +354,7 @@ func loadSessionFromDir(dir string, now time.Time, logger *slog.Logger) (*Sessio
 		// start counting resizes / bytes / wedges from the moment the
 		// session is rehydrated, not retroactively.
 		wedge:            newWedgeWatcher(),
+		titleTracker:     &oscTitleTracker{},
 	}
 	// Seed the alt-screen tracker from the persisted snapshot. Without
 	// this, a session that was on Claude /tui (or any DECSET 1049h
@@ -347,6 +365,11 @@ func loadSessionFromDir(dir string, now time.Time, logger *slog.Logger) (*Sessio
 	// stay silenced until the next user-driven alt-screen toggle.
 	// Bug A in the v1.1.2 release notes.
 	s.wedge.SetAltScreenActive(meta.AltScreenActive)
+	// Same rationale for the OSC title tracker — the title-setting
+	// OSC may have been evicted from the ring before this load. Seed
+	// from the persisted snapshot so AttachAck.LastTitle returns the
+	// right value for the next client to attach. v1.1.5+.
+	s.titleTracker.SetTitle(meta.LastTitle)
 	return s, nil
 }
 

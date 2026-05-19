@@ -267,6 +267,15 @@ type Session struct {
 	// Pump and arms a deadline timer from Resize; see wedgewatch.go.
 	wedge *wedgeWatcher
 
+	// titleTracker watches the PTY byte stream for OSC 0/2 title-
+	// setting sequences. Non-nil after NewSession. Persists to
+	// meta.cbor via persistedSessionMeta.LastTitle so a client that
+	// reattaches after the original OSC is evicted from the ring
+	// still sees the right title via AttachAck.LastTitle and can
+	// prime its terminal emulator's title before replay. Mirrors the
+	// alt-screen pattern from v1.1.2/v1.1.3.
+	titleTracker *oscTitleTracker
+
 	// ptyByteObserver, if set, receives every chunk Pump reads from
 	// the PTY (post-QueryFilter, same bytes the client renders).
 	// Installed by the recovery sequencer to detect bookend markers
@@ -385,6 +394,7 @@ func NewSession(id SessionID, name string, pty PTY, rows, cols uint16, bufCapaci
 		lastActiveAt:       now,
 		firstAttachPending: true,
 		wedge:              newWedgeWatcher(),
+		titleTracker:       &oscTitleTracker{},
 	}, nil
 }
 
@@ -416,6 +426,39 @@ func (s *Session) WedgeAltScreenActive() bool {
 		return false
 	}
 	return w.AltScreenActive()
+}
+
+// LastTitle returns the most recent terminal title observed in the
+// PTY byte stream via OSC 0/2 sequences. Used by the transport layer
+// to populate AttachAck.LastTitle so iOS / mtctl clients can prime
+// their local Terminal with the right window title before replay —
+// without that, the OSC sequence that set the title can be evicted
+// from the 4 MiB ring before a long-session client reattaches, and
+// the client falls back to "alt-screen but unknown TUI" (no Claude/
+// Codex-specific styling on the return-to-prompt pill).
+//
+// Empty string when no title has been seen yet (or pre-v1.1.5
+// sessions restored from disk without a persisted title).
+func (s *Session) LastTitle() string {
+	s.mu.Lock()
+	t := s.titleTracker
+	s.mu.Unlock()
+	if t == nil {
+		return ""
+	}
+	return t.Title()
+}
+
+// SetLastTitle seeds the title tracker from persisted state. Called
+// by loadSessionFromDir after construction; mirrors the alt-screen
+// SetAltScreenActive path.
+func (s *Session) SetLastTitle(t string) {
+	s.mu.Lock()
+	tt := s.titleTracker
+	s.mu.Unlock()
+	if tt != nil {
+		tt.SetTitle(t)
+	}
 }
 
 // WedgeSnapshot returns the per-session cumulative metrics tracked by
@@ -1116,6 +1159,14 @@ func (s *Session) Pump() {
 				// terminal queries (DA/DSR); it doesn't strip CUPs.
 				if s.wedge != nil {
 					s.wedge.ObserveBytes(filtered, s.created)
+				}
+				if s.titleTracker != nil {
+					// OSC title sniff — captures `\x1b]2;<title>\x07`
+					// (and OSC 0 / OSC 1) so the daemon knows the
+					// current terminal title even after the original
+					// OSC has been evicted from the 4 MiB ring. Cheap
+					// state-machine walk; doesn't allocate per byte.
+					s.titleTracker.feed(filtered)
 				}
 				// Fire the PTY byte observer (recovery sequencer's
 				// marker detection). Snapshot under the lock so a

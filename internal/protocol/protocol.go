@@ -292,6 +292,23 @@ type AttachAck struct {
 	// (contentSize clamping on iOS, etc.) misfire and ghost frames
 	// accumulate.
 	AltScreenActive bool `cbor:"alt_active,omitempty"`
+
+	// LastTitle is the most recently observed terminal title (OSC 0 /
+	// OSC 2 set-window-title sequence) captured by the daemon's title
+	// tracker. v1.1.5+ field; older clients ignore it.
+	//
+	// Same class of fix as AltScreenActive but for the title signal:
+	// the OSC sequence that set the title can be evicted from the
+	// ring before reattach, leaving the client-side terminal with an
+	// empty title even though the daemon knows what it should be.
+	// Clients that respect this field should inject
+	// `\x1b]2;<title>\x07` into their emulator before the first
+	// replay byte so the local terminal title matches the daemon's
+	// authoritative view. iOS uses this to drive the TUI-pill
+	// detection (Claude / Codex / generic) which keys off
+	// SwiftTerm.terminalTitle — without it the pill loses Claude's
+	// orange styling on long-running sessions.
+	LastTitle string `cbor:"last_title,omitempty"`
 }
 
 // Ack reports the highest output sequence number the client has

@@ -275,6 +275,23 @@ type AttachAck struct {
 	// the first RTTNotify; ongoing updates flow via the 5-second
 	// RTTNotify ticker.
 	RTTNanos int64 `cbor:"rtt,omitempty"`
+
+	// AltScreenActive reflects whether the daemon's wedge watcher
+	// observed the pty on the alternate screen (DECSET ?1049h / ?1047h
+	// / ?47h) at attach time. v1.1.3+ field; older clients ignore it.
+	//
+	// Mirrors the daemon-side persistence fix from v1.1.2: the original
+	// DECSET that put the pty on the alt-buffer can be evicted from the
+	// 4 MiB ring before a client attaches, so a truncated replay leaves
+	// the client-side terminal stuck on the normal buffer even though
+	// the session is semantically on the alt screen (Claude /tui, htop,
+	// less, vim). Clients that respect this flag should inject a single
+	// `\x1b[?1049h` into their terminal emulator before the first
+	// replay byte so the local Terminal state matches the daemon's
+	// authoritative view — without that, alt-screen-aware features
+	// (contentSize clamping on iOS, etc.) misfire and ghost frames
+	// accumulate.
+	AltScreenActive bool `cbor:"alt_active,omitempty"`
 }
 
 // Ack reports the highest output sequence number the client has

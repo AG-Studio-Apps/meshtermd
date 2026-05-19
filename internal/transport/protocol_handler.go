@@ -251,17 +251,18 @@ func (h *ProtocolHandler) HandleConnection(ctx context.Context, conn *quic.Conn)
 	// path) so a restore reports Restored=true, FreshlyCreated=false.
 	freshlyCreated := sess.ConsumeFirstAttach()
 	ackBody, err := protocol.MarshalAttachAck(protocol.AttachAck{
-		V:              1,
-		OK:             true,
-		SessionID:      sess.ID().Bytes(),
-		Start:          start,
-		BufSeq:         head,
-		Trunc:          trunc,
-		Mode:           resolvedMode,
-		Peers:          sess.PeerModes(attachGen),
-		Restored:       wasRestored,
-		FreshlyCreated: freshlyCreated,
-		RTTNanos:       conn.ConnectionStats().SmoothedRTT.Nanoseconds(),
+		V:               1,
+		OK:              true,
+		SessionID:       sess.ID().Bytes(),
+		Start:           start,
+		BufSeq:          head,
+		Trunc:           trunc,
+		Mode:            resolvedMode,
+		Peers:           sess.PeerModes(attachGen),
+		Restored:        wasRestored,
+		FreshlyCreated:  freshlyCreated,
+		RTTNanos:        conn.ConnectionStats().SmoothedRTT.Nanoseconds(),
+		AltScreenActive: sess.WedgeAltScreenActive(),
 	})
 	if err != nil {
 		log.WarnContext(ctx, "marshal AttachAck", "err", err)

@@ -401,6 +401,23 @@ func (s *Session) SetWedgeLogPath(path string) {
 	}
 }
 
+// WedgeAltScreenActive returns the alternate-screen state observed by
+// the wedge watcher at the moment of the call. Used by the transport
+// layer to populate AttachAck.AltScreenActive so iOS / mtctl clients
+// can prime their local Terminal into alt-buffer mode before replay
+// — without that, a truncated replay window leaves the client emulator
+// stuck on the normal buffer even though the session is semantically
+// on the alt screen (Claude /tui, htop, less, vim).
+func (s *Session) WedgeAltScreenActive() bool {
+	s.mu.Lock()
+	w := s.wedge
+	s.mu.Unlock()
+	if w == nil {
+		return false
+	}
+	return w.AltScreenActive()
+}
+
 // WedgeSnapshot returns the per-session cumulative metrics tracked by
 // the wedge watcher. Used by `meshtermd wedge-report` and
 // `meshtermd session-info` to render a summary alongside the

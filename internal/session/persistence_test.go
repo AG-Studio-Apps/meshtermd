@@ -168,6 +168,41 @@ func TestLastSidecarSeqRoundTrip(t *testing.T) {
 	}
 }
 
+// TestAltScreenActiveRoundTrip pins the v1.1.2 fix for bug A: a
+// session that was on the alternate screen at save time must come
+// back with the wedge watcher's alt-screen tracker re-armed across a
+// daemon restart. Without persistence, the original DECSET 1049h
+// sits in the scrollback ring rather than the live PTY stream, the
+// watcher never observes it post-attach, and the vertical_walk gate
+// stays silenced for the rest of the session.
+func TestAltScreenActiveRoundTrip(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	original := makePersistedSession(t, []byte("z"))
+	// Drive the tracker into the active state by feeding a real
+	// DECSET 1049h. Avoids reaching into private fields.
+	original.wedge.ObserveBytes([]byte("\x1b[?1049h"), original.Created())
+	if !original.wedge.AltScreenActive() {
+		t.Fatal("precondition: tracker should be active after DECSET 1049h")
+	}
+	if err := original.SaveTo(dir); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+
+	reg := NewRegistry(0, time.Hour, time.Hour, 0)
+	if _, err := LoadPersisted(dir, reg, nullLogger()); err != nil {
+		t.Fatalf("LoadPersisted: %v", err)
+	}
+	restored, err := reg.Lookup(original.ID())
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if !restored.wedge.AltScreenActive() {
+		t.Fatal("alt-screen state lost across SaveTo/LoadPersisted — " +
+			"bug A regression")
+	}
+}
+
 // TestAdvanceSidecarSeqMonotonic verifies that AdvanceSidecarSeq is
 // a monotonic watermark — older values do not regress lastSidecarSeq.
 // The Pump's coalesced-ack flow can otherwise advance the watermark

@@ -253,6 +253,30 @@ func (w *wedgeWatcher) SuppressUntil(t time.Time) {
 	w.mu.Unlock()
 }
 
+// AltScreenActive reports whether the byte stream currently has the
+// pty on the alternate screen buffer. Used by persistence.SaveTo to
+// snapshot the tracker so daemon-restart reattaches don't lose the
+// alt-screen flag (the original DECSET 1049h is replayed only via the
+// scrollback ring, not the live PTY stream, so a fresh tracker would
+// stay inactive for the rest of the session and silence the
+// vertical_walk gate).
+func (w *wedgeWatcher) AltScreenActive() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.altScreen.isActive()
+}
+
+// SetAltScreenActive seeds the tracker's active flag from a persisted
+// snapshot. Called by loadSessionFromDir immediately after the
+// watcher is constructed, before any bytes are observed. Safe to
+// call before the first ObserveBytes — the tracker's scanner state
+// is unaffected, only the boolean is set.
+func (w *wedgeWatcher) SetAltScreenActive(active bool) {
+	w.mu.Lock()
+	w.altScreen.active = active
+	w.mu.Unlock()
+}
+
 // ArmResize is called from Session.Resize after the PTY's SetSize has
 // returned successfully. It records the new geometry, marks the
 // watcher as awaiting redraw, and starts a one-shot deadline goroutine

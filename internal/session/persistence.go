@@ -70,6 +70,18 @@ type persistedSessionMeta struct {
 	// committed bytes don't get replayed (and re-numbered) into the
 	// daemon ring. Optional — pre-v0.6 sessions stored zero.
 	LastConsumedSidecarSeq uint64 `cbor:"lcs,omitempty"`
+
+	// AltScreenActive snapshots wedgeWatcher.altScreen.active at save
+	// time. Restored on load so a session that was on the alternate
+	// screen (Claude /tui, htop, less, vim) before a daemon restart
+	// keeps the wedge detector's vertical_walk gate armed across the
+	// bounce. Without this, the only way the tracker re-enters active
+	// is via a fresh DECSET 1049h in live PTY output — but resumed
+	// sessions get their scrollback from the sidecar's ring, which
+	// has already-consumed the original DECSET, so the detector goes
+	// silent for the rest of the session. Pre-v1.1.2 snapshots
+	// default to false; the next observed toggle reconciles state.
+	AltScreenActive bool `cbor:"alt_active,omitempty"`
 }
 
 // SaveTo writes the session's metadata + ring-buffer bytes to a
@@ -93,6 +105,12 @@ func (s *Session) SaveTo(parentDir string) error {
 	// don't hold both at once — buf has its own mu, session has s.mu.
 	bufBytes, writePos, headSeq, full := s.buf.Snapshot()
 
+	// Read alt-screen flag outside s.mu — it has its own lock on the
+	// watcher and the watcher never reaches into the session, so the
+	// order is safe in both directions. Captured before the meta init
+	// to keep s.mu's critical section pure-session.
+	altActive := s.wedge.AltScreenActive()
+
 	s.mu.Lock()
 	meta := persistedSessionMeta{
 		FormatVersion:          persistenceFormatVersion,
@@ -109,6 +127,7 @@ func (s *Session) SaveTo(parentDir string) error {
 		WritePos:               writePos,
 		Full:                   full,
 		LastConsumedSidecarSeq: s.lastSidecarSeq,
+		AltScreenActive:        altActive,
 	}
 	s.mu.Unlock()
 
@@ -319,6 +338,15 @@ func loadSessionFromDir(dir string, now time.Time, logger *slog.Logger) (*Sessio
 		// session is rehydrated, not retroactively.
 		wedge:            newWedgeWatcher(),
 	}
+	// Seed the alt-screen tracker from the persisted snapshot. Without
+	// this, a session that was on Claude /tui (or any DECSET 1049h
+	// app) at save time would come back with the tracker showing
+	// inactive, because the original DECSET sits in the ring buffer
+	// rather than the live PTY stream — the watcher only observes
+	// post-attach bytes. The detector's vertical_walk gate would then
+	// stay silenced until the next user-driven alt-screen toggle.
+	// Bug A in the v1.1.2 release notes.
+	s.wedge.SetAltScreenActive(meta.AltScreenActive)
 	return s, nil
 }
 

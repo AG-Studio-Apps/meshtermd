@@ -92,7 +92,7 @@ func NewServer(socketPath string, handler Handler, opts ...ServerOption) (*Serve
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return nil, fmt.Errorf("create socket dir: %w", err)
 	}
-	if err := verifyParentDir(parent); err != nil {
+	if err := VerifyParentDir(parent); err != nil {
 		return nil, fmt.Errorf("socket parent dir: %w", err)
 	}
 	// Remove stale socket. A live `meshtermd serve` would be
@@ -127,13 +127,19 @@ func NewServer(socketPath string, handler Handler, opts ...ServerOption) (*Serve
 	}, nil
 }
 
-// verifyParentDir asserts that the directory `path` is owned by the
+// VerifyParentDir asserts that the directory `path` is owned by the
 // current uid and has permissions no looser than 0700 (i.e. neither
 // group- nor world-readable/writable/executable). This rules out the
 // "$XDG_RUNTIME_DIR is misconfigured world-writable" attack where a
 // local attacker pre-creates the socket file or a symlink and races
 // the daemon's bind.
-func verifyParentDir(path string) error {
+//
+// Exported for the client-side discovery path (cmd/meshtermd/serve.go's
+// `discoverClientSocketPath`) so client subcommands mirror the
+// server's bind-time validation — without that mirroring a connect
+// helper would happily dial a same-name socket planted under a
+// world-writable XDG_RUNTIME_DIR by another local user.
+func VerifyParentDir(path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return err
@@ -152,6 +158,34 @@ func verifyParentDir(path string) error {
 	// Mode check: any group or other bits set fails.
 	if mode := info.Mode().Perm(); mode&0o077 != 0 {
 		return fmt.Errorf("%s has loose permissions %o; expected ≤ 0700", path, mode)
+	}
+	return nil
+}
+
+// VerifyClientSocket validates a candidate socket path before a
+// client dials it. Refuses symlinks (an attacker may plant a symlink
+// pointing at their own socket) and refuses anything that isn't a
+// Unix socket (a regular file at the same path may be an attempt to
+// trick the helper into doing protocol handshakes against
+// attacker-controlled bytes).
+//
+// Returns os.ErrNotExist if the path doesn't exist — callers should
+// treat that as "no daemon here, try the next candidate" rather than
+// an error.
+//
+// Closes the client-side mirror of the v1.0 audit hardening that
+// already covers the server-side bind path. Codex audit 2026-05-19,
+// MEDIUM finding.
+func VerifyClientSocket(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink", path)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("%s is not a unix socket", path)
 	}
 	return nil
 }

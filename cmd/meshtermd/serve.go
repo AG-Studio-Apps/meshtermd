@@ -14,6 +14,7 @@ import (
 
 	"github.com/AG-Studio-Apps/meshtermd/internal/cert"
 	"github.com/AG-Studio-Apps/meshtermd/internal/daemon"
+	"github.com/AG-Studio-Apps/meshtermd/internal/ipc"
 )
 
 // runServe is the long-running daemon mode. It owns the session
@@ -166,17 +167,29 @@ func defaultSocketPath() string {
 // message points at the conventional persistent location instead of
 // an XDG path that may not exist.
 //
-// Existence-only check (os.Stat); doesn't dial. A stale socket file
-// from a crashed daemon would still satisfy this — but the subsequent
+// Existence-only check at the lower-priority leg; the XDG leg
+// validates parent-dir ownership/perms and socket type before
+// returning a candidate. A stale socket file from a crashed daemon
+// would still satisfy the type check — but the subsequent
 // ipc.Client connect attempt surfaces that cleanly as ECONNREFUSED.
+//
+// XDG validation closes the Codex audit 2026-05-19 MEDIUM finding:
+// a misconfigured world-writable XDG_RUNTIME_DIR would otherwise let
+// another local user plant a same-name socket and answer connect
+// IPC. Mirrors the server-side bind validation in `ipc.NewServer`.
 func discoverClientSocketPath() string {
 	persistent := persistentSocketPath()
 	if rd := os.Getenv("XDG_RUNTIME_DIR"); rd != "" {
 		runtime := filepath.Join(rd, "meshtermd.sock")
-		if _, err := os.Stat(runtime); err == nil {
+		if ipc.VerifyParentDir(rd) == nil &&
+			ipc.VerifyClientSocket(runtime) == nil {
 			return runtime
 		}
-		// XDG path empty — fall through to persistent.
+		// Parent loose, socket missing/symlink/wrong-type — fall
+		// through to the persistent path. The persistent path lives
+		// under cert.DefaultDir() which is created with 0o700 by the
+		// daemon at bringup; an attacker who can write there has
+		// already escalated past our threat model.
 	}
 	return persistent
 }

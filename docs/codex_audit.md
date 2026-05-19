@@ -4,6 +4,16 @@ Date: 2026-05-19
 
 Scope: static security review of the repository, focused on update trust, SSH/bootstrap handling, IPC/socket discovery, QUIC attach authorization, persistence, and sidecar process handling.
 
+**Status: all findings addressed in v1.1.4 (2026-05-19).** Per-finding
+commits below; see git log for diffs and tests.
+
+| Finding | Severity | Status | Commit |
+|---|---|---|---|
+| Self-update signatures not bound to release tag | HIGH | Fixed | `EnforceTrustedComment` wired into both update paths |
+| Client socket discovery can select a spoofed XDG socket | MEDIUM | Fixed | `VerifyParentDir` exported + `VerifyClientSocket` added |
+| `mtctl` host values can be parsed as local `ssh` options | MEDIUM | Fixed | `validateSSHHost` guard + `--` separator in argv |
+| First-use SSH bootstrap silently trusts new host keys | LOW | Documented | TOFU caveat added to SECURITY.md § What we trust |
+
 ## Findings
 
 ### High: self-update signatures are not bound to the requested release tag

@@ -167,8 +167,10 @@ Common flags accepted by most subcommands:
 # NETWORK
 
 **meshtermd** listens for QUIC on a configurable address (default
-**0.0.0.0:51820** when installed via the iOS app's nohup path,
-**127.0.0.1:0** when the library defaults are used). ALPN
+**0.0.0.0:49820** when installed via the iOS app's nohup path,
+**127.0.0.1:0** when the library defaults are used). If the preferred
+port is in use, the daemon falls through to the next free port in the
+49820–49919 range and persists the chosen port across restarts. ALPN
 **meshterm/0**. TLS 1.3 only, pinned curves X25519 + P-256. Datagrams
 enabled. The QUIC certificate's fingerprint is what every client pins;
 no SNI, no hostname verification, no CA chain.
@@ -225,7 +227,7 @@ and trust assumptions, including:
 
 Start the daemon manually for debugging:
 
-    meshtermd serve --addr 0.0.0.0:51820
+    meshtermd serve --addr 0.0.0.0:49820
 
 Enumerate live sessions:
 

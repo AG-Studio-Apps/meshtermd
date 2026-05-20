@@ -93,7 +93,7 @@ func (n *nohup) Start(ctx context.Context, binPath string) error {
 	// don't need the outer `&` — `Process.Release` after Start
 	// detaches us from the child.
 	cmd := exec.CommandContext(ctx, binPath, "serve",
-		"--addr", "0.0.0.0:51820",
+		"--addr", "0.0.0.0:49820",
 		"--socket", homePath(".local", "share", "meshtermd", "meshtermd.sock"),
 	)
 	// New session so SIGHUP from our parent doesn't propagate.

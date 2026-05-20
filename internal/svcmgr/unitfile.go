@@ -16,9 +16,14 @@ type UserUnitOptions struct {
 	BinPath string
 
 	// Addr is the QUIC bind address (host:port). Defaults to
-	// "0.0.0.0:51820" — the iOS-pinned port the auto-installer
-	// surfaces in firewall guidance. Operators can pass an explicit
-	// override (e.g. a Tailnet IP) on a one-off install.
+	// "0.0.0.0:49820" — chosen to avoid WireGuard (51820),
+	// Tailscale (41641), and other well-known UDP services. The
+	// daemon will fall through to the next free port in the
+	// 49820–49919 range if the preferred port is in use, and
+	// persist the bound port across restarts. Operators can pass
+	// an explicit override (e.g. a Tailnet IP, or a different port
+	// they've decided on) — explicit non-default ports are honoured
+	// strictly without stickiness override.
 	Addr string
 
 	// SocketPath is the IPC socket the daemon binds for `connect`.
@@ -48,7 +53,7 @@ func RenderUserUnit(opts *UserUnitOptions) string {
 		o.BinPath = "%h/.local/bin/meshtermd"
 	}
 	if o.Addr == "" {
-		o.Addr = "0.0.0.0:51820"
+		o.Addr = "0.0.0.0:49820"
 	}
 	if o.SocketPath == "" {
 		o.SocketPath = "%h/.local/share/meshtermd/meshtermd.sock"

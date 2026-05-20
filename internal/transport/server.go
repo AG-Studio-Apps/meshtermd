@@ -12,13 +12,31 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
+	"syscall"
 	"time"
 
 	"github.com/quic-go/quic-go"
 
 	"github.com/AG-Studio-Apps/meshtermd/internal/protocol"
 )
+
+// DefaultQUICPort is the preferred UDP port the daemon binds when
+// `--addr` doesn't specify a port (or specifies the default explicitly).
+// Chosen to avoid known UDP services — clear of WireGuard's 51820,
+// Tailscale's 41641, OpenVPN's 1194, IPsec 4500, mosh's 60000-61000
+// range, mDNS / SSDP, and IANA-registered services in the same band.
+const DefaultQUICPort uint16 = 49820
+
+// FallbackPortSpan is the number of additional candidate ports the
+// bind loop will try if the preferred port is already in use. The
+// daemon walks DefaultQUICPort .. DefaultQUICPort+FallbackPortSpan,
+// stopping at the first successful bind. With stickiness, the
+// previously-bound port is tried first (before the default) on
+// subsequent restarts, so the fallback range is only exercised on
+// genuine conflict.
+const FallbackPortSpan uint16 = 99
 
 // Server wraps a quic-go listener configured with our ALPN, the
 // daemon's pinned-fingerprint TLS cert, and a Handler that drives the
@@ -87,6 +105,13 @@ type Config struct {
 	// CONNECTION_CLOSE before the handler runs. Default
 	// MaxConcurrentHandlers.
 	MaxConcurrent int
+
+	// StateDir is the daemon data directory used for port stickiness
+	// persistence (the `quic-port` file). If empty, stickiness is
+	// disabled and the bind loop starts from the configured port
+	// every time. Callers typically pass the resolved
+	// `cert.DefaultDir()` here.
+	StateDir string
 }
 
 // New constructs a Server. The QUIC listener starts immediately; call
@@ -101,13 +126,9 @@ func New(cfg Config) (*Server, error) {
 		return nil, errors.New("transport: Config.Cert is empty")
 	}
 
-	udpAddr, err := net.ResolveUDPAddr("udp", cfg.Addr)
+	udpConn, err := bindUDPWithFallback(cfg.Addr, cfg.StateDir)
 	if err != nil {
-		return nil, fmt.Errorf("resolve udp addr %q: %w", cfg.Addr, err)
-	}
-	udpConn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return nil, fmt.Errorf("listen udp: %w", err)
+		return nil, err
 	}
 
 	tlsConfig := &tls.Config{
@@ -246,6 +267,83 @@ func (s *Server) Serve(ctx context.Context) error {
 			_ = conn.CloseWithError(0x10F, "server busy")
 		}
 	}
+}
+
+// bindUDPWithFallback binds the QUIC listener's UDP socket,
+// honouring stickiness and falling back through a small range when
+// the preferred port is taken. The flow:
+//
+//  1. Parse the configured `host:port`. If port == 0, the OS picks
+//     ephemerally — no fallback or stickiness, return immediately.
+//  2. If the configured port equals DefaultQUICPort AND a stickiness
+//     state file exists with a different port, prefer the persisted
+//     port first. (Non-default configured ports are honoured strictly
+//     — explicit user intent overrides remembered state.)
+//  3. Walk candidate ports in order. On the first success, persist
+//     the chosen port to the state file (best-effort) and return.
+//  4. On any non-EADDRINUSE error, surface it immediately — that's a
+//     real failure (permission, malformed address, etc.) not a
+//     conflict to fall back from.
+func bindUDPWithFallback(addr string, stateDir string) (*net.UDPConn, error) {
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("resolve udp addr %q: %w", addr, err)
+	}
+
+	// Ephemeral port: nothing to fall back from, no stickiness.
+	if udpAddr.Port == 0 {
+		conn, err := net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			return nil, fmt.Errorf("listen udp: %w", err)
+		}
+		return conn, nil
+	}
+
+	prefPort := uint16(udpAddr.Port)
+	candidates := buildCandidatePorts(prefPort, readPortState(stateDir))
+
+	var lastErr error
+	for _, p := range candidates {
+		try := *udpAddr
+		try.Port = int(p)
+		conn, err := net.ListenUDP("udp", &try)
+		if err == nil {
+			if p != prefPort {
+				slog.Info("transport: preferred UDP port unavailable, fell through",
+					"preferred", prefPort, "bound", p)
+			}
+			writePortState(stateDir, p)
+			return conn, nil
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			return nil, fmt.Errorf("listen udp %s: %w", try.String(), err)
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("no free UDP port in %d-%d: %w",
+		prefPort, prefPort+FallbackPortSpan, lastErr)
+}
+
+// buildCandidatePorts returns the bind-attempt order. Stickiness
+// (stuck) is tried first when set, distinct from prefPort, AND only
+// when prefPort equals DefaultQUICPort — otherwise an explicit user-
+// configured non-default port overrides any persisted state. After
+// the optional stuck port, the loop walks prefPort .. prefPort + FallbackPortSpan
+// in order, skipping the already-queued stuck port.
+func buildCandidatePorts(prefPort, stuck uint16) []uint16 {
+	candidates := make([]uint16, 0, int(FallbackPortSpan)+2)
+	useStuck := stuck != 0 && stuck != prefPort && prefPort == DefaultQUICPort
+	if useStuck {
+		candidates = append(candidates, stuck)
+	}
+	for offset := uint16(0); offset <= FallbackPortSpan; offset++ {
+		p := prefPort + offset
+		if useStuck && p == stuck {
+			continue
+		}
+		candidates = append(candidates, p)
+	}
+	return candidates
 }
 
 // Close shuts down the listener and the underlying UDP socket.

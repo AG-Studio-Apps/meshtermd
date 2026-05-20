@@ -24,7 +24,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/meshtermd serve --addr 0.0.0.0:51820 --socket %h/.local/share/meshtermd/meshtermd.sock
+ExecStart=%h/.local/bin/meshtermd serve --addr 0.0.0.0:49820 --socket %h/.local/share/meshtermd/meshtermd.sock
 Restart=on-failure
 RestartSec=5
 # KillMode=process so ` + "`systemctl restart`" + ` only SIGTERMs the main

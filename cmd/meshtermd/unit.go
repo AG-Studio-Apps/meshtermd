@@ -47,7 +47,7 @@ func runUnitPrint(args []string, out io.Writer) int {
 	binPath := fs.String("bin", "",
 		"absolute path baked into ExecStart (default %h/.local/bin/meshtermd)")
 	addr := fs.String("addr", "",
-		"QUIC bind address host:port (default 0.0.0.0:51820)")
+		"QUIC bind address host:port (default 0.0.0.0:49820)")
 	socket := fs.String("socket", "",
 		"IPC socket path (default %h/.local/share/meshtermd/meshtermd.sock)")
 	if err := fs.Parse(args); err != nil {
@@ -76,7 +76,7 @@ Actions:
 
 print flags:
   --bin=PATH      override ExecStart binary path
-  --addr=H:P      override QUIC bind address (default 0.0.0.0:51820)
+  --addr=H:P      override QUIC bind address (default 0.0.0.0:49820)
   --socket=PATH   override IPC socket path
 
 Example:

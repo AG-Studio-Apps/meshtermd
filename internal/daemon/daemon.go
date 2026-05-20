@@ -297,6 +297,7 @@ func New(cfg Config) (*Daemon, error) {
 				})
 			},
 		},
+		StateDir: stateDir,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("transport: %w", err)

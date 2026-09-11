@@ -2,6 +2,26 @@ package session
 
 import "io"
 
+// maxPending caps how many bytes QueryFilter will buffer for an escape
+// sequence that straddles PTY reads before it gives up on that
+// sequence. A legitimate terminal query is only a handful of bytes, but
+// some legitimate OSC SETs are large: a batched full 256-colour OSC 4
+// palette push is ~5.8 KiB and an OSC 52 clipboard SET scales with the
+// copied text (kilobytes). The cap is therefore set well above those so
+// a straddling legitimate sequence is buffered and passed through
+// intact, while still bounding per-session memory far below any OOM
+// threshold (pending is empty at rest and only holds a mid-sequence tail).
+//
+// Without a cap, a never-terminating CSI/OSC introducer grows pending
+// by ~8 KiB per read forever (the daemon reads the PTY into an 8 KiB
+// buffer), which is the OOM this cap closes. On overflow the buffered
+// tail is DROPPED rather than flushed or discriminated — see parkPending
+// for why dropping is safe against query reassembly. An UNTERMINATED
+// sequence longer than the cap is discarded; the only legitimate content
+// that reaches it is a single OSC SET larger than the cap, which is
+// pathological and would render poorly regardless.
+const maxPending = 256 * 1024
+
 // QueryFilter intercepts terminal-query escape sequences in PTY
 // output. For known queries (Device Attributes, Device Status
 // Report) it writes a synthetic response back to the PTY input so
@@ -41,6 +61,10 @@ type QueryFilter struct {
 	// straddling a read boundary was rebuilt from whatever landed there instead.
 	// Process's output feeds the ring as well as the screen model, so that
 	// corruption reached the client too and rendered as literal escape text.
+	//
+	// Bounded to maxPending: parkPending is the single choke point for
+	// the three park sites and drops the tail on overflow, so pending is
+	// never larger than maxPending at rest.
 	pending []byte
 
 	// pty is the writer the filter uses to inject synthetic
@@ -61,7 +85,9 @@ func NewQueryFilter(pty io.Writer) *QueryFilter {
 // responses to the PTY for any queries it recognises, and returns
 // the chunk with those queries removed. Bytes that aren't part of a
 // recognised query pass through unchanged. Sequences split across
-// chunks are buffered in `pending` and re-evaluated on the next call.
+// chunks are buffered in `pending` (up to maxPending) and re-evaluated
+// on the next call; an unterminated sequence that grows past the cap is
+// dropped so a hostile stream can't drive the buffer to OOM.
 //
 // Allocation: returns a fresh slice owned by the caller. Worst case
 // it's the same length as `chunk`, but typically shorter when
@@ -92,14 +118,14 @@ func (q *QueryFilter) Process(chunk []byte) []byte {
 		// pass through.
 		if idx+1 >= len(chunk) {
 			// ESC at end of chunk; might be a partial introducer.
-			q.pending = append([]byte(nil), chunk[idx:]...) // COPY: `chunk` is the caller's reused read buffer
+			q.parkPending(chunk[idx:])
 			return out
 		}
 		if chunk[idx+1] == 0x5D /* ] */ {
 			consumed, oscOut, isQuery := q.processOSC(chunk[idx:])
 			if consumed == 0 {
 				// Need more bytes — partial OSC (no terminator yet).
-				q.pending = append([]byte(nil), chunk[idx:]...) // COPY: `chunk` is the caller's reused read buffer
+				q.parkPending(chunk[idx:])
 				return out
 			}
 			if !isQuery {
@@ -146,7 +172,7 @@ func (q *QueryFilter) Process(chunk []byte) []byte {
 		if end >= len(chunk) {
 			// Sequence runs off the end of this chunk; hold for next
 			// read so we evaluate it as a complete unit.
-			q.pending = append([]byte(nil), chunk[idx:]...) // COPY: `chunk` is the caller's reused read buffer
+			q.parkPending(chunk[idx:])
 			return out
 		}
 		final := chunk[end]
@@ -181,6 +207,38 @@ func (q *QueryFilter) Process(chunk []byte) []byte {
 		idx = end + 1
 	}
 	return out
+}
+
+// parkPending buffers `tail` — the bytes of an escape sequence that
+// ran off the end of the current chunk — so the next Process call can
+// complete it. It is the single choke point for all three park sites
+// (partial introducer, partial OSC, partial CSI).
+//
+// Within the cap it stores a COPY, never a slice of `tail`: the caller
+// hands in a slice of its reused 8 KiB read buffer, so retaining the
+// slice would let the next read overwrite the parked bytes — a
+// sequence straddling a read boundary would be rebuilt from whatever
+// landed there, and because Process's output also feeds the ring
+// buffer that corruption would reach the client as literal escape text
+// (see queryfilter_alias_test.go).
+//
+// On OVERFLOW (len(tail) > maxPending) it DROPS the tail: clears
+// pending and returns, so the caller appends nothing to the output.
+// Dropping is provably safe against query reassembly — the
+// ESC/CSI/OSC introducer sits in the discarded prefix, so any bytes
+// that arrive in a later read lack the introducer and are handled as
+// ordinary passthrough text. The client can never reconstruct the
+// escape and auto-respond, and memory stays bounded to maxPending. The
+// only cost is that a pathological unterminated sequence longer than
+// the cap is discarded, which never touches legitimate traffic: real
+// queries are tiny and real OSC/CSI terminate promptly, well under the
+// cap.
+func (q *QueryFilter) parkPending(tail []byte) {
+	if len(tail) > maxPending {
+		q.pending = nil
+		return
+	}
+	q.pending = append([]byte(nil), tail...)
 }
 
 // matchQuery returns the synthetic response bytes if `seq` is a

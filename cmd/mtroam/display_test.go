@@ -64,3 +64,51 @@ func TestSanitizeForDisplayNoChangeOnCleanInput(t *testing.T) {
 		t.Errorf("sanitizeForDisplay(%q) = %q, want unchanged", in, got)
 	}
 }
+
+func TestSanitizeForCellNeutralizesTab(t *testing.T) {
+	repl := string(rune(0xFFFD))
+	// In a tabwriter cell the caller owns the column delimiters, so a
+	// content-embedded TAB must be neutralized (it would otherwise
+	// inject a spurious column boundary and spoof the row).
+	cases := []struct{ name, in, want string }{
+		{"embedded tab neutralized", "a\tb", "a" + repl + "b"},
+		{"leading tab neutralized", "\tname", repl + "name"},
+		{"tab plus esc both neutralized", "a\tb\x1bc", "a" + repl + "b" + repl + "c"},
+		{"plain text unchanged", "session-name", "session-name"},
+		{"multibyte still passes", "café", "café"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sanitizeForCell(tc.in); got != tc.want {
+				t.Errorf("sanitizeForCell(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+	// The default display sanitizer must STILL preserve TAB (tabwriter
+	// aligns on it): guard against a regression that collapses the two.
+	if got := sanitizeForDisplay("a\tb"); got != "a\tb" {
+		t.Errorf("sanitizeForDisplay must preserve TAB, got %q", got)
+	}
+}
+
+func TestSanitizeMultilineForDisplay(t *testing.T) {
+	repl := string(rune(0xFFFD))
+	cases := []struct{ name, in, want string }{
+		// Newlines are preserved so a multi-line daemon block still
+		// renders as lines; escapes within each line are neutralized.
+		{"newlines preserved", "line1\nline2", "line1\nline2"},
+		{"esc inside a line neutralized, newline kept",
+			"ok\n\x1b[31mbad\x1b[0m\ndone", "ok\n" + repl + "[31mbad" + repl + "[0m\ndone"},
+		{"trailing newline kept", "one line\n", "one line\n"},
+		{"stray CR within a line neutralized", "a\rb\nc", "a" + repl + "b\nc"},
+		{"tab preserved (raw terminal, not tabwriter)", "col1\tcol2\nrow", "col1\tcol2\nrow"},
+		{"single line delegates to sanitizeForDisplay", "\x1bx", repl + "x"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sanitizeMultilineForDisplay(tc.in); got != tc.want {
+				t.Errorf("sanitizeMultilineForDisplay(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}

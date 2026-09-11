@@ -100,13 +100,13 @@ func runDoctor(args []string) int {
 	// we still want to render the report. Treat anything > 1 (or a
 	// non-2-non-1 unknown code) as a hard failure.
 	if code > 1 {
-		fmt.Fprintf(os.Stderr, "mtroam doctor: remote exited %d\n%s", code, stderr)
+		fmt.Fprintf(os.Stderr, "mtroam doctor: remote exited %d\n%s", code, sanitizeMultilineForDisplay(stderr))
 		return exitRemote
 	}
 
 	var server daemonDoctorReport
 	if err := json.Unmarshal([]byte(stdout), &server); err != nil {
-		fmt.Fprintf(os.Stderr, "mtroam doctor: parse daemon JSON: %v\nraw: %s\n", err, stdout)
+		fmt.Fprintf(os.Stderr, "mtroam doctor: parse daemon JSON: %v\nraw: %s\n", err, sanitizeMultilineForDisplay(stdout))
 		return exitErr
 	}
 
@@ -139,20 +139,25 @@ func runDoctor(args []string) int {
 
 	fmt.Println("mtroam doctor — combined report")
 	fmt.Printf("  mtroam build:     %s\n", report.Mtroam.Version)
-	fmt.Printf("  Remote host:     %s\n", report.Host)
+	fmt.Printf("  Remote host:     %s\n", sanitizeForDisplay(report.Host))
 	if report.Skew != nil {
+		// DaemonVersion is daemon-supplied; MtroamVersion is our own
+		// compiled-in build string.
 		fmt.Printf("  Version skew:    ✘ mtroam=%s vs daemon=%s\n",
-			report.Skew.MtroamVersion, report.Skew.DaemonVersion)
-		fmt.Printf("                   %s\n", report.Skew.Note)
+			report.Skew.MtroamVersion, sanitizeForDisplay(report.Skew.DaemonVersion))
+		fmt.Printf("                   %s\n", sanitizeForDisplay(report.Skew.Note))
 	}
 	fmt.Println()
 	// The daemon's report is already a well-formatted block — pipe it
 	// to stdout by re-running the SSH command without --json. Cheap
 	// and avoids duplicating the daemon's table-rendering logic
-	// across two binaries.
+	// across two binaries. Sanitize it (line-preserving) before it
+	// reaches the terminal: it is daemon-supplied and may carry
+	// attacker-influenced fields (host process paths, contact errors).
 	stdout2, _, _, _ := runRemote(ctx, target, "mtroamd doctor", *timeout)
-	fmt.Print(stdout2)
-	if !endsWithNewline(stdout2) {
+	safe2 := sanitizeMultilineForDisplay(stdout2)
+	fmt.Print(safe2)
+	if !endsWithNewline(safe2) {
 		fmt.Println()
 	}
 

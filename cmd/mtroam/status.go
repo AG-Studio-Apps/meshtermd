@@ -59,10 +59,10 @@ func runStatus(args []string) int {
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintf(w, "Host\t%s\n", target)
-	fmt.Fprintf(w, "Version\t%s\n", sanitizeForDisplay(resp.Version))
+	fmt.Fprintf(w, "Version\t%s\n", sanitizeForCell(resp.Version))
 	fmt.Fprintf(w, "Uptime\t%s\n", shortDur(time.Duration(resp.UptimeNs)))
-	fmt.Fprintf(w, "QUIC addr\t%s\n", sanitizeForDisplay(resp.QUICAddr))
-	fmt.Fprintf(w, "Cert fingerprint\t%s\n", sanitizeForDisplay(resp.CertFingerprint))
+	fmt.Fprintf(w, "QUIC addr\t%s\n", sanitizeForCell(resp.QUICAddr))
+	fmt.Fprintf(w, "Cert fingerprint\t%s\n", sanitizeForCell(resp.CertFingerprint))
 	fmt.Fprintf(w, "Sessions\t%d / %d\n", resp.SessionCount, resp.MaxSessions)
 	fmt.Fprintf(w, "Idle timeout\t%s\n", shortDur(time.Duration(resp.IdleTimeoutNs)))
 	if resp.MaxIdleTimeoutNs > 0 {

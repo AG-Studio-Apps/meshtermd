@@ -87,7 +87,7 @@ func bootstrapForAttach(
 	}
 	if code != 0 {
 		return nil, fmt.Errorf("`mtroamd connect` exited %d: %s",
-			code, strings.TrimSpace(stderr))
+			code, sanitizeMultilineForDisplay(strings.TrimSpace(stderr)))
 	}
 
 	line, err := pickMTRMLine(stdout)

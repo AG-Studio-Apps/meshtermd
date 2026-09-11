@@ -36,14 +36,17 @@ func runRestart(args []string) int {
 		return exitRemote
 	}
 	if code != 0 {
-		// Surface daemon's stderr (e.g. "supervisor not reachable").
-		fmt.Fprintf(os.Stderr, "%s", stderr)
+		// Surface daemon's stderr (e.g. "supervisor not reachable"),
+		// neutralizing any escape bytes in the daemon-supplied string.
+		fmt.Fprintf(os.Stderr, "%s", sanitizeMultilineForDisplay(stderr))
 		return exitRemote
 	}
 	// Daemon emits a friendly "✓ Daemon restarted via <mgr>" line on
-	// stdout; pass it through so the user sees confirmation.
-	fmt.Print(stdout)
-	if !endsWithNewline(stdout) {
+	// stdout; pass it through (sanitized — the <mgr> name is
+	// daemon-supplied) so the user sees confirmation.
+	safe := sanitizeMultilineForDisplay(stdout)
+	fmt.Print(safe)
+	if !endsWithNewline(safe) {
 		fmt.Println()
 	}
 	return exitOK

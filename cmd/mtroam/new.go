@@ -84,7 +84,7 @@ func runNew(args []string) int {
 		return exitRemote
 	}
 	if code != 0 {
-		fmt.Fprintf(os.Stderr, "%s", stderr)
+		fmt.Fprintf(os.Stderr, "%s", sanitizeMultilineForDisplay(stderr))
 		return exitRemote
 	}
 

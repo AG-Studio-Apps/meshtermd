@@ -47,7 +47,7 @@ func runRename(args []string) int {
 		return exitRemote
 	}
 	if code != 0 {
-		fmt.Fprintf(os.Stderr, "%s", stderr)
+		fmt.Fprintf(os.Stderr, "%s", sanitizeMultilineForDisplay(stderr))
 		// 3 = unknown_session, 5 = name_in_use (from the daemon CLI's
 		// exit-code convention). Pass through so scripts can branch.
 		if code == 3 || code == 5 {

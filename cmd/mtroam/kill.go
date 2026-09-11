@@ -45,8 +45,9 @@ func runKill(args []string) int {
 		return exitRemote
 	}
 	if code != 0 {
-		// Daemon's CLI emits readable stderr; surface it.
-		fmt.Fprintf(os.Stderr, "%s", stderr)
+		// Daemon's CLI emits readable stderr; surface it, neutralizing
+		// any escape bytes in the daemon-supplied string.
+		fmt.Fprintf(os.Stderr, "%s", sanitizeMultilineForDisplay(stderr))
 		// Pass through specific exit codes that scripts care about
 		// (3 = unknown_session). Anything else → generic remote.
 		if code == 3 {

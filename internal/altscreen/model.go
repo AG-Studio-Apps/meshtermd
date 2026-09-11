@@ -484,6 +484,13 @@ func (s *Screen) putRune(r rune) {
 	}
 }
 
+// maxCombPerCell bounds how many zero-width combining marks a single cell
+// retains. Combining marks do not advance the cursor, so an unbounded stream of
+// them would grow one cell's comb string without limit (memory DoS, amplified by
+// every Repaint). Real terminals (xterm) retain only a small fixed number; once
+// the cap is reached further marks are discarded rather than appended.
+const maxCombPerCell = 8
+
 // putCombining appends a zero-width mark to the last written cell.
 func (s *Screen) putCombining(r rune) {
 	cx := s.x
@@ -498,6 +505,9 @@ func (s *Screen) putCombining(r rune) {
 		cx-- // point at the lead of a wide glyph
 	}
 	if cx >= 0 && cx < s.cols {
+		if utf8.RuneCountInString(row[cx].comb) >= maxCombPerCell {
+			return // per-cell combining cap reached: discard further marks
+		}
 		row[cx].comb += string(r)
 	}
 }

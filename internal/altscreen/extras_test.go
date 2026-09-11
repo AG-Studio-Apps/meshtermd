@@ -119,6 +119,24 @@ func TestCombiningMark(t *testing.T) {
 	}
 }
 
+// TestCombiningMarkFloodIsBounded: a sustained stream of zero-width combining
+// marks aimed at a single cell must not grow that cell's comb string without
+// limit (memory DoS). The per-cell count is capped and further marks discarded,
+// while a normal few-mark sequence still renders.
+func TestCombiningMarkFloodIsBounded(t *testing.T) {
+	s := feed(1, 6, "\x1b[1;1He"+strings.Repeat("́", 100000))
+	if x, _ := s.Cursor(); x != 1 {
+		t.Fatalf("combining flood advanced cursor to %d, want 1", x)
+	}
+	n := len([]rune(s.grid[0][0].comb))
+	if n == 0 {
+		t.Fatalf("combining marks dropped entirely: comb empty")
+	}
+	if n > maxCombPerCell {
+		t.Fatalf("comb accumulated %d marks, want <= %d (cap)", n, maxCombPerCell)
+	}
+}
+
 // TestTruecolorRoundTrip: 38;2;r;g;b and 48;2;r;g;b survive into the repaint.
 func TestTruecolorRoundTrip(t *testing.T) {
 	s := feed(1, 10, "\x1b[1;1H\x1b[38;2;10;20;30m\x1b[48;2;40;50;60mX\x1b[0m")

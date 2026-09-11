@@ -94,13 +94,38 @@ func runRemote(ctx context.Context, host, remoteCmd string, timeout time.Duratio
 	// a passworded host gets a clean error instead of a hung wait.
 	// -o ConnectTimeout matches our overall budget.
 	//
+	// -o StrictHostKeyChecking=yes: fail closed on host-key trust.
+	// This SSH channel bootstraps FURTHER cryptographic trust — the
+	// daemon's QUIC certificate fingerprint and the attach token are
+	// parsed from this stream's stdout (see attach_bootstrap.go), so
+	// the SSH host key is the SOLE authenticator of the whole handshake.
+	// We therefore force the strictest posture and deliberately override
+	// any looser user ssh_config:
+	//
+	//   * NOT `accept-new`: accept-new silently auto-adds an UNKNOWN key
+	//     on first use — exactly the first-use MITM we must prevent
+	//     (findings F4/F7). An on-path attacker on the first connection
+	//     would have its forged MTRM_QUIC line trusted.
+	//   * NOT unset / user-governed: a user who set `StrictHostKeyChecking
+	//     no`/`off` for this host would get warn-and-proceed on a CHANGED
+	//     key (an on-path attacker substituting a key for an already
+	//     trusted host), and the forged bootstrap line would then be
+	//     parsed and used. `-o` here overrides that looser setting.
+	//   * `yes` fails closed on BOTH cases — unknown key on first use AND
+	//     a changed key — regardless of the user's ssh_config. Combined
+	//     with BatchMode=yes there is no interactive prompt to auto-answer.
+	//
+	// The user establishes/rotates trust out-of-band (add the key to
+	// ~/.ssh/known_hosts); isHostKeyVerificationFailure below turns the
+	// resulting ssh abort into an actionable error.
+	//
 	// The `--` separator between options and the host argument is
 	// defence-in-depth against host-as-option injection. validateSSHHost
 	// above already rejects leading `-`; this is the belt to the
 	// suspenders. OpenSSH 7.x+ honours `--` to stop option parsing.
 	args := []string{
 		"-o", "BatchMode=yes",
-		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "StrictHostKeyChecking=yes",
 		"--",
 		host,
 		remoteCmd,
@@ -113,14 +138,47 @@ func runRemote(ctx context.Context, host, remoteCmd string, timeout time.Duratio
 	stdout = sout.String()
 	stderr = serr.String()
 	if runErr != nil {
+		exitCode = -1
 		var ee *exec.ExitError
 		if errors.As(runErr, &ee) {
 			exitCode = ee.ExitCode()
+		}
+		// A host-key verification failure (unknown key on first use, or a
+		// CHANGED key for an already-trusted host) is fatal and actionable.
+		// Under StrictHostKeyChecking=yes ssh aborts (exit 255) rather than
+		// trusting the key. Surface it as an explicit, guidance-bearing
+		// error instead of a bare non-zero exit so the user knows to verify
+		// the host key out-of-band and add it to known_hosts — this bootstrap
+		// must never be silently retried or bypassed.
+		if isHostKeyVerificationFailure(stderr) {
+			return stdout, stderr, exitCode, fmt.Errorf(
+				"host key verification failed for %q: the SSH host key is unknown "+
+					"or has changed. mtroam refuses to trust it automatically because "+
+					"the daemon's QUIC certificate fingerprint and attach token are "+
+					"delivered over this SSH channel. Verify the host key out-of-band, "+
+					"add it to ~/.ssh/known_hosts, then retry. ssh said: %s",
+				host, strings.TrimSpace(stderr))
+		}
+		if ee != nil {
 			return stdout, stderr, exitCode, nil
 		}
 		return stdout, stderr, -1, fmt.Errorf("ssh: %w", runErr)
 	}
 	return stdout, stderr, 0, nil
+}
+
+// isHostKeyVerificationFailure reports whether ssh's stderr indicates
+// that host-key verification failed — either an UNKNOWN host key on
+// first use (under StrictHostKeyChecking=yes) or a CHANGED key for an
+// already-known host. OpenSSH emits the stable sentinel
+// "Host key verification failed." and exits 255 in both cases. We match
+// that sentinel case-insensitively rather than the longer human-readable
+// warning banners, whose wording varies across OpenSSH versions.
+func isHostKeyVerificationFailure(stderr string) bool {
+	return strings.Contains(
+		strings.ToLower(stderr),
+		"host key verification failed",
+	)
 }
 
 // shellQuote single-quotes a value so it survives the remote shell's

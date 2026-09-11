@@ -104,3 +104,55 @@ func TestValidateSSHHostRejectsOptionInjection(t *testing.T) {
 		})
 	}
 }
+
+// TestIsHostKeyVerificationFailure covers the classifier that turns an
+// ssh abort under StrictHostKeyChecking=yes into an actionable error.
+// Both the unknown-first-use case (F4/F7) and the changed-key case (the
+// loose-config regression the review flagged) must be detected, while
+// unrelated ssh failures must NOT be mistaken for a host-key failure.
+func TestIsHostKeyVerificationFailure(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		stderr string
+		want   bool
+	}{
+		{
+			name:   "unknown host, strict checking (first-use MITM)",
+			stderr: "No ECDSA host key is known for example.com and you have requested strict checking.\r\nHost key verification failed.\r\n",
+			want:   true,
+		},
+		{
+			name:   "changed host key (MITM on already-trusted host)",
+			stderr: "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\nHost key verification failed.\n",
+			want:   true,
+		},
+		{
+			name:   "case-insensitive match",
+			stderr: "HOST KEY VERIFICATION FAILED.",
+			want:   true,
+		},
+		{
+			name:   "auth failure is not a host-key failure",
+			stderr: "Permission denied (publickey).",
+			want:   false,
+		},
+		{
+			name:   "connection refused is not a host-key failure",
+			stderr: "ssh: connect to host example.com port 22: Connection refused",
+			want:   false,
+		},
+		{
+			name:   "empty stderr",
+			stderr: "",
+			want:   false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isHostKeyVerificationFailure(tc.stderr); got != tc.want {
+				t.Errorf("isHostKeyVerificationFailure(%q) = %v, want %v", tc.stderr, got, tc.want)
+			}
+		})
+	}
+}

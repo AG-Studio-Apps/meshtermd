@@ -10,7 +10,29 @@ Detection sources used across the project: `govulncheck`, dependency advisories
 scans, manual code review (including adversarial multi-agent review), and
 independent agent audits (e.g. Codex 5.5).
 
-## Unreleased
+## v1.8.0 (2026-09-11)
+
+_Post-audit hardening release, and a line in the sand. Rather than the usual diff audit, this was a **deep multi-agent Claude Security scan of the whole daemon taken at the `v1.7.11` stable tag (`5bbed5e`) as a fresh baseline** - per-component threat models, per-category researchers, and a three-lens adversarial verifier panel - alongside the full static / binary / dependency scan suite; scan report + pre-stable gate in `.security/`. **11 findings were verified and all 11 are fixed** (2 High, 6 Medium, 3 Low), grouped into five focused commits; each fix was generated and then challenged by an adversarial verifier before it landed. The static / binary suite is clean against the v1.7.11 baseline: `go vet` clean; `govulncheck` **0 in code and 0 in imports** (source + freshly rebuilt daemon+cli binaries on go1.26.6); `gosec` unchanged at the **90** prior-accepted baseline with the CI high/high gate green; `staticcheck` style/unused only; `gitleaks` clean (one prior-accepted match: the public offline release-signing key); `osv-scanner` 0; `go test -race` green across every package. This release also bumps `golang.org/x/crypto` 0.53.0 -> **0.56.0** to clear three `x/crypto/ssh` advisories (GO-2026-6355 / GO-2026-6354 / GO-2026-6303) that the vuln-watch surfaced after the baseline was taken - all were unreachable, cleared proactively for a security release (the remaining govulncheck note GO-2026-5932, `x/crypto/openpgp` unmaintained, has no fix and is not imported by the daemon)._
+
+| Finding | Severity | Source | Fix |
+|---|---|---|---|
+| **F1** - Integer overflow in the CUD (cursor-down) handler defeated the `min()` clamp: a hostile PTY-side CSI parameter (e.g. `\e[4294967296B`) wrapped to a small positive after the add, drove an out-of-bounds grid row index, and crashed the daemon | High | Claude Security scan (multi-agent) | CSI parameters are capped at 65535 in `parseParams`; CUD/CNL now compute the target as `clamp(y + count, 0, hi)` instead of `min()`, so no arithmetic can escape the grid (`5e7c253`) |
+| **F2** - Same integer-overflow class in the CNL (cursor-next-line) handler | High | Claude Security scan (multi-agent) | Same param cap + `clamp` (`5e7c253`) |
+| **F4** - The `mtroam` SSH bootstrap forced `StrictHostKeyChecking=accept-new`, auto-trusting the daemon host key - and therefore the QUIC cert fingerprint it delivers - on first connect | Medium | Claude Security scan (multi-agent) | Forces `StrictHostKeyChecking=yes` for the daemon dial; adds an actionable `isHostKeyVerificationFailure` classifier so a real key change surfaces a clear error instead of a silent accept (`df9a90b`) |
+| **F7** - Same accept-new behaviour framed as a first-use MITM of the entire QUIC trust bootstrap | Medium | Claude Security scan (multi-agent) | Same `StrictHostKeyChecking=yes` (`df9a90b`) |
+| **F5** - Unbounded CSI `REP` repeat count from attacker PTY output caused CPU exhaustion / hang | Medium | Claude Security scan (multi-agent) | `REP` count is bounded at `cols*rows` (`5e7c253`) |
+| **F6** - Same unbounded `REP` (CSI `b`) iteration, CPU-DoS framing | Medium | Claude Security scan (multi-agent) | Same `REP` bound (`5e7c253`) |
+| **F8** - Unbounded combining-mark accumulation grew a single cell's `comb` string without limit (memory DoS from PTY output) | Medium | Claude Security scan (multi-agent) | `maxCombPerCell = 8` guard in `putCombining` (`1daf963`) |
+| **F3** - Unbounded pending buffer in `QueryFilter`: attacker PTY output (an unterminated CSI/OSC) could grow the reassembly buffer without limit, exhausting daemon memory | Medium | Claude Security scan (multi-agent) | `maxPending = 256 KiB` cap across all three park sites; on overflow the buffered tail is **dropped**, not flushed - dropping the `ESC` introducer prevents leaking a partially-stripped query (the leak that made the first cut un-shippable). Real palette/clipboard sequences (~5.8 KiB) fit far under the cap (`3108250`) |
+| **F9** - Daemon-supplied session `Name` / foreground-command strings were written unsanitized to the interactive CLI terminal - control-sequence injection | Low | Claude Security scan (multi-agent) | Shared `sanitizeForDisplay` (C0/C1/`ESC`/`DEL`/invalid-UTF-8 -> U+FFFD; TAB and multibyte preserved) at the structured CLI sinks (list / search / status / session-info / attach header); the raw attach + tail relay path is left untouched (`bdd85e6`) |
+| **F10** - `mtroam search` rendered raw scrollback bytes (escape sequences) to the local terminal without neutralizing them | Low | Claude Security scan (multi-agent) | Same `sanitizeForDisplay` (`bdd85e6`) |
+| **F11** - Same per-cell combining-mark growth from PTY output, memory-growth framing | Low | Claude Security scan (multi-agent) | Same `maxCombPerCell` guard (`1daf963`) |
+
+## v1.7.11 (2026-08-23)
+
+_Dependency / toolchain security bump surfaced by the twice-daily `govulncheck` vuln-watch (PR #40). Bumped the pinned toolchain to **go1.26.6** and **`golang.org/x/net` v0.56.0**, clearing the `x/net` advisories flagged against the deployed daemon; `govulncheck` (source + binary) returned to clean. No code change to the daemon's own surface; Nix `vendorHash` re-locked for the `go.mod` bump._
+
+## v1.7.10 (2026-08-09)
 
 _Availability hardening from a box freeze on 2026-08-06: a leak in the `connect` client, and the cgroup cap that stops any future leak reaching the machine. Both ship together because either alone leaves a gap - the fix stops this leak, the cap bounds the next one._
 

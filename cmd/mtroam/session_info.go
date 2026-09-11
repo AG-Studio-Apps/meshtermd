@@ -81,7 +81,7 @@ func runSessionInfo(args []string) int {
 	now := time.Now()
 	created := time.Unix(0, match.CreatedAtNs)
 	lastActive := time.Unix(0, match.LastActiveAtNs)
-	fmt.Fprintf(w, "Name\t%s\n", match.Name)
+	fmt.Fprintf(w, "Name\t%s\n", sanitizeForDisplay(match.Name))
 	fmt.Fprintf(w, "ID\t%s\n", match.ID)
 	fmt.Fprintf(w, "Created\t%s ago (%s)\n",
 		shortDur(now.Sub(created)),
@@ -103,7 +103,7 @@ func runSessionInfo(args []string) int {
 		// before deciding whether to attach (e.g., "OK to displace
 		// the exclusive that's there?").
 		for i, m := range match.AttachedModes {
-			fmt.Fprintf(w, "  client #%d\t%s\n", i+1, m)
+			fmt.Fprintf(w, "  client #%d\t%s\n", i+1, sanitizeForDisplay(m))
 		}
 	}
 	// Wedge-watcher cumulative counters, mirroring the daemon-side

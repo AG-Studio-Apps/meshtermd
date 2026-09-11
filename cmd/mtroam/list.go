@@ -87,12 +87,12 @@ func runList(args []string) int {
 			running = "-"
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s ago\t%s\t%s\t%s\n",
-			s.Name,
+			sanitizeForDisplay(s.Name),
 			truncateID(s.ID),
 			shortDur(now.Sub(created)),
 			shortDur(now.Sub(lastActive)),
 			formatAttachedModes(s.AttachedModes, s.AttachedNow),
-			running,
+			sanitizeForDisplay(running),
 		)
 	}
 	_ = w.Flush()

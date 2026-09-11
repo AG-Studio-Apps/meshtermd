@@ -277,7 +277,7 @@ func attachRun(target, selector, createName, shell, mode string, idleTimeout, de
 	// stdout.
 	if len(ack.Peers) > 0 {
 		fmt.Fprintf(os.Stderr, "[mtroam: attached %s; %d other client(s): %s]\r\n",
-			ack.Mode, len(ack.Peers), strings.Join(ack.Peers, ", "))
+			sanitizeForDisplay(ack.Mode), len(ack.Peers), sanitizeForDisplay(strings.Join(ack.Peers, ", ")))
 	} else if mode == protocol.AttachModeReadonly {
 		fmt.Fprintf(os.Stderr, "[mtroam: attached readonly; no other clients]\r\n")
 	}
@@ -335,7 +335,7 @@ func attachRun(target, selector, createName, shell, mode string, idleTimeout, de
 	printInfo := func() {
 		fmt.Fprintf(os.Stderr,
 			"\r\n[mtroam: rtt=%s session=%s mode=%s peers=%d]\r\n",
-			fmtRTT(stats.RTT()), shortSessionID(ack.SessionID), ack.Mode, len(ack.Peers))
+			fmtRTT(stats.RTT()), shortSessionID(ack.SessionID), sanitizeForDisplay(ack.Mode), len(ack.Peers))
 	}
 
 	// Active QUIC connection migration: when the local interface set

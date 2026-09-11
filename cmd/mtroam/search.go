@@ -87,7 +87,7 @@ func runSearch(args []string) int {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "LINE\tSEQ\tCONTENT")
 	for _, m := range matches {
-		fmt.Fprintf(w, "%d\t%d\t%s\n", m.LineNum, m.StartSeq, m.Line)
+		fmt.Fprintf(w, "%d\t%d\t%s\n", m.LineNum, m.StartSeq, sanitizeForDisplay(m.Line))
 	}
 	_ = w.Flush()
 	return exitOK

@@ -351,3 +351,54 @@ func TestReconstructBottomRowsRestoresFooter(t *testing.T) {
 		t.Fatalf("body clobbered: row1=%q", got)
 	}
 }
+
+// TestOverflowCSIParamsClampCursorAndRepeat proves that a pathologically large
+// CSI numeric parameter (here MaxInt64 as decimal digits) can no longer wrap
+// int and corrupt the cursor row or spin the REP loop. Each case must leave the
+// cursor inside the grid and return promptly. Regression for the integer-
+// overflow finding on CUD (B) / CNL (E) / REP (b).
+func TestOverflowCSIParamsClampCursorAndRepeat(t *testing.T) {
+	const huge = "9223372036854775807" // math.MaxInt64 as decimal digits
+
+	cases := []struct {
+		name string
+		seq  string
+	}{
+		// Start CUD/CNL from a non-zero row: on the unfixed code s.y+MaxInt64
+		// then wraps to a negative int that min() keeps, corrupting the row.
+		{"CUD", "\x1b[3;1H\x1b[" + huge + "B"},
+		{"CNL", "\x1b[3;1H\x1b[" + huge + "E"},
+		{"CUU", "\x1b[5;1H\x1b[" + huge + "A"},
+		{"CPL", "\x1b[5;1H\x1b[" + huge + "F"},
+		// REP repeats the last graphic char; seed one first, then a huge count
+		// (the unfixed loop would spin ~forever and trip the test timeout).
+		{"REP", "\x1b[H" + "x" + "\x1b[" + huge + "b"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := feed(6, 10, tc.seq)
+			x, y := s.Cursor()
+			if y < 0 || y >= s.rows {
+				t.Fatalf("%s: cursor row %d out of range [0,%d)", tc.name, y, s.rows)
+			}
+			if x < 0 || x >= s.cols {
+				t.Fatalf("%s: cursor col %d out of range [0,%d)", tc.name, x, s.cols)
+			}
+			// Repaint must not panic on an out-of-bounds grid index.
+			_ = s.Repaint()
+		})
+	}
+}
+
+// TestParseParamsCapsAtMax confirms the parser caps an over-long digit run at
+// csiParamMax instead of overflowing.
+func TestParseParamsCapsAtMax(t *testing.T) {
+	got := parseParams([]byte("9223372036854775807"))
+	if len(got) != 1 || got[0] != csiParamMax {
+		t.Fatalf("parseParams(huge) = %v, want [%d]", got, csiParamMax)
+	}
+	// A normal parameter is untouched.
+	if got := parseParams([]byte("12;34")); len(got) != 2 || got[0] != 12 || got[1] != 34 {
+		t.Fatalf("parseParams(\"12;34\") = %v", got)
+	}
+}

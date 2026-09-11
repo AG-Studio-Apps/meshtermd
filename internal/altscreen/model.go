@@ -39,6 +39,11 @@ const (
 	colRGB     uint8 = 2
 )
 
+// csiParamMax bounds every parsed CSI numeric parameter, matching xterm's
+// clamp. It keeps parameter arithmetic (s.y+cnt(p1), the REP loop count) far
+// from int overflow while staying well above any legitimate value.
+const csiParamMax = 65535
+
 type attr struct {
 	fg, bg                            color
 	bold, dim, italic, underline, rev bool
@@ -644,7 +649,10 @@ func (s *Screen) csi(p []byte) int {
 		if s.y <= s.bottom {
 			hi = s.bottom
 		}
-		s.y = min(s.y+cnt(p1), hi)
+		// clamp (not min): a wrapped-negative sum is pulled back to 0 rather
+		// than kept as a negative row index. hi >= s.y always, so legitimate
+		// moves are unchanged.
+		s.y = clamp(s.y+cnt(p1), 0, hi)
 		s.wrapNext = false
 	case 'C': // CUF
 		s.x = clamp(s.x+cnt(p1), 0, s.cols-1)
@@ -659,7 +667,7 @@ func (s *Screen) csi(p []byte) int {
 		s.setRow(param(params, 0, 1) - 1)
 		s.wrapNext = false
 	case 'E': // CNL
-		s.y = min(s.y+cnt(p1), s.rows-1)
+		s.y = clamp(s.y+cnt(p1), 0, s.rows-1) // clamp (not min): see CUD above
 		s.x = 0
 		s.wrapNext = false
 	case 'F': // CPL
@@ -686,7 +694,15 @@ func (s *Screen) csi(p []byte) int {
 		s.scrollDown(cnt(p1))
 	case 'b': // REP — repeat last graphic char
 		if s.lastRune != 0 {
-			for k := 0; k < cnt(p1); k++ {
+			// Cap the repeat at the cell count: filling every cell once is the
+			// most a repaint can show, so a larger count only spins the Pump
+			// goroutine under screenMu (CPU DoS + lock starvation). Real REP
+			// counts are tiny, so this is a no-op for legitimate input.
+			n := cnt(p1)
+			if cells := s.cols * s.rows; n > cells {
+				n = cells
+			}
+			for k := 0; k < n; k++ {
 				s.putRune(s.lastRune)
 			}
 		}
@@ -1028,6 +1044,15 @@ func parseParams(b []byte) []int {
 		switch {
 		case c >= '0' && c <= '9':
 			cur = cur*10 + int(c-'0')
+			// Cap each parameter at xterm's maximum so a pathologically long
+			// digit run can't overflow int and wrap negative — a wrapped count
+			// would defeat the min()/clamp guards downstream (CUD/CNL/REP) and
+			// drive an out-of-bounds grid index. Real CSI params are tiny
+			// (colors ≤255, positions ≤ screen size, modes ≤ ~2004), so this
+			// only affects pathological input.
+			if cur > csiParamMax {
+				cur = csiParamMax
+			}
 		case c == ';' || c == ':':
 			out = append(out, cur)
 			cur = 0
